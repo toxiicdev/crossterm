@@ -58,8 +58,42 @@ if [ -d "$BREW_LIB" ]; then
 else
     "$QT_PREFIX/bin/macdeployqt" "$BUILD/CrossTerm.app"
 fi
-# macdeployqt rewrites the binaries and invalidates their signatures: re-sign the whole bundle ad hoc, otherwise
-# macOS refuses out-of-process services (file panels, Keychain) to the app.
-codesign --force --deep --sign - "$BUILD/CrossTerm.app"
-codesign --verify --deep --strict "$BUILD/CrossTerm.app" && echo "Signature OK (ad hoc)"
+# macdeployqt rewrites the binaries and invalidates their signatures: re-sign the whole bundle, otherwise macOS
+# refuses out-of-process services (file panels, Keychain) to the app.
+# A local self-signed certificate (created once in the login keychain) keeps the same signature across builds, so
+# Keychain "Always Allow" stays valid; an ad hoc signature changes at every build and the password is asked again.
+IDENTITY="CrossTerm Local Signing"
+if ! security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
+    echo "Creating the local signing certificate \"$IDENTITY\" (once)"
+    tmp="$(mktemp -d)"
+    cat > "$tmp/cert.cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $IDENTITY
+[ext]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+EOF
+    # /usr/bin/openssl (LibreSSL) writes a PKCS#12 that `security import` accepts.
+    if /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$tmp/cert.cnf" \
+           -keyout "$tmp/key.pem" -out "$tmp/cert.pem" >/dev/null 2>&1 &&
+       /usr/bin/openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" -out "$tmp/id.p12" \
+           -passout pass:crossterm >/dev/null 2>&1; then
+        security import "$tmp/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" -P crossterm -T /usr/bin/codesign ||
+            echo "Could not import the signing certificate; signing ad hoc."
+    fi
+    rm -rf "$tmp"
+fi
+if security find-certificate -c "$IDENTITY" >/dev/null 2>&1 &&
+   codesign --force --deep --sign "$IDENTITY" "$BUILD/CrossTerm.app"; then
+    echo "Signed with \"$IDENTITY\""
+else
+    codesign --force --deep --sign - "$BUILD/CrossTerm.app"
+    echo "Signed ad hoc (Keychain will ask again after every build)"
+fi
+codesign --verify --deep --strict "$BUILD/CrossTerm.app" && echo "Signature OK"
 echo "Built: $BUILD/CrossTerm.app"
