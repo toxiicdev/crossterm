@@ -4020,6 +4020,37 @@ public:
             check(typed->terminal->font().pointSize() == size + 1, "Ctrl+wheel zooms the terminal font");
             SessionSecrets::instance().forget(target);
             closePage(typed);
+
+            // First login: host key unknown. It is accepted in the terminal, then the password is typed; SFTP,
+            // which failed on the unknown key meanwhile, lists on its own.
+            if (const auto keygen = QStandardPaths::findExecutable("ssh-keygen"); !keygen.isEmpty())
+            {
+                QProcess::execute(keygen, {"-R", "[127.0.0.1]:2222"});
+                open(pw);
+                auto *first = current();
+                check(wait(20000,
+                           [&]
+                           {
+                               return first->terminal->prompting() &&
+                                      first->terminal->contents().contains("fingerprint", Qt::CaseInsensitive);
+                           }),
+                      "first login: host key question shown in the terminal");
+                type(first->terminal, "yes\r");
+                check(wait(20000, [&] { return first->terminal->prompting(); }), "first login: then the password prompt");
+                for (const auto c : QString("test-password-123"))
+                {
+                    QKeyEvent press(QEvent::KeyPress, 0, Qt::NoModifier, QString(c));
+                    QCoreApplication::sendEvent(first->terminal, &press);
+                }
+                QKeyEvent enterKey(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier, "\r");
+                QCoreApplication::sendEvent(first->terminal, &enterKey);
+                check(wait(20000, [&] { return first->terminal->contents().contains("test@localhost:~$"); }),
+                      "first login: logged in after accepting the host key");
+                check(wait(30000, [&] { return !first->sftp->busy() && listedNames(first->sftp).contains("README.md"); }),
+                      "first login: SFTP lists on its own after the host key and password: " + first->sftp->message());
+                SessionSecrets::instance().forget(target);
+                closePage(first);
+            }
         }
 
         // SSH tunnels: local (-L), remote (-R) and dynamic (-D, SOCKS5) to a local test service.
@@ -4384,7 +4415,20 @@ public:
                 if (p && p->terminal && !p->terminal->finished() &&
                     p->command.environment.contains("CROSSTERM_ASKPASS_TERMINAL=" + id))
                 {
-                    p->terminal->prompt(prompt, echo, std::move(answer));
+                    // After an answer (host key accepted, password typed) the login usually completes within
+                    // seconds: SFTP and monitoring that failed meanwhile retry on their own.
+                    p->terminal->prompt(prompt, echo,
+                                        [window, answer = std::move(answer)](std::optional<QString> value)
+                                        {
+                                            answer(std::move(value));
+                                            for (const int delay : {2000, 6000})
+                                                QTimer::singleShot(delay, window,
+                                                                   [window]
+                                                                   {
+                                                                       if (window)
+                                                                           window->retryLogins();
+                                                                   });
+                                        });
                     return true;
                 }
             }
@@ -4395,6 +4439,12 @@ public:
         const auto knownHosts = sshFolder + "/known_hosts";
         auto watchHosts = [hosts, sshFolder, knownHosts]
         {
+            // First ssh use on this machine: ~/.ssh does not exist yet, so watch the home folder until it appears.
+            const auto home = QDir::homePath();
+            if (!QFileInfo::exists(sshFolder) && !hosts->directories().contains(home))
+                hosts->addPath(home);
+            if (QFileInfo::exists(sshFolder) && hosts->directories().contains(home))
+                hosts->removePath(home);
             if (QFileInfo::exists(sshFolder) && !hosts->directories().contains(sshFolder))
                 hosts->addPath(sshFolder);
             if (QFileInfo::exists(knownHosts) && !hosts->files().contains(knownHosts))
