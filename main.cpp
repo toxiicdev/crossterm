@@ -17,6 +17,7 @@
 #include "vnc.h"
 #include "rdp.h"
 #include "mobaimport.h"
+#include "titlebar.h"
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QtWidgets>
@@ -3371,6 +3372,24 @@ public:
             applyScheme("Solarized Dark");
             check(p->terminal->background() == QColor("#002b36"), "terminal color scheme applied live");
             applyScheme("CrossTerm Dark");
+            {
+                // Drawn window buttons (macOS/Linux title bar): full screen toggles, close closes.
+                QMainWindow probe;
+                auto *lights = new WindowButtons;
+                probe.setCentralWidget(lights);
+                probe.resize(200, 60);
+                probe.show();
+                QCoreApplication::processEvents();
+                lights->trigger(2);
+                QCoreApplication::processEvents();
+                const bool full = probe.isFullScreen();
+                lights->trigger(2);
+                QCoreApplication::processEvents();
+                const bool normal = !probe.isFullScreen();
+                shot("window-buttons.png", lights);
+                lights->trigger(0);
+                check(full && normal && !probe.isVisible(), "drawn window buttons: full screen and close");
+            }
 
             QTemporaryDir csvDir;
             const auto csv = csvDir.filePath("sessions.csv");
@@ -4680,6 +4699,7 @@ public:
         tools->addWidget(spacer);
         button("xserver", N("X server"), N("X server"), xMenu);
         connect(button("exit", N("Exit"), N("Exit CrossTerm")), &QAction::triggered, this, &QWidget::close);
+        installTitleBar(this, tools);
 
         // Left column: quick connect, vertical strip, panels
         auto *left = new QWidget;
