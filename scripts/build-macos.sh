@@ -58,4 +58,8 @@ if [ -d "$BREW_LIB" ]; then
 else
     "$QT_PREFIX/bin/macdeployqt" "$BUILD/CrossTerm.app"
 fi
+# macdeployqt rewrites the binaries and invalidates their signatures: re-sign the whole bundle ad hoc, otherwise
+# macOS refuses out-of-process services (file panels, Keychain) to the app.
+codesign --force --deep --sign - "$BUILD/CrossTerm.app"
+codesign --verify --deep --strict "$BUILD/CrossTerm.app" && echo "Signature OK (ad hoc)"
 echo "Built: $BUILD/CrossTerm.app"
