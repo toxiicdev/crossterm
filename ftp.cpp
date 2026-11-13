@@ -1118,6 +1118,10 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
         if (!key.isEmpty())
         {
             a->setShortcut(key);
+#ifdef Q_OS_MACOS
+            if (key == QKeySequence(Qt::Key_Delete)) // Cmd+Backspace deletes on macOS, like Del
+                a->setShortcuts({key, QKeySequence(Qt::CTRL | Qt::Key_Backspace)});
+#endif
             a->setShortcutContext(Qt::WidgetWithChildrenShortcut);
         }
         connect(a, &QAction::triggered, this, slot);

@@ -4856,6 +4856,12 @@ public:
                 });
         auto *del = new QShortcut(QKeySequence::Delete, tree, nullptr, nullptr, Qt::WidgetShortcut);
         connect(del, &QShortcut::activated, this, [this] { removeSelected(); });
+#ifdef Q_OS_MACOS
+        // Cmd+Backspace deletes on macOS, like Del elsewhere.
+        auto *cmdBackspace =
+            new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Backspace), tree, nullptr, nullptr, Qt::WidgetShortcut);
+        connect(cmdBackspace, &QShortcut::activated, this, [this] { removeSelected(); });
+#endif
         auto *rename = new QShortcut(QKeySequence(Qt::Key_F2), tree, nullptr, nullptr, Qt::WidgetShortcut);
         connect(rename, &QShortcut::activated, this,
                 [this]
