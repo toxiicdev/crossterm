@@ -31,6 +31,13 @@
 #include <unistd.h>
 #endif
 
+// Application icon (assets/): square tile on Windows, macOS-style rounded tile on macOS and Linux.
+#ifdef Q_OS_WIN
+static const char *const appIconPath = ":/assets/crossterm-square.png";
+#else
+static const char *const appIconPath = ":/assets/crossterm.png";
+#endif
+
 static QString platform()
 {
 #ifdef Q_OS_WIN
@@ -4395,7 +4402,7 @@ public:
         connect(hosts, &QFileSystemWatcher::fileChanged, this, [this, watchHosts] { watchHosts(), retryLogins(); });
         connect(hosts, &QFileSystemWatcher::directoryChanged, this, [this, watchHosts] { watchHosts(), retryLogins(); });
         setWindowTitle("CrossTerm");
-        setWindowIcon(QIcon(":/assets/crossterm.png")); // same icon on every platform (assets/)
+        setWindowIcon(QIcon(appIconPath));
         resize(1200, 740); // restoreWindow() then applies the last saved size
         qApp->setStyle("Fusion");
         QFont interfaceFont("Segoe UI");
@@ -4997,7 +5004,7 @@ int main(int argc, char **argv)
     if (isAskpassInvocation(argc))
         return runAskpass(argc, argv); // ssh prompt helper: no window unless a dialog is needed
     QApplication app(argc, argv);
-    QApplication::setWindowIcon(QIcon(":/assets/crossterm.png")); // Dock / taskbar while running
+    QApplication::setWindowIcon(QIcon(appIconPath)); // Dock / taskbar while running
     // Portable mode: INI settings and sessions in CrossTerm-data next to the executable.
     const auto portable = portableRoot(QCoreApplication::applicationDirPath(), app.arguments());
     if (!portable.isEmpty())
