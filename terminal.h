@@ -46,6 +46,9 @@ public:
     QString workingDirectory() const;
     // Called after "Session stopped": Enter closes the tab, R restarts the session.
     std::function<void()> onClose, onRestart;
+    // Ctrl+wheel zoom: new font size in points (the window saves it per session).
+    std::function<void(int)> onZoom;
+    void setFontPointSize(int points);
     // Predictions drawn over the screen (underlined if "terminal/predictionUnderline", on by default);
     // cursor.x() >= 0 shows the cursor there. The caller refreshes them after every output: real output wins.
     // With a MoshDevice the terminal runs MoshPredictor (mosh.h) on its own, according to "mosh/prediction".

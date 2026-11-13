@@ -897,6 +897,13 @@ void Terminal::mouseDoubleClickEvent(QMouseEvent *event)
     update();
 }
 
+void Terminal::setFontPointSize(int points)
+{
+    QFont face = font();
+    face.setPointSize(std::clamp(points, 6, 48));
+    setFont(face);
+}
+
 void Terminal::wheelEvent(QWheelEvent *event)
 {
     if (event->modifiers() & Qt::ControlModifier)
@@ -911,6 +918,8 @@ void Terminal::wheelEvent(QWheelEvent *event)
             QFont face = font();
             face.setPointSize(std::clamp(face.pointSize() + steps, 6, 48));
             setFont(face);
+            if (onZoom)
+                onZoom(face.pointSize());
         }
         event->accept();
         return;

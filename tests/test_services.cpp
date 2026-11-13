@@ -311,7 +311,8 @@ static const char *fixture =
     "tmpfs               401000      1200    399800       1% /run\n"
     "/dev/loop3           65536     65536         0     100% /snap/core/1\n"
     "/dev/sdd          1055762868 38231956 963827440      4% /etc/hosts\n"
-    "/dev/sda2           999320     58200    872308       6% /boot\n@@end\n";
+    "/dev/sda2           999320     58200    872308       6% /boot\n"
+    "@@procs\n145\n@@fds\n2048\t0\t9223372036854775807\n@@tcp\n3\n1\n@@end\n";
 
 static void testMonitor()
 {
@@ -325,8 +326,17 @@ static void testMonitor()
     CHECK(stats.memTotal == 4005484LL * 1024 && stats.memUsed == (4005484LL - 3271481) * 1024)
     CHECK(stats.rxPerSec == 100 && stats.txPerSec == 2500) // lo excluded
     CHECK(stats.uptimeSeconds == 1213325 && stats.diskPercent == 52)
-    const QStringList expected{"server01", "7%",   "0.70 GB / 3.82 GB", "0.02 Mb/s", "0.00 Mb/s",
-                               "14 days",  "root", "/: 52%   /boot: 6%"}; // tmpfs and snap loops left out
+    const QStringList expected{"server01",
+                               "7%",
+                               "0.70 GB / 3.82 GB",
+                               "0.02 Mb/s",
+                               "0.00 Mb/s",
+                               "14 days",
+                               "root",
+                               "/: 52%   /boot: 6%", // tmpfs and snap loops left out
+                               "4 clients",
+                               "145 processes",
+                               "2048 files open"};
     CHECK(monitorTexts(stats) == expected)
     MonitorStats partial;
     partial.uptimeSeconds = 3725;
@@ -344,7 +354,10 @@ static void testMonitor()
     QStringList shown;
     for (auto *label : bar.findChildren<QLabel *>("monitorText"))
         shown << label->text();
-    CHECK(shown == expected)
+    QStringList displayOrder; // bar order: the three optional values sit after the network ones
+    for (const int i : {0, 1, 2, 3, 4, 8, 9, 10, 5, 6, 7})
+        displayOrder << expected[i];
+    CHECK(shown == displayOrder)
     bar.showError("connection lost");
     CHECK(bar.findChild<QLabel *>("monitorError")->text() == "connection lost")
 

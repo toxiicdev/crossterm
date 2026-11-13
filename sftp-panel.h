@@ -13,6 +13,9 @@
 #include <QStandardPaths>
 #include <memory>
 #include <QFileSystemWatcher>
+#ifdef Q_OS_WIN
+#include <shlobj.h> // SHOpenWithDialog
+#endif
 
 static QString sftpQuote(QString text)
 {
@@ -105,19 +108,24 @@ class SftpPanel : public QWidget
     }
     QString join(const QString &name) const { return listed.endsWith('/') ? listed + name : listed + "/" + name; }
 
-    // --- Transfer queue: one sftp process per item, one at a time, with real progress.
+    // --- Transfer queue: one sftp process per item, up to "sftp/parallel" at a time (Settings), with real progress.
     struct Transfer
     {
         QString directory, name, local, state; // state: queued, running, done, failed, cancelled
         bool upload = false, folder = false, resume = false, open = false, cancelled = false;
+        int openMode = 0; // 0 default program, 1 "Open with" chooser, 2 text editor
         qint64 size = -1;
         QTreeWidgetItem *item = nullptr;
         QProgressBar *bar = nullptr;
+        QProcess *process = nullptr; // while running
     };
     QList<std::shared_ptr<Transfer>> transfers;
-    std::shared_ptr<Transfer> active;
-    QProcess *mover = hideConsoleWindow(new QProcess(this));
     QTimer *ticker = new QTimer(this);
+    static int parallelTransfers() { return std::clamp(QSettings().value("sftp/parallel", 5).toInt(), 1, 20); }
+    int runningTransfers() const
+    {
+        return int(std::count_if(transfers.begin(), transfers.end(), [](const auto &t) { return t->state == "running"; }));
+    }
     QWidget *queueBox = new QWidget;
     QTreeWidget *queueView = new QTreeWidget;
     // Files opened for editing: every local save is uploaded back to the server.
@@ -228,10 +236,11 @@ class SftpPanel : public QWidget
 
     void pump()
     {
-        if (active)
-            return;
+        int running = runningTransfers();
         for (const auto &t : transfers)
         {
+            if (running >= parallelTransfers())
+                break;
             if (t->state != "queued")
                 continue;
             const auto program = QStandardPaths::findExecutable(command.program);
@@ -254,9 +263,12 @@ class SftpPanel : public QWidget
             auto environment = QProcessEnvironment::systemEnvironment();
             for (const auto &entry : askpassEnvironment(target, true))
                 environment.insert(entry.section('=', 0, 0), entry.section('=', 1));
+            auto *mover = hideConsoleWindow(new QProcess(this));
             mover->setProcessEnvironment(environment);
             mover->setProperty("batch", batch.toUtf8());
-            active = t;
+            t->process = mover;
+            watchTransfer(t);
+            ++running;
             t->state = "running";
             t->cancelled = false;
             if (t->folder || (t->upload && bytesRead(QCoreApplication::applicationPid()) < 0))
@@ -268,21 +280,23 @@ class SftpPanel : public QWidget
                                               "ConnectTimeout=10"} +
                                       command.arguments);
             ticker->start(150);
-            return;
         }
     }
 
     void tick()
     {
-        if (!active || active->size <= 0 || active->folder)
-            return;
-        qint64 done = -1;
-        if (active->upload)
-            done = mover->state() == QProcess::Running ? bytesRead(mover->processId()) : -1;
-        else
-            done = QFileInfo(active->local).size();
-        if (done >= 0)
-            active->bar->setValue(int(std::min<qint64>(99, done * 100 / active->size)));
+        for (const auto &t : transfers)
+        {
+            if (t->state != "running" || !t->process || t->size <= 0 || t->folder)
+                continue;
+            qint64 done = -1;
+            if (t->upload)
+                done = t->process->state() == QProcess::Running ? bytesRead(t->process->processId()) : -1;
+            else
+                done = QFileInfo(t->local).size();
+            if (done >= 0)
+                t->bar->setValue(int(std::min<qint64>(99, done * 100 / t->size)));
+        }
     }
 
     std::shared_ptr<Transfer> selectedTransfer() const
@@ -328,7 +342,8 @@ public:
         if (t->state == "running")
         {
             t->cancelled = true;
-            mover->kill();
+            if (t->process)
+                t->process->kill();
         }
         else
         {
@@ -353,7 +368,8 @@ public:
     void resumeTransfer(int i) { resumeTransfer(transfers.value(i)); }
     bool transfersIdle() const
     {
-        return !active && std::none_of(transfers.begin(), transfers.end(), [](const auto &t) { return t->state == "queued"; });
+        return std::none_of(transfers.begin(), transfers.end(),
+                            [](const auto &t) { return t->state == "queued" || t->state == "running"; });
     }
 
 private:
@@ -400,22 +416,25 @@ private:
         queueBox->hide();
         layout->addWidget(queueBox);
         connect(ticker, &QTimer::timeout, this, [this] { tick(); });
+    }
+
+    // Signals of one transfer's sftp process: send the batch, then record the result and start the next ones.
+    void watchTransfer(const std::shared_ptr<Transfer> &t)
+    {
+        auto *mover = t->process;
         connect(mover, &QProcess::started, this,
-                [this]
+                [mover]
                 {
                     mover->write(mover->property("batch").toByteArray());
                     mover->closeWriteChannel();
                 });
         connect(mover, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-                [this](int code, QProcess::ExitStatus exit)
+                [this, t, mover](int code, QProcess::ExitStatus exit)
                 {
-                    ticker->stop();
-                    auto t = active;
-                    active.reset();
                     const auto error = QString::fromUtf8(mover->readAllStandardError()).trimmed();
                     mover->readAllStandardOutput();
-                    if (!t)
-                        return;
+                    mover->deleteLater();
+                    t->process = nullptr;
                     if (t->cancelled)
                         t->state = "cancelled";
                     else if (code == 0 && exit == QProcess::NormalExit)
@@ -436,21 +455,25 @@ private:
                     {
                         edited[t->local] = {t->directory, t->name};
                         if (launchEditor)
-                            QDesktopServices::openUrl(QUrl::fromLocalFile(t->local));
+                            openLocal(t->local, t->openMode);
                     }
                     if (!t->upload && edited.contains(t->local) && QFileInfo::exists(t->local))
                         watcher->addPath(t->local);
+                    if (!runningTransfers())
+                        ticker->stop();
                     pump();
                 });
         connect(mover, &QProcess::errorOccurred, this,
-                [this](QProcess::ProcessError e)
+                [this, t, mover](QProcess::ProcessError e)
                 {
-                    if (e != QProcess::FailedToStart || !active)
+                    if (e != QProcess::FailedToStart)
                         return;
-                    ticker->stop();
-                    active->state = "failed";
-                    active->item->setText(3, L("Failed") + ": " + mover->errorString());
-                    active.reset();
+                    t->state = "failed";
+                    t->item->setText(3, L("Failed") + ": " + mover->errorString());
+                    t->process = nullptr;
+                    mover->deleteLater();
+                    if (!runningTransfers())
+                        ticker->stop();
                     pump();
                 });
     }
@@ -526,15 +549,38 @@ public:
         return process->state() != QProcess::NotRunning || scanner->state() != QProcess::NotRunning || !scanQueue.isEmpty();
     }
     std::function<QString()> folderSource;
-    std::function<void(bool)> onMonitoring;    // the window starts/stops monitoring the session
-    QPushButton *monitoring = new QPushButton; // current folder of the associated terminal
-    bool launchEditor = true;                  // false in tests: no external editor
+    std::function<void(const QString &)> pasteToTerminal; // "Copy file path to terminal"
+    std::function<void(bool)> onMonitoring;               // the window starts/stops monitoring the session
+    QPushButton *monitoring = new QPushButton;            // Remote monitoring toggle
+    bool launchEditor = true;                             // false in tests: no external editor
     void setFollow(bool on) { follow->setChecked(on); }
-    void openRemote(const QString &name, qint64 size)
+    QCheckBox *followBox() const { return follow; }
+    // Downloads to a temporary folder and opens it (with the "Open with" chooser when chooseApp);
+    // every save of the local copy is uploaded back to the server.
+    void openRemote(const QString &name, qint64 size, int openMode = 0)
     {
         const auto dir = QDir::temp().filePath("CrossTerm-sftp");
         QDir().mkpath(dir);
         enqueue(listed, name, QDir(dir).filePath(name), false, false, size, true);
+        transfers.last()->openMode = openMode;
+    }
+    static void openLocal(const QString &file, int openMode)
+    {
+#ifdef Q_OS_WIN
+        const auto native = QDir::toNativeSeparators(file);
+        if (openMode == 1)
+        {
+            const auto wide = native.toStdWString();
+            OPENASINFO info{wide.c_str(), nullptr, OAIF_ALLOW_REGISTRATION | OAIF_EXEC};
+            if (SUCCEEDED(SHOpenWithDialog(nullptr, &info)))
+                return;
+        }
+        if (openMode == 2 && QProcess::startDetached("notepad.exe", {native}))
+            return;
+#else
+        Q_UNUSED(openMode);
+#endif
+        QDesktopServices::openUrl(QUrl::fromLocalFile(file));
     }
     void removeRecursive(const QStringList &directories, const QStringList &filesToRemove)
     {
@@ -697,7 +743,7 @@ public:
                    run(listed, {"put " + sftpQuote(QDir::fromNativeSeparators(empty)) + " " + sftpQuote(name)});
                });
         action("delete", N("Delete selected files"), [this] { remove(); }, QKeySequence(Qt::Key_Delete));
-        action(
+        auto *renameAction = action(
             "rename", N("Rename"),
             [this]
             {
@@ -729,7 +775,71 @@ public:
         files->viewport()->installEventFilter(this);
         files->setDragEnabled(true); // drag out (download), see SftpTree
         files->dragData = [this] { return createDragData(selectedNames()); };
-        files->setContextMenuPolicy(Qt::ActionsContextMenu);
+        // Right click on a file: open, edit and download / delete and rename / path, properties, permissions.
+        files->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(files, &QWidget::customContextMenuRequested, this,
+                [this, renameAction](const QPoint &at)
+                {
+                    auto *item = files->itemAt(at);
+                    if (!item || item->text(0) == "..")
+                        return;
+                    const auto name = item->text(0);
+                    const bool dir = item->data(0, Qt::UserRole).toBool();
+                    const auto size = item->data(0, Qt::UserRole + 1).toLongLong();
+                    const auto remotePath = join(name);
+                    QMenu menu(this);
+                    if (!dir)
+                    {
+                        menu.addAction(icon("open", 16), L("Open"), [=] { openRemote(name, size, 0); });
+                        menu.addAction(icon("edit", 16), L("Open with default text editor"), [=] { openRemote(name, size, 2); });
+                        menu.addAction(icon("openwith", 16), L("Open with..."), [=] { openRemote(name, size, 1); });
+                    }
+                    else
+                        menu.addAction(icon("folder", 16), L("Open"), [=] { run(remotePath); });
+                    menu.addAction(icon("download", 16), L("Download"), [this] { download(); });
+                    menu.addSeparator();
+                    menu.addAction(icon("delete", 16), L("Delete"), [this] { remove(); });
+                    menu.addAction(icon("rename", 16), L("Rename"), renameAction, &QAction::trigger);
+                    menu.addSeparator();
+                    menu.addAction(icon("copy", 16), L("Copy file path"),
+                                   [remotePath] { QApplication::clipboard()->setText(remotePath); });
+                    if (pasteToTerminal)
+                        menu.addAction(icon("terminal", 16), L("Copy file path to terminal"),
+                                       [this, remotePath] { pasteToTerminal(sftpQuote(remotePath)); });
+                    menu.addAction(icon("info", 16), L("Properties"),
+                                   [this, item]
+                                   {
+                                       QMessageBox::information(this, L("Properties"),
+                                                                QString("%1\n\n%2: %3\n%4: %5\n%6: %7 / %8\n%9: %10")
+                                                                    .arg(join(item->text(0)), L("Size (KB)"), item->text(1),
+                                                                         L("Last modified"), item->text(2), L("Owner"),
+                                                                         item->text(3), item->text(4), L("Access"))
+                                                                    .arg(item->text(5)));
+                                   });
+                    menu.addAction(icon("lock", 16), L("Permissions"),
+                                   [this, item]
+                                   {
+                                       // rwxr-xr-x -> 755 as the starting value ('*' and unknown bits count as 0).
+                                       const auto access = item->text(5);
+                                       QString octal;
+                                       for (int g = 0; g < 3; ++g)
+                                       {
+                                           int v = 0;
+                                           for (int b = 0; b < 3; ++b)
+                                               v = v * 2 + (QString("rwx").contains(access.mid(1 + g * 3 + b, 1)) &&
+                                                            access.mid(1 + g * 3 + b, 1) != "-");
+                                           octal += QString::number(v);
+                                       }
+                                       bool ok = false;
+                                       const auto mode =
+                                           QInputDialog::getText(this, L("Permissions"), L("Octal mode (e.g. 644, 755):"),
+                                                                 QLineEdit::Normal, octal, &ok)
+                                               .trimmed();
+                                       if (ok && QRegularExpression("^[0-7]{3,4}$").match(mode).hasMatch())
+                                           run(listed, {"chmod " + mode + " " + sftpQuote(item->text(0))});
+                                   });
+                    menu.exec(files->viewport()->mapToGlobal(at));
+                });
         layout->addWidget(files, 1);
         buildQueue(layout);
         connect(files, &QTreeWidget::itemActivated, this,
@@ -822,8 +932,13 @@ public:
         status->setTextFormat(Qt::PlainText);
         status->setObjectName("sftpStatus");
         layout->addWidget(status);
-        layout->addWidget(monitoring);
-        layout->addWidget(follow);
+        // Bottom: Remote monitoring (1px side margin) with Follow terminal folder centered under it, 2px above the edge.
+        auto *bottom = new QVBoxLayout;
+        bottom->setContentsMargins(1, 0, 1, 2);
+        bottom->setSpacing(2);
+        bottom->addWidget(monitoring);
+        bottom->addWidget(follow, 0, Qt::AlignHCenter);
+        layout->addLayout(bottom);
 
         connect(process, &QProcess::started, this,
                 [this]

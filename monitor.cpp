@@ -1,7 +1,12 @@
 #include "monitor.h"
 #include <QApplication>
 #include <QCoreApplication>
+#include <QClipboard>
+#include <QContextMenuEvent>
+#include <QFileDialog>
 #include <QFrame>
+#include <QMenu>
+#include <QSettings>
 #include <QPainter>
 #include <algorithm>
 #include <QHBoxLayout>
@@ -21,7 +26,10 @@ QString monitorScript()
     return "echo @@host; uname -n; echo @@user; id -un; echo @@uptime; cat /proc/uptime; "
            "echo @@stat1; head -n 1 /proc/stat; echo @@net1; cat /proc/net/dev; sleep 1; "
            "echo @@stat2; head -n 1 /proc/stat; echo @@net2; cat /proc/net/dev; "
-           "echo @@mem; grep ^Mem /proc/meminfo; echo @@df; df -P; echo @@end";
+           "echo @@mem; grep ^Mem /proc/meminfo; echo @@df; df -P; "
+           "echo @@procs; ls /proc | grep -c ^[0-9]; echo @@fds; cat /proc/sys/fs/file-nr; "
+           "echo @@tcp; cut -c35-36 /proc/net/tcp | grep -c 01; cut -c83-84 /proc/net/tcp6 2>/dev/null | grep -c 01; "
+           "echo @@end";
 }
 
 struct Cpu
@@ -89,6 +97,12 @@ bool parseMonitor(const QByteArray &output, MonitorStats &stats)
             else if (fields[0] == "MemFree:")
                 memFree = kb;
         }
+        else if (section == "procs")
+            stats.processes = fields[0].toInt();
+        else if (section == "fds")
+            stats.fileDescriptors = fields[0].toLongLong();
+        else if (section == "tcp") // one count for IPv4, one for IPv6 (ESTABLISHED = state 01)
+            stats.clients = qMax(stats.clients, 0) + fields[0].toInt();
         else if (section == "df" && fields.size() >= 6 && fields[4].endsWith('%'))
         {
             // Local block devices only (no tmpfs, overlay, snap loops); "/" is always kept.
@@ -146,7 +160,10 @@ QStringList monitorTexts(const MonitorStats &s)
             s.rxPerSec < 0 ? QString{} : ui("%1 Mb/s").arg(mbit(s.rxPerSec)),
             uptime,
             s.user,
-            disks.join("   ")};
+            disks.join("   "),
+            s.clients < 0 ? QString{} : ui("%1 clients").arg(s.clients),
+            s.processes < 0 ? QString{} : ui("%1 processes").arg(s.processes),
+            s.fileDescriptors < 0 ? QString{} : ui("%1 files open").arg(s.fileDescriptors)};
 }
 
 RemoteMonitor::RemoteMonitor(const Command &command, const QStringList &environment, int intervalSeconds, QObject *parent)
@@ -342,6 +359,30 @@ static QPixmap monitorIcon(int kind)
         p.drawEllipse(QRectF(5, 1.5, 6, 6));
         p.drawRoundedRect(QRectF(2.5, 8.5, 11, 7), 3, 3);
         break;
+    case 8: // connected clients: three linked nodes
+        p.setPen(QPen(QColor("#7aa2f7"), 1.3));
+        p.drawLine(QPointF(8, 4), QPointF(3.5, 12));
+        p.drawLine(QPointF(8, 4), QPointF(12.5, 12));
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor("#7aa2f7"));
+        for (const auto c : {QPointF(8, 4), QPointF(3.5, 12), QPointF(12.5, 12)})
+            p.drawEllipse(c, 2.5, 2.5);
+        break;
+    case 9: // processes: stacked bars
+        p.setPen(Qt::NoPen);
+        for (int r = 0; r < 3; ++r)
+        {
+            p.setBrush(QColor(r == 0 ? "#e0af68" : r == 1 ? "#9ece6a" : "#7dcfff"));
+            p.drawRoundedRect(QRectF(2, 2.5 + r * 4.5, 12 - r * 3, 3), 1, 1);
+        }
+        break;
+    case 10: // file descriptors: document
+        p.setPen(QPen(QColor("#c0caf5"), 1.1));
+        p.setBrush(QColor("#565f89"));
+        p.drawPolygon(QPolygonF{{3.5, 1.5}, {10, 1.5}, {12.5, 4}, {12.5, 14.5}, {3.5, 14.5}});
+        p.drawLine(QPointF(5.5, 7), QPointF(10.5, 7));
+        p.drawLine(QPointF(5.5, 10), QPointF(10.5, 10));
+        break;
     default: // disk
         p.setPen(QPen(QColor("#9aa4ad"), 1));
         p.setBrush(QColor("#5b6670"));
@@ -359,7 +400,10 @@ MonitorBar::MonitorBar(QWidget *parent) : QWidget(parent)
     layout->setContentsMargins(4, 2, 4, 2);
     layout->setSpacing(4);
     setStyleSheet("QFrame#monitorCell { border: 1px solid palette(mid); border-radius: 2px; }");
-    for (int i = 0; i < 8; ++i)
+    // Display order: host, CPU, RAM, upload, download, clients, processes, descriptors, uptime, user, disks.
+    cells.resize(11);
+    labels.resize(11);
+    for (const int i : {0, 1, 2, 3, 4, 8, 9, 10, 5, 6, 7})
     {
         auto *cell = new QFrame(this);
         cell->setObjectName("monitorCell");
@@ -378,8 +422,8 @@ MonitorBar::MonitorBar(QWidget *parent) : QWidget(parent)
             row->addWidget(cpuGraph);
         }
         layout->addWidget(cell);
-        cells << cell;
-        labels << label;
+        cells[i] = cell; // indexed like monitorTexts()
+        labels[i] = label;
     }
     error = new QLabel(this);
     error->setObjectName("monitorError");
@@ -393,12 +437,87 @@ void MonitorBar::show(const MonitorStats &stats)
     const auto texts = monitorTexts(stats);
     error->hide();
     for (int i = 0; i < labels.size(); ++i)
-    {
         labels[i]->setText(texts.value(i));
-        cells[i]->setVisible(!texts.value(i).isEmpty());
-    }
+    applyVisibility();
     if (stats.cpu >= 0)
         cpuGraph->add(stats.cpu);
+}
+
+static QList<int> hiddenValues()
+{
+    QList<int> hidden;
+    for (const auto &v : QSettings().value("monitor/hidden", QVariantList{8, 9, 10}).toList())
+        hidden << v.toInt();
+    return hidden;
+}
+
+void MonitorBar::applyVisibility()
+{
+    if (error->isVisible())
+        return;
+    const auto hidden = hiddenValues();
+    for (int i = 0; i < cells.size(); ++i)
+        cells[i]->setVisible(!labels[i]->text().isEmpty() && !hidden.contains(i));
+}
+
+QString MonitorBar::summary() const
+{
+    if (error->isVisible())
+        return error->text();
+    QStringList parts;
+    for (int i = 0; i < cells.size(); ++i)
+    {
+        if (cells[i]->isVisible())
+            parts << labels[i]->text();
+    }
+    return parts.join(" | ");
+}
+
+void MonitorBar::contextMenuEvent(QContextMenuEvent *event)
+{
+    QMenu menu(this);
+    menu.addAction(ui("Copy"), [this] { QApplication::clipboard()->setText(summary()); });
+    menu.addAction(ui("Save to file"),
+                   [this]
+                   {
+                       const auto file = QFileDialog::getSaveFileName(this, ui("Save to file"), "monitoring.txt");
+                       QFile out(file);
+                       if (!file.isEmpty() && out.open(QIODevice::WriteOnly | QIODevice::Text))
+                           out.write((summary() + "\n").toUtf8());
+                   });
+    menu.addSeparator();
+    // Same order as the bar.
+    const QList<std::pair<int, QString>> items{{0, ui("Display host information")},
+                                               {1, ui("Display CPU information")},
+                                               {2, ui("Display RAM information")},
+                                               {3, ui("Display network (upload) information")},
+                                               {4, ui("Display network (download) information")},
+                                               {8, ui("Display network connected clients")},
+                                               {9, ui("Display number of processes")},
+                                               {10, ui("Display number of file descriptors")},
+                                               {5, ui("Display uptime")},
+                                               {6, ui("Display connected users")},
+                                               {7, ui("Display partitions information")}};
+    const auto hidden = hiddenValues();
+    for (const auto &[index, text] : items)
+    {
+        auto *action = menu.addAction(QIcon(monitorIcon(index)), text);
+        action->setCheckable(true);
+        action->setChecked(!hidden.contains(index));
+        connect(action, &QAction::toggled, this,
+                [this, index = index](bool on)
+                {
+                    QVariantList next;
+                    for (const int h : hiddenValues())
+                        if (h != index)
+                            next << h;
+                    if (!on)
+                        next << index;
+                    QSettings().setValue("monitor/hidden", next);
+                    applyVisibility();
+                });
+    }
+    menu.exec(event->globalPos());
 }
 
 void MonitorBar::showError(const QString &message)

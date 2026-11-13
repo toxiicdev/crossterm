@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#ifdef Q_OS_WIN
+#define NOMINMAX
+#include <windows.h>
+#endif
 #include <array>
 #include <cstring>
 #include <QDir>
@@ -174,6 +178,20 @@ std::optional<QString> decryptMobaPassword(const QString &base64, const QString 
             return std::nullopt;
     }
     return text;
+}
+
+QProcess *hideConsoleWindow(QProcess *process)
+{
+#ifdef Q_OS_WIN
+    process->setCreateProcessArgumentsModifier(
+        [](QProcess::CreateProcessArguments *arguments)
+        {
+            arguments->flags |= CREATE_NEW_CONSOLE;
+            arguments->startupInfo->dwFlags |= STARTF_USESHOWWINDOW;
+            arguments->startupInfo->wShowWindow = SW_HIDE;
+        });
+#endif
+    return process;
 }
 
 static QString decode(const QByteArray &bytes)

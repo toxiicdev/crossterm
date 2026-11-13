@@ -1,5 +1,8 @@
 #pragma once
-// Icons drawn at runtime with QPainter.
+// Icons: system icon font glyphs where available, otherwise drawn at runtime with QPainter.
+#include <QFontDatabase>
+#include <QFontMetrics>
+#include <QHash>
 #include <QIcon>
 #include <QMap>
 #include <QPainter>
@@ -7,8 +10,57 @@
 #include <QPixmap>
 #include <QtMath>
 
+// Modern icons from the system icon font (Windows 11: Segoe Fluent Icons, Windows 10: Segoe MDL2 Assets),
+// one glyph and accent colour per name. Names without a glyph, or systems without the font, use the drawings below.
+static bool fluentIcon(const QString &name, int size, QPixmap &out)
+{
+    static const QHash<QString, std::pair<char16_t, const char *>> glyphs{
+        {"session", {0xE7F4, "#3b8eea"}},  {"servers", {0xE968, "#29b6f6"}},   {"tools", {0xE90F, "#f06a5a"}},
+        {"sessions", {0xE734, "#f5c518"}}, {"star", {0xE735, "#f5c518"}},      {"view", {0xE890, "#4fc3a1"}},
+        {"split", {0xE8A9, "#5c9ded"}},    {"multiexec", {0xE762, "#9a7cf0"}}, {"tunneling", {0xE71B, "#36c08f"}},
+        {"packages", {0xE7B8, "#5fa8ff"}}, {"settings", {0xE713, "#5f9bf5"}},  {"help", {0xE897, "#3b8eea"}},
+        {"xserver", {0xE770, "#e5534b"}},  {"exit", {0xE7E8, "#e5534b"}},      {"macros", {0xE768, "#f39a1e"}},
+        {"sftp", {0xE774, "#e8a33d"}},     {"monitor", {0xE9D9, "#3cb44a"}},   {"user", {0xE77B, "#d9a35b"}},
+        {"home", {0xE80F, "#e5534b"}},     {"plus", {0xE710, "#c8c8c8"}},      {"ok", {0xE73E, "#3cb44a"}},
+        {"refresh", {0xE72C, "#3cb44a"}},  {"parent", {0xE74A, "#5c9ded"}},    {"download", {0xE896, "#2f7fe0"}},
+        {"upload", {0xE898, "#1fb5a8"}},   {"delete", {0xE74D, "#e5534b"}},    {"rename", {0xE8AC, "#9a7cf0"}},
+        {"folder", {0xE8D5, "#f5c518"}},   {"newfolder", {0xE8F4, "#f5c518"}}, {"file", {0xE8A5, "#b8c0cc"}},
+        {"newfile", {0xE8A5, "#5fa8ff"}},  {"open", {0xE8E5, "#5fa8ff"}},      {"edit", {0xE70F, "#4fc3a1"}},
+        {"openwith", {0xE7AC, "#9a7cf0"}}, {"copy", {0xE8C8, "#b8c0cc"}},      {"terminal", {0xE756, "#4fc3a1"}},
+        {"info", {0xE946, "#3b8eea"}},     {"lock", {0xE72E, "#d9a35b"}},      {"ssh", {0xE756, "#f5c518"}},
+        {"shell", {0xE756, "#4fc3a1"}},    {"telnet", {0xE756, "#5fa8ff"}},    {"rlogin", {0xE756, "#9a7cf0"}},
+        {"rsh", {0xE756, "#9a7cf0"}},      {"mosh", {0xE756, "#36c08f"}},      {"wsl", {0xE756, "#f39a1e"}},
+        {"rdp", {0xE8AF, "#3b8eea"}},      {"vnc", {0xE7F4, "#36c08f"}},       {"ftp", {0xE8B7, "#f5c518"}},
+        {"serial", {0xE88E, "#b8c0cc"}}};
+    static const QString family = []
+    {
+        for (const char *f : {"Segoe Fluent Icons", "Segoe MDL2 Assets"})
+            if (QFontDatabase::hasFamily(f))
+                return QString(f);
+        return QString();
+    }();
+    const auto it = glyphs.find(name);
+    if (family.isEmpty() || it == glyphs.end())
+        return false;
+    QFont font(family);
+    font.setPixelSize(qRound(size * 0.78));
+    const QChar glyph(it->first);
+    if (!QFontMetrics(font).inFont(glyph))
+        return false;
+    out = QPixmap(size, size);
+    out.fill(Qt::transparent);
+    QPainter p(&out);
+    p.setRenderHint(QPainter::TextAntialiasing);
+    p.setFont(font);
+    p.setPen(QColor(it->second));
+    p.drawText(QRect(0, 0, size, size), Qt::AlignCenter, QString(glyph));
+    return true;
+}
+
 static QIcon icon(const QString &name, int size = 32)
 {
+    if (QPixmap fluent; fluentIcon(name, size, fluent))
+        return QIcon(fluent);
     QPixmap pix(size, size);
     pix.fill(Qt::transparent);
     QPainter p(&pix);

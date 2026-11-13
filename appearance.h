@@ -87,13 +87,13 @@ inline AppearancePalette appearancePalette(Appearance a)
     switch (a)
     {
     case Appearance::ClassicLight:
-        return {"#f3f3f3", "#f3f3f3", "#1e1e1e", "#6a6a6a", "#3d8fe0", "#d0d0d0", "#ffffff", 24, true};
+        return {"#f3f3f3", "#f3f3f3", "#1e1e1e", "#6a6a6a", "#3d8fe0", "#d0d0d0", "#ffffff", 28, true};
     case Appearance::MacLight:
-        return {"#ececec", "#e3e3e8", "#1d1d1f", "#6e6e73", "#007aff", "#d1d1d6", "#ffffff", 20, true};
+        return {"#ececec", "#e3e3e8", "#1d1d1f", "#6e6e73", "#007aff", "#d1d1d6", "#ffffff", 28, true};
     case Appearance::MacDark:
-        return {"#1e1e1e", "#262628", "#e5e5e7", "#98989d", "#0a84ff", "#38383a", "#1e1e1e", 20, true};
+        return {"#1e1e1e", "#262628", "#e5e5e7", "#98989d", "#0a84ff", "#38383a", "#1e1e1e", 28, true};
     default:
-        return {"#141414", "#141414", "#e6e6e6", "#8a8a8a", "#3d8fe0", "#3a3a3a", "#000000", 24, true};
+        return {"#141414", "#141414", "#e6e6e6", "#8a8a8a", "#3d8fe0", "#3a3a3a", "#000000", 28, true};
     }
 }
 

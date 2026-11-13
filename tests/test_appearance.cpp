@@ -286,12 +286,12 @@ int main(int argc, char **argv)
         const auto p = appearancePalette(a);
         check(contrast(p.text, p.window) >= 4.5, "text/window contrast " + appearanceKey(a).toUtf8());
         check(contrast(p.text, p.sidebar) >= 4.5, "text/sidebar contrast " + appearanceKey(a).toUtf8());
-        check(p.toolbarIconSize == 20 && p.textUnderIcon, "toolbar 20px text under icon " + appearanceKey(a).toUtf8());
+        check(p.toolbarIconSize == 28 && p.textUnderIcon, "toolbar 28px text under icon " + appearanceKey(a).toUtf8());
     }
     check(appearancePalette(Appearance::MacLight).separator == QColor("#d1d1d6") &&
               appearancePalette(Appearance::MacDark).separator == QColor("#38383a"),
           "separators");
-    check(appearancePalette(Appearance::ClassicDark).toolbarIconSize == 24, "Classic keeps 24px icons");
+    check(appearancePalette(Appearance::ClassicDark).toolbarIconSize == 28, "toolbar icons at 28px");
 
     // Tabs: the current one is drawn differently from a non-current one; reasonable sizes.
     const QFontMetrics fm(app.font());

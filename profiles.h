@@ -27,15 +27,10 @@ QString encryptMobaPassword(const QString &plain, const QString &master);       
 QByteArray aes256EncryptBlock(const QByteArray &key32, const QByteArray &block16); // tests (FIPS-197 vector)
 
 // Background console programs (ssh, sftp) started from the GUI: on Windows they would get a console window that
-// flashes on screen. Call before start(); no effect on other platforms.
-inline QProcess *hideConsoleWindow(QProcess *process)
-{
-#ifdef Q_OS_WIN
-    process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments)
-                                               { arguments->flags |= 0x08000000; }); // CREATE_NO_WINDOW
-#endif
-    return process;
-}
+// flashes on screen. They get a console of their own that is never shown: unlike CREATE_NO_WINDOW (no console at
+// all), the programs they start in turn (sftp -> ssh) inherit it instead of opening a visible one.
+// Call before start(); no effect on other platforms.
+QProcess *hideConsoleWindow(QProcess *process);
 
 enum class ImportPolicy
 {

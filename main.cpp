@@ -394,6 +394,16 @@ private:
         return out + frame + "└" + QString(inner, QChar(0x2500)) + "┘" + reset + "\r\n\r\n";
     }
 
+    // Per-session settings (zoom, Remote monitoring, Follow terminal folder) live in QSettings under this key.
+    static QString sessionKey(const QJsonObject &profile)
+    {
+        if (profile.isEmpty())
+            return "session/local";
+        const auto id = profile["id"].toString();
+        return "session/" + (id.isEmpty() ? credentialTarget(profile, "quick").replace('/', '_') : id);
+    }
+    bool monitoringByDefault = true; // the e2e turns it off: its test server has no /proc
+
     Terminal *makeTerminal(Page *p)
     {
         Terminal *t = nullptr;
@@ -403,6 +413,11 @@ private:
             t = new Terminal(device, area);
         else
             return new Terminal(Command{p->profile["protocol"].toString(), {}, {}}, area); // shows "Cannot start"
+        // Last Ctrl+wheel zoom of this session.
+        const auto key = sessionKey(p->profile);
+        if (const int zoom = QSettings().value(key + "/zoom").toInt(); zoom > 0)
+            t->setFontPointSize(zoom);
+        t->onZoom = [key](int points) { QSettings().setValue(key + "/zoom", points); };
         if (!t->finished())
             t->printLocal(welcomeBanner(p->profile, p->command));
         return t;
@@ -426,7 +441,31 @@ private:
             p->sftp = new SftpPanel(profile, platform(), sftpStack);
             p->sftp->folderSource = [p] { return p->terminal ? p->terminal->workingDirectory() : QString(); };
             p->sftp->onMonitoring = [this, p](bool on) { toggleMonitor(p, on); };
+            p->sftp->pasteToTerminal = [p](const QString &text)
+            {
+                if (p->terminal)
+                    p->terminal->paste(text);
+            };
             sftpStack->addWidget(p->sftp);
+            // Last Remote monitoring (on by default) and Follow terminal folder state of this session.
+            const auto key = sessionKey(profile);
+            // A session never opened before starts from the last choice made in any session.
+            QSettings settings;
+            p->sftp->setFollow(settings.value(key + "/follow", settings.value("session/last/follow", false)).toBool());
+            connect(p->sftp->followBox(), &QCheckBox::toggled, this,
+                    [key](bool on)
+                    {
+                        QSettings().setValue(key + "/follow", on);
+                        QSettings().setValue("session/last/follow", on);
+                    });
+            connect(p->sftp->monitoring, &QPushButton::toggled, this,
+                    [key](bool on)
+                    {
+                        QSettings().setValue(key + "/monitoring", on);
+                        QSettings().setValue("session/last/monitoring", on);
+                    });
+            if (settings.value(key + "/monitoring", settings.value("session/last/monitoring", monitoringByDefault)).toBool())
+                QTimer::singleShot(0, p->sftp, [sftp = p->sftp] { sftp->monitoring->setChecked(true); });
         }
         addPage(p, QString("%1. %2").arg(++counter).arg(name), icon(protocol.isEmpty() ? "shell" : protocol));
         if (p->sftp)
@@ -529,6 +568,8 @@ private:
             monitorBar->showError(now->monitorError);
         else if (now->monitor && !now->stats.host.isEmpty())
             monitorBar->show(now->stats);
+        else if (now->monitor)
+            monitorBar->showError(L("Loading…")); // until the first data arrives
         sftpStack->setCurrentIndex(0);
         if (now->sftp)
             sftpStack->setCurrentWidget(now->sftp);
@@ -1633,6 +1674,10 @@ private:
         prediction->addItem(L("Never"), "never");
         prediction->setCurrentIndex(std::max(0, prediction->findData(settings.value("mosh/prediction", "adaptive").toString())));
         form->addRow(L("Mosh local echo"), prediction);
+        auto *parallel = new QSpinBox;
+        parallel->setRange(1, 20);
+        parallel->setValue(std::clamp(settings.value("sftp/parallel", 5).toInt(), 1, 20));
+        form->addRow(L("Simultaneous SFTP transfers"), parallel);
         auto pemField = [&](const QString &key)
         {
             auto *edit = new QLineEdit(settings.value(key).toString());
@@ -1681,6 +1726,7 @@ private:
         settings.setValue("terminal/rightPaste", paste->isChecked());
         applyThemeKey(theme->currentData().toString());
         settings.setValue("mosh/prediction", prediction->currentData().toString());
+        settings.setValue("sftp/parallel", parallel->value());
         settings.setValue("servers/ftpCertificate", ftpCertificate->text().trimmed());
         settings.setValue("servers/ftpKey", ftpKey->text().trimmed());
         applyScheme(scheme->currentText());
@@ -3076,6 +3122,7 @@ public:
                         box->accept();
                 });
         skipPasswordPrompts.start(250);
+        monitoringByDefault = false; // the SSH test server has no /proc; the default is checked separately
         resize(1349, 819);
         wait(500, [] { return false; });
         shot("01-start.png");
@@ -3104,7 +3151,7 @@ public:
             }
             sample.resize(sample.sizeHint());
             shot("15-monitor-bar.png", &sample);
-            check(sample.findChildren<QFrame *>("monitorCell").size() == 8, "monitoring bar has its eight cells");
+            check(sample.findChildren<QFrame *>("monitorCell").size() == 11, "monitoring bar has its eleven cells");
         }
         open(0);
         auto *p = current();
@@ -3299,7 +3346,7 @@ public:
             applyAppearance(Appearance::MacLight);
             QCoreApplication::processEvents();
             check(qApp->styleSheet().contains("#007aff", Qt::CaseInsensitive) &&
-                      findChild<QToolBar *>("main")->iconSize().width() == 20,
+                      findChild<QToolBar *>("main")->iconSize().width() == 28,
                   "macOS light appearance applied live");
             shot("13-macos-light.png");
             applyAppearance(Appearance::MacDark);
@@ -3307,7 +3354,7 @@ public:
             check(qApp->styleSheet().contains("#0a84ff", Qt::CaseInsensitive), "macOS dark appearance applied live");
             shot("14-macos-dark.png");
             applyTheme(false);
-            check(qApp->styleSheet().contains("#141414") && findChild<QToolBar *>("main")->iconSize().width() == 24,
+            check(qApp->styleSheet().contains("#141414") && findChild<QToolBar *>("main")->iconSize().width() == 28,
                   "dark theme restored");
             applyScheme("Solarized Dark");
             check(p->terminal->background() == QColor("#002b36"), "terminal color scheme applied live");
@@ -4051,6 +4098,41 @@ public:
                       closed.state() != QAbstractSocket::ConnectedState,
                   "stopping tunnels closes the forwarded ports");
             tunnels = {};
+        }
+
+        // Per-session settings: Remote monitoring (on by default, "Loading…" until data), Follow terminal folder
+        // and zoom are restored when the session is opened again.
+        {
+            const auto key = sessionKey(profiles[0].toObject());
+            QSettings().remove(key);
+            QSettings().remove("session/last");
+            monitoringByDefault = true;
+            open(0);
+            auto *sp = current();
+            wait(500, [] { return false; });
+            check(sp->sftp->monitoring->isChecked() && sp->monitor && monitorBar->isVisible(),
+                  "Remote monitoring on by default for a new session");
+            const auto barText = monitorBar->findChild<QLabel *>("monitorError")->text();
+            check(barText == L("Loading…") || !sp->monitorError.isEmpty(),
+                  "monitoring bar shows Loading… until data: " + barText);
+            sp->sftp->monitoring->setChecked(false);
+            sp->sftp->setFollow(true);
+            sp->terminal->setFontPointSize(10);
+            QWheelEvent zoomIn(QPointF(10, 10), sp->terminal->mapToGlobal(QPointF(10, 10)), {}, {0, 240}, Qt::NoButton,
+                               Qt::ControlModifier, Qt::NoScrollPhase, false);
+            QCoreApplication::sendEvent(sp->terminal, &zoomIn);
+            closePage(sp);
+            open(0);
+            sp = current();
+            wait(500, [] { return false; });
+            check(!sp->sftp->monitoring->isChecked() && !sp->monitor, "Remote monitoring off remembered for the session");
+            check(sp->sftp->followBox()->isChecked(), "Follow terminal folder remembered for the session");
+            check(sp->terminal->font().pointSize() == 12, "terminal zoom remembered for the session");
+            sp->sftp->setFollow(false);
+            closePage(sp);
+            QSettings().remove(key);
+            QSettings().remove("session/last");
+            monitoringByDefault = false;
         }
 
         // Del on a session folder deletes it with its sessions and subfolders, after confirmation.
