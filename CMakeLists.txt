@@ -18,7 +18,8 @@ target_link_libraries(relaycore PUBLIC Qt6::Core Qt6::Widgets Qt6::Network)
 if(WIN32)
     target_link_libraries(relaycore PUBLIC advapi32 bcrypt ole32 oleaut32 uuid)
 elseif(APPLE)
-    target_link_libraries(relaycore PUBLIC "-framework Security" "-framework CoreFoundation")
+    # AppKit + objc: askpass helper processes stay out of the Dock (setActivationPolicy, main.cpp).
+    target_link_libraries(relaycore PUBLIC "-framework Security" "-framework CoreFoundation" "-framework AppKit" objc)
 endif()
 
 # Terminal and transports (PTY, telnet, rlogin, serial, mosh).
