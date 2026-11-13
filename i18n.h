@@ -132,7 +132,8 @@ inline void applyLanguage(const QString &code)
             rtl = l.rtl;
     }
     QLocale::setDefault(QLocale(code));
-    qApp->setLayoutDirection(rtl ? Qt::RightToLeft : Qt::LeftToRight);
+    if (qobject_cast<QGuiApplication *>(QCoreApplication::instance())) // askpass may run without a GUI application
+        QGuiApplication::setLayoutDirection(rtl ? Qt::RightToLeft : Qt::LeftToRight);
     QCoreApplication::installTranslator(catalog);
 }
 

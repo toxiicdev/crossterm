@@ -4,6 +4,8 @@
 // it asks the user. Yes/no questions (e.g. host key) become an explicit dialog, never an automatic answer.
 #include "credentials.h"
 #include "i18n.h"
+#include "profiles.h"
+#include <memory>
 #include <QtWidgets>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -14,6 +16,10 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#endif
+#ifdef Q_OS_MACOS
+#include <objc/message.h>
+#include <objc/runtime.h>
 #endif
 
 // Session passwords: typed once (in the askpass dialog) and reused by the terminal, SFTP browser,
@@ -239,9 +245,39 @@ static void writeAnswer(QString answer)
     answer.fill(QChar(0));
 }
 
-inline int runAskpass(QApplication &app)
+// Askpass runs as a plain QCoreApplication (no windowing system: on macOS no Dock icon, no focus change). Only
+// when a dialog is really needed it is replaced by a QApplication, which on macOS is an "accessory" app.
+inline int runAskpass(int &argc, char **argv)
 {
-    const auto prompt = app.arguments().value(1);
+    std::unique_ptr<QCoreApplication> app = std::make_unique<QCoreApplication>(argc, argv);
+    auto identity = [&]
+    {
+        app->setOrganizationName("CrossTerm");
+        app->setApplicationName("CrossTerm");
+    };
+    identity();
+    // Portable mode: the same settings (language) as the CrossTerm window that launched ssh.
+    if (const auto portable = portableRoot(QCoreApplication::applicationDirPath(), app->arguments()); !portable.isEmpty())
+    {
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, portable);
+    }
+    auto gui = [&]
+    {
+        app.reset();
+        app = std::make_unique<QApplication>(argc, argv);
+        identity();
+#ifdef Q_OS_MACOS
+        using SharedApplication = void *(*)(void *, SEL);
+        using SetPolicy = signed char (*)(void *, SEL, long);
+        void *nsApp = reinterpret_cast<SharedApplication>(objc_msgSend)(reinterpret_cast<void *>(objc_getClass("NSApplication")),
+                                                                        sel_registerName("sharedApplication"));
+        reinterpret_cast<SetPolicy>(objc_msgSend)(nsApp, sel_registerName("setActivationPolicy:"),
+                                                  1); // NSApplicationActivationPolicyAccessory: no Dock icon
+#endif
+        applyLanguage(currentLanguage());
+    };
+    const auto prompt = app->arguments().value(1);
     const auto target = qEnvironmentVariable("CROSSTERM_CREDENTIAL");
     const bool interactive = !qEnvironmentVariableIsSet("CROSSTERM_ASKPASS_NONINTERACTIVE");
     // Attempt counter for this ssh process (the file holds just a number).
@@ -266,6 +302,7 @@ inline int runAskpass(QApplication &app)
             writeAnswer(*inline_.value);
             return 0;
         }
+        gui();
         const auto answer = QMessageBox::question(nullptr, "CrossTerm", prompt.trimmed());
         writeAnswer(answer == QMessageBox::Yes ? "yes" : "no");
         return 0;
@@ -304,6 +341,7 @@ inline int runAskpass(QApplication &app)
         typed.value->fill(QChar(0));
         return 0;
     }
+    gui();
     QDialog dialog;
     dialog.setWindowTitle(L("Authentication"));
     auto *layout = new QVBoxLayout(&dialog);

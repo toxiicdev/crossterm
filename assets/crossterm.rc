@@ -1,0 +1,2 @@
+// Windows executable icon (Explorer, taskbar pinning, shortcuts).
+IDI_ICON1 ICON "crossterm.ico"

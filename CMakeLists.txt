@@ -31,10 +31,21 @@ elseif(WIN32)
     target_link_libraries(termwidget PUBLIC ws2_32)
 endif()
 
-add_executable(CrossTerm WIN32 MACOSX_BUNDLE main.cpp)
+# Application icon: .ico in the Windows executable, .icns in the macOS bundle (Dock, Finder), PNG as a resource
+# for the window icon everywhere (Linux taskbars).
+set(APP_ICON_SOURCES)
+if(WIN32)
+    list(APPEND APP_ICON_SOURCES assets/crossterm.rc)
+elseif(APPLE)
+    set(MACOSX_BUNDLE_ICON_FILE crossterm.icns)
+    set_source_files_properties(assets/crossterm.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    list(APPEND APP_ICON_SOURCES assets/crossterm.icns)
+endif()
+add_executable(CrossTerm WIN32 MACOSX_BUNDLE main.cpp ${APP_ICON_SOURCES})
 file(GLOB TRANSLATIONS CONFIGURE_DEPENDS i18n/*.json)
 list(FILTER TRANSLATIONS EXCLUDE REGEX "keys\\.json$")
 qt_add_resources(CrossTerm "translations" PREFIX "/" BASE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${TRANSLATIONS})
+qt_add_resources(CrossTerm "appicon" PREFIX "/" BASE "${CMAKE_CURRENT_SOURCE_DIR}" FILES assets/crossterm.png)
 target_link_libraries(CrossTerm PRIVATE termwidget)
 target_compile_definitions(CrossTerm PRIVATE CROSSTERM_VERSION="${PROJECT_VERSION}")
 

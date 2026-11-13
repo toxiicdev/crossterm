@@ -30,10 +30,6 @@
 #include <csignal>
 #include <unistd.h>
 #endif
-#ifdef Q_OS_MACOS
-#include <objc/message.h>
-#include <objc/runtime.h>
-#endif
 
 static QString platform()
 {
@@ -4399,7 +4395,7 @@ public:
         connect(hosts, &QFileSystemWatcher::fileChanged, this, [this, watchHosts] { watchHosts(), retryLogins(); });
         connect(hosts, &QFileSystemWatcher::directoryChanged, this, [this, watchHosts] { watchHosts(), retryLogins(); });
         setWindowTitle("CrossTerm");
-        setWindowIcon(icon("session"));
+        setWindowIcon(QIcon(":/assets/crossterm.png")); // same icon on every platform (assets/)
         resize(1200, 740); // restoreWindow() then applies the last saved size
         qApp->setStyle("Fusion");
         QFont interfaceFont("Segoe UI");
@@ -4998,7 +4994,10 @@ int main(int argc, char **argv)
         if (arguments.contains("--proxy-connect"))
             return runProxyConnect(arguments);
     }
+    if (isAskpassInvocation(argc))
+        return runAskpass(argc, argv); // ssh prompt helper: no window unless a dialog is needed
     QApplication app(argc, argv);
+    QApplication::setWindowIcon(QIcon(":/assets/crossterm.png")); // Dock / taskbar while running
     // Portable mode: INI settings and sessions in CrossTerm-data next to the executable.
     const auto portable = portableRoot(QCoreApplication::applicationDirPath(), app.arguments());
     if (!portable.isEmpty())
@@ -5006,24 +5005,6 @@ int main(int argc, char **argv)
         QDir().mkpath(portable);
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, portable);
-    }
-    if (isAskpassInvocation(argc))
-    {
-#ifdef Q_OS_MACOS
-        // ssh runs this binary (inside CrossTerm.app) for every prompt: as a regular app each copy would get its
-        // own Dock icon. Accessory = no Dock icon or app-switcher entry, dialogs still allowed.
-        {
-            using SharedApplication = void *(*)(void *, SEL);
-            using SetPolicy = signed char (*)(void *, SEL, long);
-            void *nsApp = reinterpret_cast<SharedApplication>(objc_msgSend)(
-                reinterpret_cast<void *>(objc_getClass("NSApplication")), sel_registerName("sharedApplication"));
-            reinterpret_cast<SetPolicy>(objc_msgSend)(nsApp, sel_registerName("setActivationPolicy:"),
-                                                      1); // NSApplicationActivationPolicyAccessory
-        }
-#endif
-        app.setOrganizationName("CrossTerm");
-        app.setApplicationName("CrossTerm");
-        return runAskpass(app);
     }
     app.setOrganizationName("CrossTerm");
     app.setApplicationName("CrossTerm");
