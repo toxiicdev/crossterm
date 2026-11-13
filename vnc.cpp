@@ -573,7 +573,7 @@ bool VncView::step()
         // SetPixelFormat: 32 bpp, depth 24, little-endian, true colour, max 255, shift 16/8/0.
         send(QByteArray("\0\0\0\0\x20\x18\0\x01\0\xff\0\xff\0\xff\x10\x08\0\0\0\0", 20));
         const qint32 encodings[] = {16, 5, 2, 1, 0, -223}; // ZRLE, Hextile, RRE, CopyRect, Raw, DesktopSize
-        QByteArray message = QByteArray(" ", 2) + be16(quint16(std::size(encodings)));
+        QByteArray message = QByteArray("\x02\x00", 2) + be16(quint16(std::size(encodings)));
         for (qint32 e : encodings)
             message += be32(quint32(e));
         send(message);

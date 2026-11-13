@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #if defined(Q_OS_MACOS)
 #include <util.h>
@@ -269,7 +270,7 @@ struct Terminal::State
             ClosePseudoConsole(console);
 #else
         if (fd >= 0)
-            close(fd);
+            ::close(fd); // global close(): QWidget::close would shadow it
         if (pid > 0)
         {
             kill(pid, SIGHUP);
