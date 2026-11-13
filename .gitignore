@@ -1,0 +1,19 @@
+# Build output and package (Qt and VcXsrv binaries)
+build/
+build-*/
+dist/
+*.user
+.vs/
+CMakeUserPresets.json
+
+# Local analysis and internal notes
+reverse-engineering/
+HANDOFF-*.md
+RAPPORTO.md
+GAPS.md
+i18n/new-keys.json
+
+# Local assistant notes and code graph
+CLAUDE.md
+.claude/
+graphify-out/

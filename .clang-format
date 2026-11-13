@@ -1,0 +1,11 @@
+BasedOnStyle: Microsoft
+BreakBeforeBraces: Allman
+IndentWidth: 4
+ColumnLimit: 130
+SortIncludes: Never
+AllowShortLambdasOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: Inline
+PointerAlignment: Right
+AccessModifierOffset: -4
+BreakStringLiterals: false

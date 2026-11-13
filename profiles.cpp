@@ -1,0 +1,619 @@
+#include "profiles.h"
+#include "proxy.h"
+#include <algorithm>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QHash>
+#include <QJsonDocument>
+#include <QRegularExpression>
+#include <QStringDecoder>
+#include <QUuid>
+#include <QSet>
+#include <QMap>
+
+static const QStringList types{"ssh",    "telnet", "rsh",   "xdmcp",   "rdp",  "vnc",    "ftp", "sftp",
+                               "serial", "file",   "shell", "browser", "mosh", "rlogin", "wsl"};
+
+int defaultPort(const QString &protocol)
+{
+    const int ports[]{22, 23, 514, 177, 3389, 5900, 21, 22, 0, 0, 0, 0, 22, 513, 0};
+    const int index = types.indexOf(protocol);
+    return index < 0 ? 0 : ports[index];
+}
+
+bool validHost(const QString &host)
+{
+    static const QRegularExpression pattern("^(?:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,252}|(?=[0-9a-fA-F:.]*:)[0-9a-fA-F:.]+)$");
+    return pattern.match(host).hasMatch();
+}
+
+static QString decode(const QByteArray &bytes)
+{
+    if (bytes.startsWith("\xff\xfe") || bytes.startsWith("\xfe\xff"))
+        return QStringDecoder(QStringDecoder::Utf16).decode(bytes);
+    QStringDecoder utf8(QStringDecoder::Utf8);
+    QString value = utf8.decode(bytes);
+    if (!utf8.hasError())
+        return value;
+    value = QString::fromLatin1(bytes);
+    const QString substitutions = QString::fromUtf8("€\u0081‚ƒ„…†‡ˆ‰Š‹Œ\u008dŽ\u008f\u0090‘’“”•–—˜™š›œ\u009džŸ");
+    for (auto &c : value)
+    {
+        if (c.unicode() >= 128 && c.unicode() <= 159)
+            c = substitutions.at(c.unicode() - 128);
+    }
+    return value;
+}
+
+static QString hostValue(QString host)
+{
+    host = host.trimmed();
+    if (host.startsWith('[') && host.endsWith(']'))
+        return host.mid(1, host.size() - 2);
+    return host;
+}
+
+static QString bracket(const QString &host)
+{
+    return host.contains(':') ? "[" + host + "]" : host;
+}
+
+static bool flag(const QString &value)
+{
+    return value == "-1" || value == "1";
+}
+static bool option(const QString &value)
+{
+    return !value.isEmpty() && value != "0";
+}
+static QString uuid()
+{
+    return QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+static bool safeUser(const QString &user)
+{
+    static const QRegularExpression pattern("^(?:[a-zA-Z0-9_][a-zA-Z0-9_.@\\\\-]{0,127})?$");
+    return pattern.match(user).hasMatch();
+}
+static QString readUser(QString user, QJsonArray &issues, const QMap<QString, QString> &accounts)
+{
+    if (user.startsWith('[') && user.endsWith(']'))
+    {
+        const auto account = accounts.value(user.mid(1, user.size() - 2).toCaseFolded());
+        if (!account.isEmpty())
+            return account;
+    }
+    if (user.contains('['))
+    {
+        issues.append("Sostituisci il riferimento alla credenziale con il nome utente remoto.");
+        return {};
+    }
+    if (user.compare("<default>", Qt::CaseInsensitive) == 0)
+        return {};
+    if (!safeUser(user))
+        issues.append("Nome utente da verificare.");
+    return user;
+}
+
+Import parseMoba(const QByteArray &bytes, const QString &drive)
+{
+    static const QRegularExpression lines("[\r\n]+");
+    static const QRegularExpression section("^\\[([^\\]]+)\\]\\s*(?:;.*)?$");
+    static const QRegularExpression bookmarkSection("^Bookmarks(?:_\\d+)?$", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression bookmark("^(?:;\\s*logout\\s*)?#-?\\d+#(\\d+(?:%[^#]*)?)(?:#|$)");
+    const auto rows = decode(bytes).split(lines);
+    bool inside = true;
+    for (const auto &line : rows)
+    {
+        if (section.match(line.trimmed()).hasMatch())
+        {
+            inside = false;
+            break;
+        }
+    }
+    QMap<QString, QString> accounts;
+    QSet<QString> protectedAliases, protectedEndpoints;
+    bool credentials = false, passwords = false;
+    int accountCount = 0, secretCount = 0;
+    for (const auto &row : rows)
+    {
+        const auto heading = section.match(row.trimmed());
+        if (heading.hasMatch())
+        {
+            credentials = heading.captured(1).compare("Credentials", Qt::CaseInsensitive) == 0;
+            passwords = heading.captured(1).compare("Passwords", Qt::CaseInsensitive) == 0;
+            continue;
+        }
+        const int eq = row.indexOf('=');
+        if (passwords && eq > 0 && !row.mid(eq + 1).trimmed().isEmpty())
+        {
+            ++secretCount;
+            protectedEndpoints.insert(row.left(eq).trimmed().toCaseFolded());
+        }
+        if (!credentials)
+            continue;
+        const int colon = row.indexOf(':', eq + 1);
+        if (eq <= 0 || colon <= eq)
+            continue;
+        ++accountCount;
+        if (!row.mid(colon + 1).trimmed().isEmpty())
+        {
+            ++secretCount;
+            protectedAliases.insert(row.left(eq).trimmed().toCaseFolded());
+        }
+        const auto user = row.mid(eq + 1, colon - eq - 1).trimmed();
+        if (!user.isEmpty() && safeUser(user))
+            accounts.insert(row.left(eq).trimmed().toCaseFolded(), user);
+    }
+    Import result;
+    result.accounts = accountCount;
+    result.secrets = secretCount;
+    QString folder;
+    QJsonArray pending;
+    auto flush = [&]
+    {
+        for (const auto &entry : pending)
+        {
+            auto profile = entry.toObject();
+            profile["folder"] = folder;
+            result.profiles.append(profile);
+        }
+        pending = {};
+        folder.clear();
+    };
+    for (const auto &row : rows)
+    {
+        const auto line = row.trimmed();
+        if (line.isEmpty() || line.startsWith(';') || line.startsWith('#'))
+            continue;
+        const auto heading = section.match(line);
+        if (heading.hasMatch())
+        {
+            flush();
+            inside = bookmarkSection.match(heading.captured(1)).hasMatch();
+            continue;
+        }
+        if (!inside)
+            continue;
+        const int equals = line.indexOf('=');
+        const auto name = line.left(equals).trimmed();
+        const auto value = line.mid(equals + 1).trimmed();
+        if (name.compare("SubRep", Qt::CaseInsensitive) == 0 && equals > 0)
+        {
+            folder = value;
+            continue;
+        }
+        if (name.compare("ImgNum", Qt::CaseInsensitive) == 0 && equals > 0)
+            continue;
+        const auto match = bookmark.match(value);
+        if (!match.hasMatch() || equals <= 0)
+        {
+            result.warnings.append("Una voce di sessione ha un formato non riconosciuto.");
+            continue;
+        }
+        const auto fields = match.captured(1).split('%');
+        bool validType = false;
+        const auto type = fields[0].toInt(&validType);
+        const auto protocol = validType ? types.value(type, "unsupported") : QString("unsupported");
+        const auto host = hostValue(fields.value(1));
+        const auto rawPort = fields.value(2);
+        const int port = rawPort.isEmpty() ? defaultPort(protocol) : rawPort.toInt();
+        QJsonArray issues, jumps;
+        QString user, identity;
+        if (protocol == "ssh" || protocol == "sftp" || protocol == "rdp" || protocol == "ftp")
+            user = readUser(protocol == "ssh" && flag(fields.value(12)) ? QString{} : fields.value(3), issues, accounts);
+        const bool ssh = protocol == "ssh";
+        const bool sftp = protocol == "sftp";
+        if (ssh || sftp)
+        {
+            identity = fields.value(ssh ? 14 : 9);
+            if (identity.startsWith("_CurrentDrive_") && !drive.isEmpty())
+            {
+                auto tail = identity.mid(14);
+                if (tail.startsWith(':'))
+                    tail.remove(0, 1);
+                identity = drive + ":" + tail;
+            }
+            if (identity.startsWith("_CurrentDrive_"))
+                issues.append("Seleziona la chiave privata locale.");
+        }
+        if (ssh && !fields.value(8).isEmpty())
+        {
+            const auto hosts = fields.value(8).split("__PIPE__");
+            const auto ports = fields.value(9).split("__PIPE__");
+            const auto users = fields.value(10).split("__PIPE__");
+            for (int i = 0; i < hosts.size(); ++i)
+            {
+                jumps.append(QJsonObject{{"host", hostValue(hosts[i])},
+                                         {"port", ports.value(i, "22").isEmpty() ? 22 : ports.value(i, "22").toInt()},
+                                         {"user", readUser(users.value(i), issues, accounts)}});
+            }
+        }
+        if ((ssh &&
+             (option(fields.value(19)) || !fields.value(7).isEmpty() || option(fields.value(13)) || !fields.value(15).isEmpty() ||
+              fields.value(27) == "2" || !fields.value(28).isEmpty() || !fields.value(29).isEmpty() ||
+              !fields.value(30).isEmpty() || flag(fields.value(31)) || fields.value(33) == "0" || flag(fields.value(34)) ||
+              !fields.value(35).isEmpty() || !fields.value(36).isEmpty() || flag(fields.value(37)))) ||
+            (sftp && (option(fields.value(10)) || fields.value(4) == "0" || !fields.value(6).isEmpty() || flag(fields.value(7)) ||
+                      !fields.value(15).isEmpty())) ||
+            (protocol == "rdp" && (!fields.value(12).isEmpty() || !fields.value(13).isEmpty() || !fields.value(20).isEmpty() ||
+                                   option(fields.value(30)))) ||
+            (protocol == "vnc" && (flag(fields.value(4)) || !fields.value(5).isEmpty() || flag(fields.value(11)) ||
+                                   !fields.value(12).isEmpty() || option(fields.value(13)))) ||
+            (protocol == "telnet" && (!fields.value(6).isEmpty() || option(fields.value(11)))))
+            issues.append("Rivedi le opzioni avanzate di connessione nel client.");
+        if (defaultPort(protocol) && (!validHost(host) || port < 1 || port > 65535))
+            issues.append("Indirizzo o porta da verificare.");
+        const auto id = uuid();
+        const auto reference = fields.value(3).trimmed();
+        const auto endpoint = (user + "@" + host).toCaseFolded();
+        if ((ssh || sftp) && !user.isEmpty() &&
+            ((reference.startsWith('[') && reference.endsWith(']') &&
+              protectedAliases.contains(reference.mid(1, reference.size() - 2).toCaseFolded())) ||
+             protectedEndpoints.contains(endpoint) || protectedEndpoints.contains(protocol + ":" + endpoint) ||
+             protectedEndpoints.contains(protocol + ":" + endpoint + ":" + QString::number(port))))
+            result.passwordProfiles.append(id);
+        pending.append(QJsonObject{{"id", id},
+                                   {"name", name},
+                                   {"protocol", protocol},
+                                   {"host", defaultPort(protocol) ? host : QString{}},
+                                   {"port", port},
+                                   {"user", user},
+                                   {"identity", identity},
+                                   {"jumps", jumps},
+                                   {"compression", flag(fields.value(ssh    ? 6
+                                                                     : sftp ? 5
+                                                                            : 99))},
+                                   {"x11", ssh && flag(fields.value(5))},
+                                   {"issues", issues}});
+    }
+    flush();
+    if (result.profiles.isEmpty())
+        result.warnings.append("Nessuna sessione MobaXterm riconosciuta.");
+    return result;
+}
+
+QJsonArray mergeProfiles(QJsonArray current, const QJsonArray &incoming)
+{
+    auto key = [](const QJsonValue &value)
+    {
+        const auto p = value.toObject();
+        return QJsonDocument(QJsonArray{p["name"], p["folder"], p["protocol"], p["host"], p["port"], p["user"]})
+            .toJson(QJsonDocument::Compact);
+    };
+    QSet<QByteArray> seen;
+    for (const auto &item : current)
+        seen.insert(key(item));
+    for (const auto &item : incoming)
+    {
+        const auto imported = item.toObject();
+        bool repaired = false;
+        if (!imported["user"].toString().isEmpty())
+        {
+            for (int i = 0; i < current.size(); ++i)
+            {
+                auto previous = current[i].toObject();
+                if (!previous["user"].toString().isEmpty())
+                    continue;
+                auto compare = previous;
+                compare["user"] = imported["user"];
+                if (key(compare) != key(imported))
+                    continue;
+                QJsonArray issues;
+                for (const auto &issue : previous["issues"].toArray())
+                {
+                    if (issue.toString() != "Sostituisci il riferimento alla credenziale con il nome utente remoto.")
+                        issues.append(issue);
+                }
+                if (issues.size() == previous["issues"].toArray().size())
+                    continue;
+                previous["user"] = imported["user"];
+                previous["issues"] = issues;
+                current.replace(i, previous);
+                seen.insert(key(previous));
+                repaired = true;
+                break;
+            }
+        }
+        if (repaired)
+            continue;
+        const auto id = key(item);
+        if (!seen.contains(id))
+        {
+            current.append(item);
+            seen.insert(id);
+        }
+    }
+    return current;
+}
+
+Command sessionCommand(const QJsonObject &profile, const QString &platform, bool display)
+{
+    const auto protocol = profile["protocol"].toString();
+    if (protocol == "wsl")
+    {
+        const auto distro = profile["host"].toString().trimmed();
+        if (platform != "windows" || distro.isEmpty() || distro.startsWith('-') || distro.contains(QChar(0)))
+            return {{}, {}, "Distribuzione WSL non valida o non disponibile su questa piattaforma."};
+        return {"wsl.exe", {"--distribution", distro}, {}};
+    }
+    const auto host = hostValue(profile["host"].toString());
+    const auto user = profile["user"].toString();
+    const auto key = profile["identity"].toString();
+    const int port = profile["port"].toInt();
+    if (!profile["issues"].toArray().isEmpty())
+        return {{}, {}, "Rivedi le impostazioni importate."};
+    if (!validHost(host) || port < 1 || port > 65535 || !safeUser(user) || key.startsWith('-') ||
+        key.contains(QRegularExpression("[\\x00-\\x1f\\x7f]")))
+        return {{}, {}, "Host, porta, utente o percorso della chiave non valido."};
+    const auto destination = bracket(host) + ":" + QString::number(port);
+    if (protocol != "ssh" && protocol != "sftp" &&
+        (!profile["jumps"].toArray().isEmpty() || !key.isEmpty() || profile["x11"].toBool() || profile["compression"].toBool()))
+        return {{}, {}, "Le opzioni SSH richiedono un profilo SSH o SFTP."};
+    if (protocol == "rdp")
+    {
+        if (platform == "windows")
+            return {"mstsc.exe", {"/v:" + destination}, {}};
+        QStringList args{"/v:" + destination};
+        if (!user.isEmpty())
+            args << "/u:" + user;
+        return {"xfreerdp", args, {}};
+    }
+    if (protocol == "vnc")
+        return {"vncviewer", {bracket(host) + "::" + QString::number(port)}, {}};
+    if (protocol == "telnet")
+        return {"telnet", {host, QString::number(port)}, {}};
+    if (protocol == "ftp")
+    {
+        const auto endpoint = "ftp://" + destination;
+        QStringList args;
+        if (!user.isEmpty())
+            args << "-u" << user;
+        return {"lftp", args << endpoint, {}};
+    }
+    if (protocol != "ssh" && protocol != "sftp")
+        return {{}, {}, "Protocollo ancora da implementare."};
+    const bool ssh = protocol == "ssh";
+    QStringList args{ssh ? "-p" : "-P", QString::number(port)};
+    if (!user.isEmpty())
+        args << (ssh ? "-l" : "-o") << (ssh ? user : "User=" + user);
+    if (!key.isEmpty())
+        args << "-i" << key;
+    QStringList hops;
+    for (const auto &item : profile["jumps"].toArray())
+    {
+        const auto hop = item.toObject();
+        const auto hopHost = hop["host"].toString();
+        const auto hopUser = hop["user"].toString();
+        const int hopPort = hop["port"].toInt();
+        if (!validHost(hopHost) || !safeUser(hopUser) || hopUser.contains('@') || hopUser.contains('\\') || hopPort < 1 ||
+            hopPort > 65535)
+            return {{}, {}, "Gateway SSH non valido."};
+        hops << (hopUser.isEmpty() ? QString{} : hopUser + "@") + bracket(hopHost) + ":" + QString::number(hopPort);
+    }
+    if (!hops.isEmpty())
+        args << "-J" << hops.join(',');
+    if (profile["compression"].toBool())
+        args << "-C";
+    args << "-o" << "ServerAliveInterval=30"; // Keepalive for SSH sessions and the SFTP browser
+    // X11: on Windows ssh has no xauth for "untrusted" cookies, so use -Y (trusted) with the local X server.
+    if (ssh && display && profile["x11"].toBool())
+        args << (platform == "windows" ? "-Y" : "-X");
+    // HTTP/SOCKS proxy: CrossTerm itself acts as the ProxyCommand (ssh ignores it when jump hosts are set).
+    const auto proxyType = profile["proxyType"].toString();
+    if (!proxyType.isEmpty() && proxyType != "none")
+    {
+        const auto proxy = proxyArguments(proxyType, profile["proxyHost"].toString(), profile["proxyPort"].toInt(),
+                                          QCoreApplication::applicationFilePath());
+        if (proxy.isEmpty())
+            return {{}, {}, "Proxy non valido."};
+        args << proxy;
+    }
+    args << "--" << (ssh ? host : bracket(host));
+    return {protocol, args, {}};
+}
+
+bool parseListing(const QString &line, RemoteEntry &entry)
+{
+    // The link count is optional: some SFTP servers omit it from the longname.
+    static const QRegularExpression pattern(
+        "^([-dlbcps][-rwxsStT]{9})\\S*(?:\\s+\\d+)?\\s+(\\S+)\\s+(\\S+)\\s+(\\d+)\\s+(\\S+\\s+\\d+\\s+[\\d:]+)\\s(.+)$");
+    const auto m = pattern.match(line);
+    if (!m.hasMatch())
+        return false;
+    entry.access = m.captured(1);
+    entry.owner = m.captured(2);
+    entry.group = m.captured(3);
+    entry.size = m.captured(4).toLongLong();
+    entry.modified = m.captured(5).simplified();
+    entry.name = m.captured(6);
+    entry.dir = entry.access.startsWith('d');
+    entry.link = entry.access.startsWith('l');
+    if (entry.link && entry.name.contains(" -> "))
+        entry.name = entry.name.section(" -> ", 0, 0);
+    return entry.name != "." && entry.name != "..";
+}
+
+QJsonArray applyImport(QJsonArray current, const QJsonArray &incoming, ImportPolicy policy)
+{
+    if (policy == ImportPolicy::Merge)
+        return mergeProfiles(current, incoming);
+    auto identity = [](const QJsonObject &p)
+    { return (p["name"].toString() + "\n" + p["folder"].toString() + "\n" + p["protocol"].toString()).toCaseFolded(); };
+    for (const auto &value : incoming)
+    {
+        const auto item = value.toObject();
+        int found = -1;
+        for (int i = 0; i < current.size() && found < 0; ++i)
+        {
+            if (identity(current[i].toObject()) == identity(item))
+                found = i;
+        }
+        if (found < 0)
+            current.append(item);
+        else if (policy == ImportPolicy::Replace)
+        {
+            auto replaced = item;
+            replaced["id"] = current[found].toObject()["id"];
+            current.replace(found, replaced);
+        }
+    }
+    return current;
+}
+
+QRect fitToArea(QRect window, const QRect &area)
+{
+    if (area.isEmpty())
+        return window;
+    window.setWidth(std::min(window.width(), area.width()));
+    window.setHeight(std::min(window.height(), area.height()));
+    window.moveLeft(std::clamp(window.left(), area.left(), area.right() - window.width() + 1));
+    window.moveTop(std::clamp(window.top(), area.top(), area.bottom() - window.height() + 1));
+    return window;
+}
+
+// Messages stay stored in profiles as Italian identifiers (compatibility with existing data);
+// here they become the English source text, translated into the current language.
+QString describe(const QString &message)
+{
+    static const QHash<QString, const char *> sources{
+        {"Sostituisci il riferimento alla credenziale con il nome utente remoto.",
+         "Replace the credential reference with the remote user name."},
+        {"Nome utente da verificare.", "Check the user name."},
+        {"Una voce di sessione ha un formato non riconosciuto.", "A session entry has an unrecognized format."},
+        {"Seleziona la chiave privata locale.", "Select the local private key."},
+        {"Rivedi le opzioni avanzate di connessione nel client.", "Review the advanced connection options."},
+        {"Indirizzo o porta da verificare.", "Check the address or port."},
+        {"Nessuna sessione MobaXterm riconosciuta.", "No MobaXterm session recognized."},
+        {"Rivedi le impostazioni importate.", "Review the imported settings."},
+        {"Host, porta, utente o percorso della chiave non valido.", "Invalid host, port, user or key path."},
+        {"Le opzioni SSH richiedono un profilo SSH o SFTP.", "SSH options require an SSH or SFTP session."},
+        {"Protocollo ancora da implementare.", "This protocol is not supported yet."},
+        {"Gateway SSH non valido.", "Invalid SSH gateway."},
+        {"Proxy non valido.", "Invalid proxy: check the type, host and port."},
+        {"Tunnel non valido.", "Invalid tunnel: check the ports and the destination host."},
+    };
+    const auto source = sources.value(message);
+    return source ? QCoreApplication::translate("CrossTerm", source) : message;
+}
+
+Command tunnelCommand(const QJsonObject &tunnel, const QJsonObject &profile, const QString &platform)
+{
+    auto ssh = profile;
+    ssh["protocol"] = "ssh";
+    ssh["x11"] = false;
+    auto command = sessionCommand(ssh, platform, false);
+    if (!command.error.isEmpty())
+        return command;
+    const auto type = tunnel["type"].toString();
+    const int listen = tunnel["listenPort"].toInt(), port = tunnel["destPort"].toInt();
+    const auto host = tunnel["destHost"].toString().trimmed();
+    if (listen < 1 || listen > 65535 || (type != "dynamic" && (port < 1 || port > 65535 || !validHost(host))))
+        return {{}, {}, "Tunnel non valido."};
+    const auto target = (host.contains(':') ? "[" + host + "]" : host) + ":" + QString::number(port);
+    QStringList forward;
+    if (type == "local")
+        forward = {"-L", "127.0.0.1:" + QString::number(listen) + ":" + target};
+    else if (type == "remote")
+        forward = {"-R", QString::number(listen) + ":" + target};
+    else if (type == "dynamic")
+        forward = {"-D", "127.0.0.1:" + QString::number(listen)};
+    else
+        return {{}, {}, "Tunnel non valido."};
+    // -N: no shell; ExitOnForwardFailure: fail immediately if the port is not available.
+    const int at = int(command.arguments.indexOf("--"));
+    command.arguments = command.arguments.mid(0, at) +
+                        QStringList{"-N", "-o", "ExitOnForwardFailure=yes", "-o", "StrictHostKeyChecking=yes"} + forward +
+                        command.arguments.mid(at);
+    return command;
+}
+
+static QStringList csvFields(const QString &line, QChar separator)
+{
+    QStringList fields;
+    QString field;
+    bool quoted = false;
+    for (int i = 0; i < line.size(); ++i)
+    {
+        const QChar c = line[i];
+        if (quoted)
+        {
+            if (c == '"' && i + 1 < line.size() && line[i + 1] == '"')
+                field += '"', ++i;
+            else if (c == '"')
+                quoted = false;
+            else
+                field += c;
+        }
+        else if (c == '"')
+            quoted = true;
+        else if (c == separator)
+            fields << field.trimmed(), field.clear();
+        else
+            field += c;
+    }
+    fields << field.trimmed();
+    return fields;
+}
+
+Import parseCsv(const QByteArray &bytes)
+{
+    Import result;
+    auto text = QString::fromUtf8(bytes);
+    if (text.startsWith(QChar(0xfeff)))
+        text.remove(0, 1);
+    const auto lines = text.split(QRegularExpression("[\r\n]+"), Qt::SkipEmptyParts);
+    if (lines.isEmpty())
+    {
+        result.warnings << "Nessuna sessione MobaXterm riconosciuta.";
+        return result;
+    }
+    const QChar separator = lines[0].count(';') > lines[0].count(',') ? ';' : ',';
+    const auto header = csvFields(lines[0].toLower(), separator);
+    const int name = int(header.indexOf("name")), host = int(header.indexOf("host"));
+    if (name < 0 || host < 0)
+    {
+        result.warnings << "Una voce di sessione ha un formato non riconosciuto.";
+        return result;
+    }
+    const int protocol = int(header.indexOf("protocol")), port = int(header.indexOf("port")), user = int(header.indexOf("user")),
+              folder = int(header.indexOf("folder"));
+    for (int i = 1; i < lines.size(); ++i)
+    {
+        const auto f = csvFields(lines[i], separator);
+        const auto kind = (protocol >= 0 ? f.value(protocol) : QString("ssh")).toLower();
+        const auto address = f.value(host).trimmed();
+        const int number = port >= 0 && !f.value(port).isEmpty() ? f.value(port).toInt() : defaultPort(kind);
+        QJsonArray issues;
+        if (!defaultPort(kind))
+            issues.append("Protocollo ancora da implementare.");
+        else if (!validHost(address) || number < 1 || number > 65535)
+            issues.append("Indirizzo o porta da verificare.");
+        if (f.value(name).isEmpty())
+        {
+            result.warnings << "Una voce di sessione ha un formato non riconosciuto.";
+            continue;
+        }
+        result.profiles.append(QJsonObject{{"id", uuid()},
+                                           {"name", f.value(name)},
+                                           {"folder", folder >= 0 ? f.value(folder) : QString()},
+                                           {"protocol", kind},
+                                           {"host", address},
+                                           {"port", number},
+                                           {"user", user >= 0 ? f.value(user) : QString()},
+                                           {"identity", QString()},
+                                           {"jumps", QJsonArray{}},
+                                           {"compression", false},
+                                           {"x11", false},
+                                           {"issues", issues}});
+    }
+    return result;
+}
+
+QString portableRoot(const QString &executableDir, const QStringList &arguments)
+{
+    if (arguments.contains("--portable") || QFileInfo::exists(QDir(executableDir).filePath("CrossTerm.portable")))
+        return QDir(executableDir).filePath("CrossTerm-data");
+    return {};
+}
