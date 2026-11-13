@@ -51,5 +51,11 @@ echo "Using Qt: $QT_PREFIX"
 cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$QT_PREFIX"
 cmake --build "$BUILD" --parallel
 QT_QPA_PLATFORM=offscreen ctest --test-dir "$BUILD" --output-on-failure || echo "Some tests failed (see above)."
-"$QT_PREFIX/bin/macdeployqt" "$BUILD/CrossTerm.app"
+# Homebrew keeps Qt modules and their dependencies (webp, brotli...) in its own lib folder.
+BREW_LIB="$(brew --prefix 2>/dev/null || true)/lib"
+if [ -d "$BREW_LIB" ]; then
+    "$QT_PREFIX/bin/macdeployqt" "$BUILD/CrossTerm.app" -libpath="$BREW_LIB"
+else
+    "$QT_PREFIX/bin/macdeployqt" "$BUILD/CrossTerm.app"
+fi
 echo "Built: $BUILD/CrossTerm.app"

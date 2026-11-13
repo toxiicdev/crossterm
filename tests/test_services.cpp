@@ -407,8 +407,9 @@ static void testMonitor()
 
 static void testXServer()
 {
-    const XServerInfo vcxsrv{"VcXsrv", "C:\\X\\vcxsrv.exe"}, xming{"Xming", "C:\\X\\Xming.exe"},
-        xwin{"Cygwin/X", "C:\\cygwin64\\bin\\XWin.exe"}, x410{"X410", "C:\\X\\X410.exe"};
+    // '/' separators: valid on Windows and recognized by QFileInfo on every platform.
+    const XServerInfo vcxsrv{"VcXsrv", "C:/X/vcxsrv.exe"}, xming{"Xming", "C:/X/Xming.exe"},
+        xwin{"Cygwin/X", "C:/cygwin64/bin/XWin.exe"}, x410{"X410", "C:/X/X410.exe"};
     CHECK(xserverCommand(vcxsrv, 0, "multiwindow").arguments == QStringList({":0", "-multiwindow", "-clipboard", "-wgl", "-ac"}))
     CHECK(xserverCommand(vcxsrv, 3, "rootless").arguments == QStringList({":3", "-rootless", "-clipboard", "-wgl", "-ac"}))
     CHECK(xserverCommand(vcxsrv, 1, "xdmcp", "unix.example").arguments ==

@@ -146,7 +146,8 @@ static void testHttp(const QString &root)
     CHECK(!server.isRunning());
     QTcpSocket socket;
     socket.connectToHost(QHostAddress::LocalHost, port);
-    CHECK(!socket.waitForConnected(1000));
+    // A connection can only be TCP "self-connect" (source port == closed server port, seen on macOS/Linux).
+    CHECK(!socket.waitForConnected(1000) || socket.localPort() == socket.peerPort());
 }
 
 static void testJail(const QString &root)
