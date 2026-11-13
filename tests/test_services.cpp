@@ -307,7 +307,11 @@ static const char *fixture =
     "  eth0: 1000100    5001    0    0    0     0          0         0   502500    4003    0    0    0     0       0          0\n"
     "@@mem\nMemTotal:        4005484 kB\nMemFree:          812344 kB\nMemAvailable:    3271481 kB\n"
     "@@df\nFilesystem     1024-blocks     Used Available Capacity Mounted on\n"
-    "/dev/sda1         20511312 10156340   9290400      52% /\n@@end\n";
+    "/dev/sda1         20511312 10156340   9290400      52% /\n"
+    "tmpfs               401000      1200    399800       1% /run\n"
+    "/dev/loop3           65536     65536         0     100% /snap/core/1\n"
+    "/dev/sdd          1055762868 38231956 963827440      4% /etc/hosts\n"
+    "/dev/sda2           999320     58200    872308       6% /boot\n@@end\n";
 
 static void testMonitor()
 {
@@ -321,8 +325,8 @@ static void testMonitor()
     CHECK(stats.memTotal == 4005484LL * 1024 && stats.memUsed == (4005484LL - 3271481) * 1024)
     CHECK(stats.rxPerSec == 100 && stats.txPerSec == 2500) // lo excluded
     CHECK(stats.uptimeSeconds == 1213325 && stats.diskPercent == 52)
-    const QStringList expected{"server01", "CPU 7%", "0.70 GB / 3.82 GB", "↑ 0.02 Mb/s", "↓ 0.00 Mb/s", "14 days",
-                               "root",     "/: 52%"};
+    const QStringList expected{"server01", "7%",   "0.70 GB / 3.82 GB", "0.02 Mb/s", "0.00 Mb/s",
+                               "14 days",  "root", "/: 52%   /boot: 6%"}; // tmpfs and snap loops left out
     CHECK(monitorTexts(stats) == expected)
     MonitorStats partial;
     partial.uptimeSeconds = 3725;
@@ -338,11 +342,11 @@ static void testMonitor()
     MonitorBar bar;
     bar.show(parseMonitor(fixture, stats) ? stats : MonitorStats{});
     QStringList shown;
-    for (auto *label : bar.findChildren<QLabel *>())
+    for (auto *label : bar.findChildren<QLabel *>("monitorText"))
         shown << label->text();
     CHECK(shown == expected)
     bar.showError("connection lost");
-    CHECK(bar.findChildren<QLabel *>().first()->text() == "connection lost")
+    CHECK(bar.findChild<QLabel *>("monitorError")->text() == "connection lost")
 
     // Command: -T first, script as the remote command after "-- host"
     QJsonObject profile{{"protocol", "ssh"}, {"host", "127.0.0.1"}, {"port", 2223}, {"user", "linuxtest"}, {"identity", sshKey}};

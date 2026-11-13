@@ -106,6 +106,23 @@ int main(int argc, char **argv)
                                    "[Bookmarks]\nS=#109#0%h.example%22%[login]#");
     CHECK(secured.accounts == 1 && secured.secrets == 2)
     CHECK(!QString(QJsonDocument(secured.profiles).toJson()).contains("protected"))
+    // MobaXterm master-password encryption: AES-256 (FIPS-197 C.3 vector), CFB8 round trip, wrong master password.
+    CHECK(aes256EncryptBlock(QByteArray::fromHex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
+                             QByteArray::fromHex("00112233445566778899aabbccddeeff"))
+              .toHex() == "8ea2b7ca516745bfeafc49904b496089")
+    const auto sealed = encryptMobaPassword("s3cret-Pässword!", "master");
+    CHECK(sealed != "s3cret-Pässword!" && decryptMobaPassword(sealed, "master") == QString("s3cret-Pässword!"))
+    CHECK(!decryptMobaPassword(encryptMobaPassword("a-longer-password-123", "master"), "wrong"))
+    // Real key formats: [Passwords] "ssh22:user@host" and [Credentials] "name=user:encrypted"; values stay in memory.
+    const auto keyed = parseMoba("[Credentials]\nwork=carol:" + encryptMobaPassword("pw-carol", "m").toLatin1() +
+                                 "\n[Passwords]\nssh22:root@10.0.0.5=" + encryptMobaPassword("pw-root", "m").toLatin1() +
+                                 "\n[Bookmarks]\nA=#109#0%10.0.0.5%22%root#\nB=#109#0%h.example%22%[work]#\n");
+    CHECK(keyed.profiles.size() == 2 && keyed.encryptedPasswords.size() == 2)
+    CHECK(decryptMobaPassword(keyed.encryptedPasswords.value(keyed.profiles[0].toObject()["id"].toString()), "m") ==
+          QString("pw-root"))
+    CHECK(decryptMobaPassword(keyed.encryptedPasswords.value(keyed.profiles[1].toObject()["id"].toString()), "m") ==
+          QString("pw-carol"))
+    CHECK(!QString(QJsonDocument(keyed.profiles).toJson()).contains("pw-"))
     // Import policies.
     QJsonObject existing{{"id", "keep"},      {"name", "web"},         {"folder", "A"},
                          {"protocol", "ssh"}, {"host", "old.example"}, {"port", 22}};
@@ -173,6 +190,11 @@ int main(int argc, char **argv)
     CHECK(parseListing("drwxr-xr-x    2 root     root         4096 Jan  3  2025 docs", entry) && entry.dir)
     CHECK(parseListing("lrwxrwxrwx    1 root     root            7 Jan  3  2025 bin -> usr/bin", entry) && entry.name == "bin")
     CHECK(!parseListing("drwxr-xr-x    2 root     root         4096 Jan  3  2025 ..", entry))
+    // Windows OpenSSH sftp against an OpenSSH server (Ubuntu 24.04): '*' permission bits and '?' link count.
+    CHECK(parseListing("drwx******    ? root     root         4096 Nov 13 18:47 docs", entry) && entry.dir &&
+          entry.name == "docs" && entry.owner == "root")
+    CHECK(parseListing("-rw-******    ? root     root         3106 Apr 22  2024 .bashrc", entry) && !entry.dir &&
+          entry.size == 3106 && entry.name == ".bashrc")
     CHECK(!parseListing("sftp> ls -la", entry))
     // Catalogs: 29 languages besides English, all keys translated, placeholders preserved.
     {

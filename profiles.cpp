@@ -2,6 +2,9 @@
 #include "proxy.h"
 #include <algorithm>
 #include <QCoreApplication>
+#include <QCryptographicHash>
+#include <array>
+#include <cstring>
 #include <QDir>
 #include <QFileInfo>
 #include <QHash>
@@ -26,6 +29,151 @@ bool validHost(const QString &host)
 {
     static const QRegularExpression pattern("^(?:[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,252}|(?=[0-9a-fA-F:.]*:)[0-9a-fA-F:.]+)$");
     return pattern.match(host).hasMatch();
+}
+
+// --- MobaXterm passwords protected by a master password: key = SHA-512(master)[0..32),
+// IV = AES-256-ECB(key, zero block), cipher = AES-256-CFB8, value in base64.
+namespace
+{
+uint8_t xtime(uint8_t x)
+{
+    return uint8_t((x << 1) ^ ((x >> 7) * 0x1b));
+}
+
+const uint8_t *aesSbox()
+{
+    static const auto table = []
+    {
+        std::array<uint8_t, 256> s{};
+        for (int x = 0; x < 256; ++x)
+        {
+            uint8_t b = 0; // multiplicative inverse in GF(2^8), then the affine transform
+            for (int y = 1; y < 256 && x; ++y)
+            {
+                uint8_t a = uint8_t(x), m = uint8_t(y), p = 0;
+                for (; m; m >>= 1, a = xtime(a))
+                    if (m & 1)
+                        p ^= a;
+                if (p == 1)
+                {
+                    b = uint8_t(y);
+                    break;
+                }
+            }
+            auto rot = [b](int n) { return uint8_t((b << n) | (b >> (8 - n))); };
+            s[size_t(x)] = uint8_t(b ^ rot(1) ^ rot(2) ^ rot(3) ^ rot(4) ^ 0x63);
+        }
+        return s;
+    }();
+    return table.data();
+}
+
+// AES-256, encryption only (CFB uses only the forward cipher).
+struct Aes256
+{
+    uint8_t rk[240];
+    explicit Aes256(const uint8_t *key)
+    {
+        const auto *s = aesSbox();
+        memcpy(rk, key, 32);
+        uint8_t rcon = 1;
+        for (int i = 32; i < 240; i += 4)
+        {
+            uint8_t t[4] = {rk[i - 4], rk[i - 3], rk[i - 2], rk[i - 1]};
+            if (i % 32 == 0)
+            {
+                const uint8_t t0 = t[0];
+                t[0] = uint8_t(s[t[1]] ^ rcon);
+                t[1] = s[t[2]];
+                t[2] = s[t[3]];
+                t[3] = s[t0];
+                rcon = xtime(rcon);
+            }
+            else if (i % 32 == 16)
+            {
+                for (auto &v : t)
+                    v = s[v];
+            }
+            for (int j = 0; j < 4; ++j)
+                rk[i + j] = rk[i + j - 32] ^ t[j];
+        }
+    }
+    void encrypt(uint8_t *b) const
+    {
+        const auto *s = aesSbox();
+        for (int i = 0; i < 16; ++i)
+            b[i] ^= rk[i];
+        for (int r = 1; r <= 14; ++r)
+        {
+            uint8_t t[16];
+            for (int i = 0; i < 16; ++i) // SubBytes + ShiftRows (column-major state)
+                t[i] = s[b[(i + 4 * (i % 4)) % 16]];
+            if (r < 14)
+            {
+                for (int c = 0; c < 16; c += 4) // MixColumns
+                {
+                    const uint8_t a0 = t[c], a1 = t[c + 1], a2 = t[c + 2], a3 = t[c + 3], x = a0 ^ a1 ^ a2 ^ a3;
+                    t[c] ^= x ^ xtime(a0 ^ a1);
+                    t[c + 1] ^= x ^ xtime(a1 ^ a2);
+                    t[c + 2] ^= x ^ xtime(a2 ^ a3);
+                    t[c + 3] ^= x ^ xtime(a3 ^ a0);
+                }
+            }
+            for (int i = 0; i < 16; ++i)
+                b[i] = t[i] ^ rk[16 * r + i];
+        }
+    }
+};
+
+QByteArray mobaCfb8(const QByteArray &input, const QString &master, bool decrypt)
+{
+    auto digest = QCryptographicHash::hash(master.toUtf8(), QCryptographicHash::Sha512);
+    const Aes256 aes(reinterpret_cast<const uint8_t *>(digest.constData()));
+    digest.fill('\0');
+    uint8_t shift[16]{};
+    aes.encrypt(shift); // IV
+    QByteArray output(input.size(), '\0');
+    for (qsizetype i = 0; i < input.size(); ++i)
+    {
+        uint8_t block[16];
+        memcpy(block, shift, 16);
+        aes.encrypt(block);
+        const auto in = uint8_t(input[i]), out = uint8_t(in ^ block[0]);
+        output[i] = char(out);
+        memmove(shift, shift + 1, 15);
+        shift[15] = decrypt ? in : out; // CFB feeds back the ciphertext byte
+    }
+    return output;
+}
+} // namespace
+
+QByteArray aes256EncryptBlock(const QByteArray &key32, const QByteArray &block16)
+{
+    QByteArray out = block16;
+    Aes256(reinterpret_cast<const uint8_t *>(key32.constData())).encrypt(reinterpret_cast<uint8_t *>(out.data()));
+    return out;
+}
+
+QString encryptMobaPassword(const QString &plain, const QString &master)
+{
+    return QString::fromLatin1(mobaCfb8(plain.toUtf8(), master, false).toBase64());
+}
+
+std::optional<QString> decryptMobaPassword(const QString &base64, const QString &master)
+{
+    const auto bytes = mobaCfb8(QByteArray::fromBase64(base64.trimmed().toLatin1()), master, true);
+    if (bytes.isEmpty())
+        return std::nullopt;
+    // A wrong master password yields random bytes: accept only printable text (UTF-8 or ANSI).
+    auto text = QString::fromUtf8(bytes);
+    if (text.contains(QChar::ReplacementCharacter))
+        text = QString::fromLatin1(bytes);
+    for (const auto c : text)
+    {
+        if (!c.isPrint())
+            return std::nullopt;
+    }
+    return text;
 }
 
 static QString decode(const QByteArray &bytes)
@@ -113,7 +261,7 @@ Import parseMoba(const QByteArray &bytes, const QString &drive)
         }
     }
     QMap<QString, QString> accounts;
-    QSet<QString> protectedAliases, protectedEndpoints;
+    QHash<QString, QString> protectedAliases, protectedEndpoints; // name -> encrypted password
     bool credentials = false, passwords = false;
     int accountCount = 0, secretCount = 0;
     for (const auto &row : rows)
@@ -129,7 +277,7 @@ Import parseMoba(const QByteArray &bytes, const QString &drive)
         if (passwords && eq > 0 && !row.mid(eq + 1).trimmed().isEmpty())
         {
             ++secretCount;
-            protectedEndpoints.insert(row.left(eq).trimmed().toCaseFolded());
+            protectedEndpoints.insert(row.left(eq).trimmed().toCaseFolded(), row.mid(eq + 1).trimmed());
         }
         if (!credentials)
             continue;
@@ -140,7 +288,7 @@ Import parseMoba(const QByteArray &bytes, const QString &drive)
         if (!row.mid(colon + 1).trimmed().isEmpty())
         {
             ++secretCount;
-            protectedAliases.insert(row.left(eq).trimmed().toCaseFolded());
+            protectedAliases.insert(row.left(eq).trimmed().toCaseFolded(), row.mid(colon + 1).trimmed());
         }
         const auto user = row.mid(eq + 1, colon - eq - 1).trimmed();
         if (!user.isEmpty() && safeUser(user))
@@ -248,12 +396,25 @@ Import parseMoba(const QByteArray &bytes, const QString &drive)
         const auto id = uuid();
         const auto reference = fields.value(3).trimmed();
         const auto endpoint = (user + "@" + host).toCaseFolded();
-        if ((ssh || sftp) && !user.isEmpty() &&
-            ((reference.startsWith('[') && reference.endsWith(']') &&
-              protectedAliases.contains(reference.mid(1, reference.size() - 2).toCaseFolded())) ||
-             protectedEndpoints.contains(endpoint) || protectedEndpoints.contains(protocol + ":" + endpoint) ||
-             protectedEndpoints.contains(protocol + ":" + endpoint + ":" + QString::number(port))))
-            result.passwordProfiles.append(id);
+        if ((ssh || sftp) && !user.isEmpty())
+        {
+            // [Credentials] alias referenced as "[name]", or [Passwords] keyed by endpoint: "user@host",
+            // "ssh22:user@host" (protocol + port) and the older "ssh:user@host[:port]".
+            QString secret;
+            if (reference.startsWith('[') && reference.endsWith(']'))
+                secret = protectedAliases.value(reference.mid(1, reference.size() - 2).toCaseFolded());
+            for (const auto &key : {protocol + QString::number(port) + ":" + endpoint, protocol + ":" + endpoint,
+                                    protocol + ":" + endpoint + ":" + QString::number(port), endpoint})
+            {
+                if (secret.isEmpty())
+                    secret = protectedEndpoints.value(key);
+            }
+            if (!secret.isEmpty())
+            {
+                result.passwordProfiles.append(id);
+                result.encryptedPasswords.insert(id, secret);
+            }
+        }
         pending.append(QJsonObject{{"id", id},
                                    {"name", name},
                                    {"protocol", protocol},
@@ -416,9 +577,11 @@ Command sessionCommand(const QJsonObject &profile, const QString &platform, bool
 
 bool parseListing(const QString &line, RemoteEntry &entry)
 {
-    // The link count is optional: some SFTP servers omit it from the longname.
+    // The link count is optional: some SFTP servers omit it from the longname. Windows OpenSSH formats the
+    // listing itself against an OpenSSH server: "drwx******    ? root root 4096 Nov 13 18:47 docs"
+    // ('*' for group/other bits it does not show, '?' for the unknown link count).
     static const QRegularExpression pattern(
-        "^([-dlbcps][-rwxsStT]{9})\\S*(?:\\s+\\d+)?\\s+(\\S+)\\s+(\\S+)\\s+(\\d+)\\s+(\\S+\\s+\\d+\\s+[\\d:]+)\\s(.+)$");
+        "^([-dlbcps][-rwxsStT*]{9})\\S*(?:\\s+[\\d?]+)?\\s+(\\S+)\\s+(\\S+)\\s+(\\d+)\\s+(\\S+\\s+\\d+\\s+[\\d:]+)\\s(.+)$");
     const auto m = pattern.match(line);
     if (!m.hasMatch())
         return false;

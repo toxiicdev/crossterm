@@ -118,7 +118,7 @@ int main(int argc, char **argv)
         return 1;
     const int *fetches = counted(data);
     const auto urls = data->urls();
-    check(urls.size() == 2 && *fetches == 1, "download on request");
+    check(urls.size() == 2 && *fetches == 1, "download on request: " + panel.message().toUtf8());
     QString readme, docs; // folders are listed first
     for (const auto &url : urls)
         (url.fileName() == "docs" ? docs : readme) = url.toLocalFile();

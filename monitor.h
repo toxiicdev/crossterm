@@ -5,6 +5,7 @@
 #include <functional>
 
 class QLabel;
+class Sparkline;
 class QProcess;
 class QTimer;
 
@@ -13,7 +14,8 @@ struct MonitorStats
     QString host, user;
     double cpu = -1;
     qint64 memUsed = -1, memTotal = -1, rxPerSec = -1, txPerSec = -1, uptimeSeconds = -1; // bytes, bytes/s, seconds
-    int diskPercent = -1;
+    int diskPercent = -1;                                                                 // root filesystem
+    QList<QPair<QString, int>> disks; // mount point -> percent used, local block devices only
 };
 
 // POSIX sh script for Linux (no quotes): "@@<name>" sections read by parseMonitor.
@@ -56,5 +58,8 @@ public:
     void showError(const QString &message);
 
 private:
+    QList<QWidget *> cells; // host, CPU, RAM, upload, download, uptime, user, disks
     QList<QLabel *> labels;
+    Sparkline *cpuGraph = nullptr;
+    QLabel *error = nullptr;
 };

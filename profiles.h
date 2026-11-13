@@ -3,16 +3,39 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QRect>
+#include <QHash>
+#include <QProcess>
 #include <QStringList>
+#include <optional>
 
 struct Import
 {
     QJsonArray profiles;
     QStringList warnings;
-    QStringList passwordProfiles; // IDs only, never encrypted values
-    int accounts = 0;             // named credentials: only the username is imported
-    int secrets = 0;              // MobaXterm-protected passwords: neither imported nor decrypted
+    QStringList passwordProfiles; // IDs of sessions with a saved MobaXterm password
+    // Profile ID -> password as MobaXterm stores it (encrypted with the master password). Kept in memory only:
+    // decrypted with the master password the user types, then written to the system vault, never to a file.
+    QHash<QString, QString> encryptedPasswords;
+    int accounts = 0; // named credentials ([Credentials])
+    int secrets = 0;  // MobaXterm-protected passwords
 };
+
+// MobaXterm master-password encryption (AES-256-CFB8, key = SHA-512 of the master password).
+// decrypt returns nullopt when the result is not text, i.e. the master password is wrong.
+std::optional<QString> decryptMobaPassword(const QString &base64, const QString &master);
+QString encryptMobaPassword(const QString &plain, const QString &master);          // tests
+QByteArray aes256EncryptBlock(const QByteArray &key32, const QByteArray &block16); // tests (FIPS-197 vector)
+
+// Background console programs (ssh, sftp) started from the GUI: on Windows they would get a console window that
+// flashes on screen. Call before start(); no effect on other platforms.
+inline QProcess *hideConsoleWindow(QProcess *process)
+{
+#ifdef Q_OS_WIN
+    process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments)
+                                               { arguments->flags |= 0x08000000; }); // CREATE_NO_WINDOW
+#endif
+    return process;
+}
 
 enum class ImportPolicy
 {

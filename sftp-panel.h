@@ -78,7 +78,7 @@ class SftpPanel : public QWidget
     QLineEdit *path = new QLineEdit(".");
     SftpTree *files = new SftpTree;
     QLabel *status = new QLabel;
-    QProcess *process = new QProcess(this);
+    QProcess *process = hideConsoleWindow(new QProcess(this));
     Command command;
     QString listed, openAfter, target;
     Texts texts;
@@ -116,7 +116,7 @@ class SftpPanel : public QWidget
     };
     QList<std::shared_ptr<Transfer>> transfers;
     std::shared_ptr<Transfer> active;
-    QProcess *mover = new QProcess(this);
+    QProcess *mover = hideConsoleWindow(new QProcess(this));
     QTimer *ticker = new QTimer(this);
     QWidget *queueBox = new QWidget;
     QTreeWidget *queueView = new QTreeWidget;
@@ -125,7 +125,7 @@ class SftpPanel : public QWidget
     QHash<QString, std::pair<QString, QString>> edited; // local -> (remote folder, name)
     QSet<QString> pendingEdits;
     // Recursive delete: walk the folders, then a single rm/rmdir batch.
-    QProcess *scanner = new QProcess(this);
+    QProcess *scanner = hideConsoleWindow(new QProcess(this));
     QStringList scanQueue, foundFiles, foundDirs;
     // Follow terminal folder.
     QCheckBox *follow = new QCheckBox;
@@ -589,6 +589,7 @@ public:
         }
         QPointer<SftpPanel> self(this);
         QProcess proc;
+        hideConsoleWindow(&proc);
         QEventLoop loop;
         QTimer timer;
         timer.setSingleShot(true);

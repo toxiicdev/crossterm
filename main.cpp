@@ -148,6 +148,13 @@ public:
     using QTabBar::QTabBar;
 
 protected:
+    // Without this the minimum width includes the scroll arrows even when every tab fits,
+    // which leaves a gap between the last tab (Home at startup) and the "+" button.
+    QSize minimumSizeHint() const override
+    {
+        const auto minimum = QTabBar::minimumSizeHint();
+        return {std::min(minimum.width(), sizeHint().width()), minimum.height()};
+    }
     QSize tabSizeHint(int index) const override
     {
         if (appearanceIsMac(appearance))
@@ -693,10 +700,50 @@ private:
             return;
         }
         QSet<QString> handled;
+        // Passwords protected by the MobaXterm master password: asked once, then every password is decrypted
+        // in memory and saved in the system vault. A wrong master password decrypts nothing.
+        QHash<QString, QString> decrypted; // profile id -> password
+        if (!source.encryptedPasswords.isEmpty())
+        {
+            for (int attempt = 0; attempt < 3 && decrypted.isEmpty(); ++attempt)
+            {
+                bool accepted = false;
+                auto master = QInputDialog::getText(
+                    parent, L("MobaXterm master password"),
+                    (attempt ? L("Wrong master password.") + "\n" : QString()) +
+                        L("Enter the MobaXterm master password to import %1 saved password(s) into the system vault. Cancel to type them one by one.")
+                            .arg(source.encryptedPasswords.size()),
+                    QLineEdit::Password, {}, &accepted);
+                if (!accepted || master.isEmpty())
+                    break;
+                for (auto it = source.encryptedPasswords.begin(); it != source.encryptedPasswords.end(); ++it)
+                {
+                    if (auto plain = decryptMobaPassword(it.value(), master))
+                        decrypted.insert(it.key(), *plain);
+                }
+                master.fill(QChar(0));
+            }
+        }
+        // Decrypted passwords go to every installed session with the same user, host and port, including
+        // sessions imported earlier (skipped as duplicates now), so re-running the import fills them in.
+        int saved = 0;
+        for (const auto &value : source.profiles)
+        {
+            const auto profile = value.toObject();
+            const auto it = decrypted.constFind(profile["id"].toString());
+            if (it == decrypted.constEnd())
+                continue;
+            const auto target = credentialTarget(profile, QCoreApplication::applicationName());
+            if (!handled.contains(target) && targetInUse(target) && storeSecret(target, profile["user"].toString(), it.value()))
+            {
+                handled.insert(target);
+                ++saved;
+            }
+        }
         for (const auto &value : selected)
         {
             const auto profile = value.toObject();
-            if (!source.passwordProfiles.contains(profile["id"].toString()))
+            if (!source.passwordProfiles.contains(profile["id"].toString()) || decrypted.contains(profile["id"].toString()))
                 continue;
             const auto target = credentialTarget(profile, QCoreApplication::applicationName());
             const auto user = profile["user"].toString();
@@ -725,6 +772,10 @@ private:
                 QMessageBox::warning(parent, L("Import"), L("The password could not be saved in the system vault."));
             secret.fill(QChar(0));
         }
+        for (auto &plain : decrypted)
+            plain.fill(QChar(0));
+        if (saved)
+            QMessageBox::information(parent, L("Import"), L("%1 password(s) imported into the system vault.").arg(saved));
     }
 
     void importLocal(const QString &source)
@@ -1124,6 +1175,7 @@ private:
         if (!command.error.isEmpty() || program.isEmpty())
             return nullptr;
         QProcess bootstrap;
+        hideConsoleWindow(&bootstrap);
         auto environment = QProcessEnvironment::systemEnvironment();
         for (const auto &entry : askpassEnvironment(credentialTarget(profile, QCoreApplication::applicationName()), true))
             environment.insert(entry.section('=', 0, 0), entry.section('=', 1));
@@ -1815,7 +1867,7 @@ private:
             setTunnelStatus(id, L("Client not found: %1").arg(command.program));
             return;
         }
-        auto *process = new QProcess(this);
+        auto *process = hideConsoleWindow(new QProcess(this));
         auto environment = QProcessEnvironment::systemEnvironment();
         for (const auto &entry : askpassEnvironment(credentialTarget(profile, QCoreApplication::applicationName()), true))
             environment.insert(entry.section('=', 0, 0), entry.section('=', 1));
@@ -2830,7 +2882,7 @@ private:
                 lines << L("%1 saved account(s): user names are imported.").arg(imported.accounts);
             if (imported.secrets)
                 lines
-                    << L("%1 saved password(s) are protected by MobaXterm and are not imported. CrossTerm can ask you to re-enter passwords for matching SSH and SFTP sessions.")
+                    << L("%1 saved password(s) are protected by MobaXterm. After the import, CrossTerm asks for your MobaXterm master password to move them into the system vault.")
                            .arg(imported.secrets);
             for (const auto &w : imported.warnings)
                 lines << describe(w);
@@ -3027,6 +3079,33 @@ public:
         resize(1349, 819);
         wait(500, [] { return false; });
         shot("01-start.png");
+        if (auto *plus = findChild<QToolButton *>("newTab"))
+        {
+            const int gap = plus->mapTo(this, QPoint(0, 0)).x() - bar->mapTo(this, QPoint(bar->tabRect(0).right(), 0)).x();
+            check(bar->count() == 1 && gap >= 0 && gap <= 8, QString("+ button right after the Home tab (gap %1px)").arg(gap));
+        }
+        check(strip.value(0) && strip[0]->width() == 45 && strip[0]->iconSize() == QSize(34, 34),
+              "side strip buttons at their configured size");
+        {
+            MonitorBar sample;
+            MonitorStats stats;
+            stats.host = "toxiicdev";
+            stats.user = "root";
+            stats.memUsed = qint64(2.62 * (1LL << 30));
+            stats.memTotal = qint64(31.24 * (1LL << 30));
+            stats.txPerSec = 45000;
+            stats.rxPerSec = 40000;
+            stats.uptimeSeconds = 22 * 86400 + 3600;
+            stats.disks = {{"/", 52}, {"/boot", 6}};
+            for (const double cpu : {3.0, 12.0, 7.0, 25.0, 9.0, 7.0})
+            {
+                stats.cpu = cpu;
+                sample.show(stats);
+            }
+            sample.resize(sample.sizeHint());
+            shot("15-monitor-bar.png", &sample);
+            check(sample.findChildren<QFrame *>("monitorCell").size() == 8, "monitoring bar has its eight cells");
+        }
         open(0);
         auto *p = current();
         check(p != home && p->terminal && p->sftp, "SSH tab opens with terminal and SFTP panel");
@@ -3550,6 +3629,47 @@ public:
             shot("12-remote-monitoring.png");
             setMonitoring(monitorTab, false);
             closePage(current());
+
+            // Password session (like an imported MobaXterm one) on a real OpenSSH server: automatic login from the
+            // vault, SFTP listing in the Windows OpenSSH format, monitoring still working after several runs.
+            {
+                const QJsonObject rootProfile{{"id", QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                                              {"name", "linux-root"},
+                                              {"protocol", "ssh"},
+                                              {"host", "127.0.0.1"},
+                                              {"port", 2223},
+                                              {"user", "root"},
+                                              {"issues", QJsonArray{}}};
+                const auto target = credentialTarget(rootProfile, QCoreApplication::applicationName());
+                storeSecret(target, "root", "test-password-123");
+                profiles.append(rootProfile);
+                open(int(profiles.size()) - 1);
+                profiles.removeLast();
+                auto *rp = current();
+                check(wait(20000, [&] { return rp->terminal->contents().contains("root@"); }),
+                      "password session logs in on a real OpenSSH server from the vault");
+                wait(20000, [&] { return !rp->sftp->busy(); });
+                rp->sftp->run("/root", {}, false);
+                check(wait(20000,
+                           [&]
+                           {
+                               const auto names = listedNames(rp->sftp);
+                               return !rp->sftp->busy() && names.contains("README.md") && names.contains("docs");
+                           }),
+                      "SFTP lists a real OpenSSH server (Windows sftp listing format): " + rp->sftp->message());
+                const int rootTab = bar->currentIndex();
+                setMonitoring(rootTab, true);
+                check(wait(30000, [&] { return monitorStats(rootTab).user == "root"; }),
+                      "monitoring with a saved password reads the server");
+                wait(12000, [] { return false; }); // at least two more runs (5 s interval)
+                check(rp->monitorError.isEmpty() && monitorStats(rootTab).user == "root",
+                      "monitoring keeps working with a saved password: " + rp->monitorError);
+                check(monitorBar->isVisible(), "monitoring bar visible for the password session");
+                shot("16-password-monitoring.png");
+                setMonitoring(rootTab, false);
+                closePage(rp);
+                removeSecret(target);
+            }
 
             if (!detectXServers().isEmpty())
             {
@@ -4125,6 +4245,17 @@ public:
             wait(600, [] { return false; });
             check(QGuiApplication::primaryScreen()->availableGeometry().adjusted(-1, -1, 1, 1).contains(huge.frameGeometry()),
                   "dialogs larger than the screen are fitted to the work area");
+            setGeometry(QRect(area.topLeft() + QPoint(60, 60), QSize(900, 600)));
+            QDialog centered(this);
+            centered.setAttribute(Qt::WA_ShowWithoutActivating);
+            centered.resize(300, 200);
+            centered.show();
+            wait(300, [] { return false; });
+            const auto offset = centered.frameGeometry().center() - frameGeometry().center();
+            check(offset.manhattanLength() < 40,
+                  QString("dialogs open centered on the main window (offset %1,%2)").arg(offset.x()).arg(offset.y()));
+            centered.close();
+            move(-20000, -20000);
         }
 
         resize(860, 600);
@@ -4431,8 +4562,8 @@ public:
             auto *b = new QToolButton;
             b->setObjectName("stripButton");
             b->setIcon(toggleIcon(stripIcons[i]));
-            b->setIconSize(QSize(24, 24));
-            b->setFixedSize(36, 42);
+            b->setIconSize(QSize(34, 34));
+            b->setFixedSize(45, 53);
             b->setCheckable(true);
             texts.tip(b, stripTips[i]);
             texts.bind(b, &QWidget::setAccessibleName, stripTips[i]);
@@ -4544,10 +4675,11 @@ public:
         bar->setContextMenuPolicy(Qt::CustomContextMenu);
         bar->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         auto *plus = new QToolButton;
+        plus->setObjectName("newTab");
         plus->setIcon(icon("plus"));
         plus->setIconSize(QSize(12, 12));
         texts.tip(plus, N("Start a new local terminal"));
-        plus->setFixedSize(34, 22);
+        plus->setFixedSize(34, 24); // as tall as the tab pill, next to the last tab
         style(plus, "QToolButton { background: #2a2a2a; border: 1px solid #6a6a6a; border-radius: 6px; margin-left: 4px; }");
         connect(plus, &QToolButton::clicked, this, [this] { terminal(localShell(), L("Local terminal")); });
         tabRow->addWidget(bar);
@@ -4696,10 +4828,21 @@ public:
 // Every dialog stays within the work area of the monitor it appears on (also on small or high-DPI screens).
 class DialogFitter : public QObject
 {
+public:
+    QPointer<QWidget> main; // owner for dialogs opened without a parent
+
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
         auto *dialog = qobject_cast<QDialog *>(watched);
+        if (dialog && event->type() == QEvent::Show && dialog->isWindow() && !dialog->property("placed").toBool())
+        {
+            // First show: centered on the window that opened it (or the main window), before it appears.
+            dialog->setProperty("placed", true);
+            QWidget *owner = dialog->parentWidget() ? dialog->parentWidget()->window() : main.data();
+            if (owner && owner != dialog && owner->isVisible())
+                dialog->move(owner->frameGeometry().center() - QPoint(dialog->width() / 2, dialog->height() / 2));
+        }
         if (dialog && event->type() == QEvent::Show && dialog->isWindow())
             QTimer::singleShot(0, dialog,
                                [dialog]
@@ -4804,6 +4947,7 @@ int main(int argc, char **argv)
     DialogFitter fitter;
     app.installEventFilter(&fitter);
     Window window(storage);
+    fitter.main = &window;
     const int e2e = app.arguments().indexOf("--e2e");
     if (!smoke && e2e < 0)
     {

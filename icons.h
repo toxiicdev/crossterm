@@ -354,7 +354,7 @@ static QIcon icon(const QString &name, int size = 32)
 // Icon with a dimmed "off" state (side stripe, matching inactive tabs).
 static QIcon toggleIcon(const QString &name)
 {
-    const auto on = icon(name).pixmap(32);
+    const auto on = icon(name).pixmap(64); // sharp at the 34px of the side strip and on high-DPI screens
     QPixmap off(on.size());
     off.fill(Qt::transparent);
     QPainter p(&off);
