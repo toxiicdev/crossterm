@@ -27,13 +27,23 @@ Passwords protected by the source application are not decrypted: CrossTerm impor
 
 ## Building
 
-Requires Qt 6.5+, CMake 3.21+ and a C++17 compiler.
+Requires Qt 6.5+, CMake 3.21+ and a C++17 compiler. Ready-made scripts in `scripts/` build in Release, run the tests and package the result; each one lists its dependencies at the top.
+
+| Platform | Command | Output |
+| --- | --- | --- |
+| Windows (MSVC) | `powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Qt C:\Qt\6.8.3\msvc2022_64` | `dist\CrossTerm.exe` with the Qt DLLs (windeployqt) |
+| Linux | `sh scripts/build-linux.sh` | `build/CrossTerm` |
+| macOS | `sh scripts/build-macos.sh` | `build/CrossTerm.app` with Qt bundled (macdeployqt) |
+
+For the integrated X server on Windows, put the VcXsrv files in `dist\xserver` (GPL v3, see its license). Manual build:
 
 ```sh
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/Qt
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+The Linux and macOS builds have not been verified on those systems yet.
 
 ## Translations
 

@@ -499,6 +499,8 @@ static void testXServer()
 
 int main(int argc, char **argv)
 {
+    if (isHiddenShellInvocation(argc))
+        return runHiddenShell(); // %COMSPEC% for the VcXsrv started by testXServer, like CrossTerm.exe
     QStringList arguments;
     for (int i = 0; i < argc; ++i)
         arguments << QString::fromLocal8Bit(argv[i]);

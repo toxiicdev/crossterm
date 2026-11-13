@@ -9,6 +9,8 @@
 #endif
 #include <array>
 #include <cstring>
+#include <string>
+#include <thread>
 #include <QDir>
 #include <QFileInfo>
 #include <QHash>
@@ -192,6 +194,64 @@ QProcess *hideConsoleWindow(QProcess *process)
         });
 #endif
     return process;
+}
+
+bool isHiddenShellInvocation(int argc)
+{
+    return argc >= 2 && qEnvironmentVariableIsSet("CROSSTERM_HIDDEN_SHELL");
+}
+
+int runHiddenShell()
+{
+#ifdef Q_OS_WIN
+    wchar_t system[MAX_PATH];
+    GetSystemDirectoryW(system, MAX_PATH);
+    std::wstring line = L"\"" + std::wstring(system) + L"\\cmd.exe\"";
+    // Everything after our own program name goes to cmd unchanged (quotes and redirections included).
+    const std::wstring self = GetCommandLineW();
+    const size_t rest = !self.empty() && self[0] == L'"' ? self.find(L'"', 1) + 1 : self.find(L' ');
+    if (rest != std::wstring::npos && rest < self.size())
+        line += self.substr(rest);
+    HANDLE inRead = nullptr, inWrite = nullptr, outRead = nullptr, outWrite = nullptr;
+    HPCON console = nullptr;
+    if (!CreatePipe(&inRead, &inWrite, nullptr, 0) || !CreatePipe(&outRead, &outWrite, nullptr, 0) ||
+        FAILED(CreatePseudoConsole({120, 30}, inRead, outWrite, 0, &console)))
+        return 1;
+    // The pseudoconsole writes its screen to outRead: drain it so it never blocks.
+    std::thread(
+        [outRead]
+        {
+            char buffer[4096];
+            DWORD n = 0;
+            while (ReadFile(outRead, buffer, sizeof buffer, &n, nullptr) && n)
+            {
+            }
+        })
+        .detach();
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::string memory(size, '\0');
+    STARTUPINFOEXW info{};
+    info.StartupInfo.cb = sizeof info;
+    info.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(memory.data());
+    PROCESS_INFORMATION child{};
+    if (!InitializeProcThreadAttributeList(info.lpAttributeList, 1, 0, &size) ||
+        !UpdateProcThreadAttribute(info.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, console, sizeof console, nullptr,
+                                   nullptr) ||
+        !CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE, EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+                        &info.StartupInfo, &child))
+        return 1;
+    WaitForSingleObject(child.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(child.hProcess, &code);
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    DeleteProcThreadAttributeList(info.lpAttributeList);
+    ClosePseudoConsole(console);
+    return int(code);
+#else
+    return 1;
+#endif
 }
 
 static QString decode(const QByteArray &bytes)

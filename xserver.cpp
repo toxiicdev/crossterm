@@ -132,6 +132,14 @@ bool XServerManager::start(const XServerInfo &server, const QString &mode, const
         return false;
     }
     process = std::make_unique<QProcess>();
+#ifdef Q_OS_WIN
+    // VcXsrv runs "%COMSPEC% /c xkbcomp ..." at startup; with Windows Terminal as the default terminal that console
+    // flashes on screen. COMSPEC points to CrossTerm itself, which runs cmd in an invisible pseudoconsole.
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("COMSPEC", QDir::toNativeSeparators(QCoreApplication::applicationFilePath()));
+    environment.insert("CROSSTERM_HIDDEN_SHELL", "1");
+    process->setProcessEnvironment(environment);
+#endif
     process->start(command.program, command.arguments);
     if (!process->waitForStarted(5000))
     {

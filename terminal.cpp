@@ -74,6 +74,7 @@ struct Terminal::State
     bool predictionUnderline = true, feeding = false;
     // Inline askpass prompt in progress (promptDone set): typed text goes to promptBuffer, not to the session.
     std::function<void(std::optional<QString>)> promptDone;
+    QList<QByteArray> hiddenOutput; // whole lines dropped from the session output (hideOutput)
     QString promptBuffer;
     bool promptEcho = false;
     std::unique_ptr<MoshPredictor> predictor;
@@ -442,7 +443,7 @@ void Terminal::readDevice()
     if (data.isEmpty())
         return;
     s.feeding = true;
-    vterm_input_write(s.vt, data.constData(), size_t(data.size()));
+    feed(data);
     s.feeding = false;
     vterm_screen_flush_damage(s.screen);
     if (s.predictor)
@@ -586,7 +587,7 @@ Terminal::Terminal(const Command &command, QWidget *parent) : QWidget(parent), s
             const auto count = read(s.fd, buffer, sizeof(buffer));
             if (count <= 0) break;
 #endif
-                    vterm_input_write(s.vt, buffer, size_t(count));
+                    feed(QByteArray(buffer, qsizetype(count)));
                     changed = true;
                 }
 #ifdef Q_OS_WIN
@@ -622,6 +623,26 @@ Terminal::~Terminal()
         state->device->disconnect(this);
         delete state->device;
     }
+}
+
+void Terminal::hideOutput(const QList<QByteArray> &lines)
+{
+    state->hiddenOutput = lines;
+}
+
+void Terminal::feed(QByteArray data)
+{
+    for (const auto &line : state->hiddenOutput)
+    {
+        for (qsizetype at = data.indexOf(line); at >= 0; at = data.indexOf(line, at))
+        {
+            qsizetype end = at + line.size();
+            while (end < data.size() && (data[end] == '\r' || data[end] == '\n'))
+                ++end;
+            data.remove(at, end - at);
+        }
+    }
+    vterm_input_write(state->vt, data.constData(), size_t(data.size()));
 }
 
 void Terminal::printLocal(const QString &text)

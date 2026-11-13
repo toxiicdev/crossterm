@@ -63,6 +63,8 @@ public:
     bool prompting() const;
     // Writes text (with ANSI sequences) to the screen locally, without sending it to the session: welcome banner.
     void printLocal(const QString &text);
+    // Output lines removed before they reach the screen (harmless client warnings, e.g. X11 without xauth).
+    void hideOutput(const QList<QByteArray> &lines);
 
 protected:
     bool event(QEvent *) override;
@@ -84,6 +86,7 @@ private:
     void readDevice();
     void write(const QByteArray &data);
     void finishPrompt(std::optional<QString> answer);
+    void feed(QByteArray data);
     QPoint cellAt(const QPoint &pixel) const;
     QString selectedText() const;
 };

@@ -418,6 +418,9 @@ private:
         if (const int zoom = QSettings().value(key + "/zoom").toInt(); zoom > 0)
             t->setFontPointSize(zoom);
         t->onZoom = [key](int points) { QSettings().setValue(key + "/zoom", points); };
+        // Harmless X11 notices: Windows ssh has no xauth, and servers without xauth refuse forwarding.
+        t->hideOutput({"Warning: No xauth data; using fake authentication data for X11 forwarding.",
+                       "X11 forwarding request failed on channel 0"});
         if (!t->finished())
             t->printLocal(welcomeBanner(p->profile, p->command));
         return t;
@@ -4980,6 +4983,8 @@ static void bindChildrenToLifetime()
 
 int main(int argc, char **argv)
 {
+    if (isHiddenShellInvocation(argc))
+        return runHiddenShell(); // %COMSPEC% for VcXsrv, before anything else
     if (!isAskpassInvocation(argc))
         bindChildrenToLifetime();
     {
