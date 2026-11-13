@@ -846,8 +846,9 @@ private:
         const auto ini = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/MobaXterm/MobaXterm.ini";
         const auto name = QFileDialog::getOpenFileName(
             this, L("Import sessions"), QFileInfo::exists(ini) ? ini : QString{},
-            filter.isEmpty() ? L("Session files (*.ini *.mxtsessions *.moba *.mobaconf *.json *.csv *.xml *.reg *.xs *.dat)")
-                             : filter);
+            (filter.isEmpty() ? L("Session files (*.ini *.mxtsessions *.moba *.mobaconf *.json *.csv *.xml *.reg *.xs *.dat)")
+                              : filter) +
+                ";;" + L("All files (*)"));
         if (name.isEmpty())
             return;
         QFile file(name);
@@ -2951,7 +2952,8 @@ private:
                 {
                     const auto file = QFileDialog::getOpenFileName(
                         &dialog, L("Import sessions"), source->currentText(),
-                        L("MobaXterm or CSV files (*.ini *.mxtsessions *.moba *.mobaconf *.csv *.xml *.reg *.xs *.dat)"));
+                        L("MobaXterm or CSV files (*.ini *.mxtsessions *.moba *.mobaconf *.csv *.xml *.reg *.xs *.dat)") + ";;" +
+                            L("All files (*)"));
                     if (!file.isEmpty())
                     {
                         source->setCurrentText(QDir::toNativeSeparators(file));
@@ -4933,6 +4935,10 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
         auto *dialog = qobject_cast<QDialog *>(watched);
+        // File, colour and font dialogs are native on macOS and Linux (NSOpenPanel, GTK/portal): they place
+        // themselves, and moving or resizing their hidden Qt widget breaks them.
+        if (qobject_cast<QFileDialog *>(watched) || qobject_cast<QColorDialog *>(watched) || qobject_cast<QFontDialog *>(watched))
+            return QObject::eventFilter(watched, event);
         if (dialog && event->type() == QEvent::Show && dialog->isWindow() && !dialog->property("placed").toBool())
         {
             // First show: centered on the window that opened it (or the main window), before it appears.
