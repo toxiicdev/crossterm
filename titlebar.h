@@ -1,8 +1,8 @@
 #pragma once
-// macOS and Linux: no system title bar. CrossTerm draws close, minimize and full screen at the top left
-// and the empty area of the menu bar or toolbar moves the window.
-// macOS keeps the native window (shadow, rounded corners, resize, full screen space) and only hides its
-// title bar; Linux uses a frameless window, moved and resized through the window manager.
+// Linux: no system title bar, CrossTerm draws close, minimize and full screen at the top left.
+// The empty area of the menu bar or toolbar moves the window.
+// macOS keeps the native window and its buttons, with a transparent title bar in the window color.
+// Linux uses a frameless window, moved and resized through the window manager.
 #include <QtWidgets>
 #ifdef Q_OS_MACOS
 #include <objc/message.h>
@@ -156,7 +156,7 @@ public:
                 main->setContentsMargins(plain ? QMargins(Border, Border, Border, Border) : QMargins());
 #endif
                 Q_UNUSED(plain);
-                hideNativeButtons(main);
+                transparentTitleBar(main);
             }
 #ifdef Q_OS_LINUX
             if (type == QEvent::MouseMove || type == QEvent::HoverMove)
@@ -200,8 +200,8 @@ public:
         return main->windowHandle() && main->windowHandle()->startSystemMove();
     }
 
-    // macOS: content under a transparent, empty title bar; the system buttons are hidden (CrossTerm draws its own).
-    static void hideNativeButtons(QWidget *w)
+    // macOS: transparent, empty title bar in the window color; the system buttons stay.
+    static void transparentTitleBar(QWidget *w)
     {
 #ifdef Q_OS_MACOS
         using Get = void *(*)(void *, SEL);
@@ -209,7 +209,6 @@ public:
         using SetMask = void (*)(void *, SEL, unsigned long);
         using SetBool = void (*)(void *, SEL, BOOL);
         using SetLong = void (*)(void *, SEL, long);
-        using Button = void *(*)(void *, SEL, unsigned long);
         void *nsWindow = reinterpret_cast<Get>(objc_msgSend)(reinterpret_cast<void *>(w->winId()), sel_registerName("window"));
         if (!nsWindow)
             return;
@@ -219,17 +218,14 @@ public:
             reinterpret_cast<SetMask>(objc_msgSend)(nsWindow, sel_registerName("setStyleMask:"), mask | fullSizeContentView);
         reinterpret_cast<SetBool>(objc_msgSend)(nsWindow, sel_registerName("setTitlebarAppearsTransparent:"), YES);
         reinterpret_cast<SetLong>(objc_msgSend)(nsWindow, sel_registerName("setTitleVisibility:"), 1); // hidden
-        for (unsigned long i = 0; i < 3; ++i) // close, minimize, zoom
-            if (void *b = reinterpret_cast<Button>(objc_msgSend)(nsWindow, sel_registerName("standardWindowButton:"), i))
-                reinterpret_cast<SetBool>(objc_msgSend)(b, sel_registerName("setHidden:"), YES);
 #else
         Q_UNUSED(w);
 #endif
     }
 };
 
-// Installs the custom title bar: buttons at the left of the in-window menu bar, or of the toolbar when the menu
-// bar is global (macOS, some Linux desktops). Does nothing on Windows, which keeps its system title bar.
+// Installs the custom title bar. Linux: buttons at the left of the in-window menu bar, or of the toolbar when the
+// menu bar is global. macOS: transparent title bar only. Windows keeps its system title bar.
 inline WindowButtons *installTitleBar(QMainWindow *main, QToolBar *tools)
 {
 #ifdef Q_OS_WIN
@@ -240,23 +236,24 @@ inline WindowButtons *installTitleBar(QMainWindow *main, QToolBar *tools)
     if (QGuiApplication::platformName() == "offscreen")
         return nullptr;
     auto *filter = new TitleBarFilter(main);
-    auto *buttons = new WindowButtons;
     auto *menu = main->menuBar();
-    if (menu->isNativeMenuBar())
-        tools->insertWidget(tools->actions().value(0), buttons);
-    else
-        menu->setCornerWidget(buttons, Qt::TopLeftCorner);
     for (QWidget *bar : {static_cast<QWidget *>(menu), static_cast<QWidget *>(tools)})
         bar->installEventFilter(filter);
     main->installEventFilter(filter);
 #ifdef Q_OS_MACOS
-    TitleBarFilter::hideNativeButtons(main);
+    TitleBarFilter::transparentTitleBar(main);
+    return nullptr;
 #else
+    auto *buttons = new WindowButtons;
+    if (menu->isNativeMenuBar())
+        tools->insertWidget(tools->actions().value(0), buttons);
+    else
+        menu->setCornerWidget(buttons, Qt::TopLeftCorner);
     main->setWindowFlag(Qt::FramelessWindowHint);
     main->setMouseTracking(true);
     main->setAttribute(Qt::WA_Hover);
     main->setContentsMargins(5, 5, 5, 5);
-#endif
     return buttons;
+#endif
 #endif
 }
