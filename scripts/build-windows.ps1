@@ -45,3 +45,16 @@ Copy-Item "$Build\Release\CrossTerm.exe" $Output -Force
 & "$Qt\bin\windeployqt.exe" --release --no-translations "$Output\CrossTerm.exe"
 if ($LASTEXITCODE) { throw "windeployqt failed." }
 Write-Host "Built: $Output\CrossTerm.exe"
+
+# Installer (Inno Setup 6, e.g. `winget install JRSoftware.InnoSetup`): skipped when ISCC is not installed.
+$iscc = @((Get-Command ISCC -ErrorAction SilentlyContinue).Source,
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if ($iscc) {
+    $version = (Select-String -Path "$Build\CMakeCache.txt" -Pattern '^CMAKE_PROJECT_VERSION:STATIC=(.*)$').Matches[0].Groups[1].Value
+    & $iscc /Q "/DVersion=$version" "/DSource=$((Resolve-Path $Output).Path)" "/O$((Resolve-Path $Build).Path)" scripts\crossterm.iss
+    if ($LASTEXITCODE) { throw "Inno Setup failed." }
+    Write-Host "Installer: $Build\CrossTerm-$version-Windows-Setup.exe"
+} else {
+    Write-Warning "Inno Setup not found: installer skipped (winget install JRSoftware.InnoSetup)."
+}

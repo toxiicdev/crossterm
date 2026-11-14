@@ -31,9 +31,12 @@ Requires Qt 6.5+, CMake 3.21+ and a C++17 compiler. Ready-made scripts in `scrip
 
 | Platform | Command | Output |
 | --- | --- | --- |
-| Windows (MSVC) | `powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Qt C:\Qt\6.8.3\msvc2022_64` | `dist\CrossTerm.exe` with the Qt DLLs (windeployqt) |
+| Windows (MSVC) | `powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1 -Qt C:\Qt\6.8.3\msvc2022_64` | `dist\CrossTerm.exe` with the Qt DLLs (windeployqt); installer `build\CrossTerm-<version>-Windows-Setup.exe` when Inno Setup 6 is installed |
 | Linux | `sh scripts/build-linux.sh` | `build/CrossTerm` |
-| macOS | `sh scripts/build-macos.sh` | `build/CrossTerm.app` with Qt bundled (macdeployqt) |
+| Linux (AppImage) | `sh scripts/build-appimage.sh` | `build/CrossTerm-<version>-x86_64.AppImage` with Qt bundled (linuxdeploy) |
+| macOS | `sh scripts/build-macos.sh` | `build/CrossTerm.app` with Qt bundled (macdeployqt) and `build/CrossTerm-<version>-macOS.dmg` |
+
+Release packages: pushing a tag `v<version>` (matching `project(VERSION)` in CMakeLists.txt) runs `.github/workflows/release.yml`, which builds the Windows installer (with VcXsrv) and the Linux AppImage and attaches them to a draft GitHub release; add the macOS `.dmg` built on a Mac, then publish the draft.
 
 For the integrated X server on Windows, put the VcXsrv files in `dist\xserver` (GPL v3, see its license). Manual build:
 

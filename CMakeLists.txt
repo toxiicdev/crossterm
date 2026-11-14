@@ -57,7 +57,14 @@ qt_add_resources(CrossTerm "appicon" PREFIX "/" BASE "${CMAKE_CURRENT_SOURCE_DIR
 target_link_libraries(CrossTerm PRIVATE termwidget)
 target_compile_definitions(CrossTerm PRIVATE CROSSTERM_VERSION="${PROJECT_VERSION}")
 if(APPLE)
-    # Complete Info.plist: bundle identifier (file panels, Keychain), Retina, version.
+    # Languages listed in Info.plist (CFBundleLocalizations), so macOS shows its own menus and panels in the
+    # language the program uses: English plus one entry per i18n/*.json.
+    set(CROSSTERM_LOCALIZATIONS "<string>en</string>")
+    foreach(translation ${TRANSLATIONS})
+        get_filename_component(code "${translation}" NAME_WE)
+        string(APPEND CROSSTERM_LOCALIZATIONS "<string>${code}</string>")
+    endforeach()
+    # Complete Info.plist: bundle identifier (file panels, Keychain), Retina, version, languages.
     set_target_properties(CrossTerm PROPERTIES
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/assets/Info.plist.in"
         MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.toxiicdev.crossterm"

@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Builds CrossTerm.app on macOS (Release), bundles Qt into it and runs the tests.
+# Builds CrossTerm.app on macOS (Release), bundles Qt into it, runs the tests and packs it into a .dmg.
 # Missing dependencies are installed automatically: Xcode Command Line Tools, then cmake and qt with Homebrew.
 # Optional at runtime: XQuartz (X11 forwarding), Microsoft Remote Desktop / Windows App (RDP).
 #
@@ -71,6 +71,18 @@ fi
 # at every build and the password is asked again.
 # An Apple certificate listed but not valid usually lacks its intermediate authority (a certificate created outside
 # Xcode, or an old Mac): import Apple's once from apple.com, then look again.
+# Disk image for distribution: the app plus a link to /Applications, signed with the Developer ID when there is one.
+make_dmg() {
+    version="$(sed -n 's/^CMAKE_PROJECT_VERSION:STATIC=//p' "$BUILD/CMakeCache.txt")"
+    dmg="$BUILD/CrossTerm-$version-macOS.dmg"
+    stage="$(mktemp -d)"
+    ditto "$BUILD/CrossTerm.app" "$stage/CrossTerm.app"
+    ln -s /Applications "$stage/Applications"
+    hdiutil create -volname CrossTerm -srcfolder "$stage" -ov -format UDZO "$dmg"
+    rm -rf "$stage"
+    case "${DEVELOPER_ID:-}" in "Developer ID Application:"*) codesign --force --timestamp --sign "$DEVELOPER_ID" "$dmg" ;; esac
+    echo "Disk image: $dmg"
+}
 APPLE_CERT='"(Developer ID Application|Apple Development): '
 if security find-identity -p codesigning 2>/dev/null | grep -qE "$APPLE_CERT" &&
     ! security find-identity -v -p codesigning 2>/dev/null | grep -qE "$APPLE_CERT"; then
@@ -98,6 +110,7 @@ if [ -n "$DEVELOPER_ID" ]; then
         spctl --assess --type execute --verbose "$BUILD/CrossTerm.app"
     fi
     echo "Built: $BUILD/CrossTerm.app"
+    make_dmg
     exit 0
 fi
 IDENTITY="CrossTerm Local Signing"
@@ -135,3 +148,4 @@ else
 fi
 codesign --verify --deep --strict "$BUILD/CrossTerm.app" && echo "Signature OK"
 echo "Built: $BUILD/CrossTerm.app"
+make_dmg

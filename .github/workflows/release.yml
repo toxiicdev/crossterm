@@ -1,0 +1,87 @@
+# Release builds: pushing a tag v* builds the Windows installer and the Linux AppImage and attaches them to a draft
+# GitHub release for that tag. The macOS .dmg is built and signed on a Mac (scripts/build-macos.sh) and added to the
+# same draft by hand; then the draft is published.
+# Run by hand (Actions > Release > Run workflow) to get the files as workflow artifacts without a release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  QT_VERSION: "6.8.3"
+  VCXSRV_VERSION: "21.1.16.1"
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          cache: true
+      - name: Inno Setup
+        run: choco install innosetup -y --no-progress
+      # Integrated X server: official VcXsrv binaries, unmodified (GPL v3: license text and source link included).
+      - name: VcXsrv
+        shell: pwsh
+        run: |
+          $v = $env:VCXSRV_VERSION
+          Invoke-WebRequest "https://github.com/marchaesen/vcxsrv/releases/download/$v/vcxsrv-64.$v.installer.noadmin.exe" -OutFile vcxsrv-setup.exe
+          7z x vcxsrv-setup.exe -odist\xserver -y | Out-Null
+          Remove-Item -Recurse -Force 'dist\xserver\$PLUGINSDIR', dist\xserver\uninstall.exe
+          Invoke-WebRequest https://www.gnu.org/licenses/gpl-3.0.txt -OutFile dist\xserver\COPYING-GPL-3.0.txt
+          Copy-Item assets\xserver-README.txt dist\xserver\README-CrossTerm.txt
+      - name: Build, test, installer
+        shell: pwsh
+        run: scripts\build-windows.ps1 -Qt $env:QT_ROOT_DIR
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: build/CrossTerm-*-Windows-Setup.exe
+          if-no-files-found: error
+
+  linux:
+    # The oldest supported runner: the AppImage runs on systems with this glibc (2.35) or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake curl file openssh-client libgl1-mesa-dev libegl1 \
+            libfontconfig1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: linux_gcc_64
+          cache: true
+      - name: Build, test, AppImage
+        run: CMAKE_PREFIX_PATH="$QT_ROOT_DIR" sh scripts/build-appimage.sh build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: build/CrossTerm-*-x86_64.AppImage
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            CrossTerm-*-Windows-Setup.exe
+            CrossTerm-*-x86_64.AppImage
