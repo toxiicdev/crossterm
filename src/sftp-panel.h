@@ -58,6 +58,95 @@ static QString posixQuote(const QString &text)
     return "'" + QString(text).replace("'", "'\\''") + "'";
 }
 
+// Permissions dialog: read/write/execute checkboxes for owner, group and others, kept in step with the numeric
+// mode (whose fourth digit, setuid/setgid/sticky, is kept as it is). The new mode, or empty when cancelled.
+static QString sftpPermissionsDialog(QWidget *parent, const QString &path, const QString &start)
+{
+    QDialog dialog(parent);
+    dialog.setWindowTitle(L("Permissions"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *name = new QLabel(path);
+    name->setTextFormat(Qt::PlainText);
+    name->setWordWrap(true);
+    layout->addWidget(name);
+    auto *grid = new QGridLayout;
+    grid->setHorizontalSpacing(18);
+    const char *columns[] = {N("Read"), N("Write"), N("Execute")};
+    const char *rows[] = {N("Owner"), N("Group"), N("Others")};
+    for (int c = 0; c < 3; ++c)
+        grid->addWidget(new QLabel(L(columns[c])), 0, c + 1, Qt::AlignHCenter);
+    QCheckBox *boxes[3][3];
+    for (int r = 0; r < 3; ++r)
+    {
+        grid->addWidget(new QLabel(L(rows[r])), r + 1, 0);
+        for (int c = 0; c < 3; ++c)
+        {
+            boxes[r][c] = new QCheckBox;
+            boxes[r][c]->setAccessibleName(L(rows[r]) + " " + L(columns[c]));
+            grid->addWidget(boxes[r][c], r + 1, c + 1, Qt::AlignHCenter);
+        }
+    }
+    layout->addLayout(grid);
+    auto *numericRow = new QHBoxLayout;
+    auto *numeric = new QLineEdit(start);
+    numeric->setValidator(new QRegularExpressionValidator(QRegularExpression("[0-7]{0,4}"), numeric));
+    numeric->setMaximumWidth(80);
+    numericRow->addWidget(new QLabel(L("Numeric value:")));
+    numericRow->addWidget(numeric);
+    numericRow->addStretch();
+    layout->addLayout(numericRow);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    static const QRegularExpression valid("^[0-7]{3,4}$");
+    bool syncing = false;
+    auto fromNumber = [&]
+    {
+        const auto mode = numeric->text();
+        const bool ok = valid.match(mode).hasMatch();
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(ok);
+        if (!ok || syncing)
+            return;
+        syncing = true;
+        const auto digits = mode.right(3);
+        for (int r = 0; r < 3; ++r)
+        {
+            const int v = digits[r].digitValue();
+            for (int c = 0; c < 3; ++c)
+                boxes[r][c]->setChecked(v & (4 >> c));
+        }
+        syncing = false;
+    };
+    auto fromBoxes = [&]
+    {
+        if (syncing)
+            return;
+        syncing = true;
+        QString digits;
+        for (int r = 0; r < 3; ++r)
+        {
+            int v = 0;
+            for (int c = 0; c < 3; ++c)
+                v |= boxes[r][c]->isChecked() ? 4 >> c : 0;
+            digits += QString::number(v);
+        }
+        const auto current = numeric->text();
+        const auto special = current.size() == 4 && current[0] != '0' ? current.left(1) : QString();
+        numeric->setText(special + digits);
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(true);
+        syncing = false;
+    };
+    QObject::connect(numeric, &QLineEdit::textChanged, &dialog, fromNumber);
+    for (auto &row : boxes)
+        for (auto *box : row)
+            QObject::connect(box, &QCheckBox::toggled, &dialog, fromBoxes);
+    fromNumber();
+    if (dialog.exec() != QDialog::Accepted || !valid.match(numeric->text()).hasMatch())
+        return {};
+    return numeric->text();
+}
+
 // A remote name usable as a local file name inside a folder (a name with '\' or ':' from a Unix server would
 // leave the folder on Windows).
 static bool safeLocalName(const QString &name)
@@ -269,6 +358,91 @@ protected:
         --dragging;
         if (dragEnded)
             dragEnded();
+    }
+};
+
+// Buttons in a row that wraps onto more lines when the panel is too narrow for them, instead of widening it.
+class SftpFlowLayout : public QLayout
+{
+    QList<QLayoutItem *> items;
+    int arrange(const QRect &rect, bool apply) const
+    {
+        const int gap = spacing() < 0 ? 4 : spacing();
+        int x = rect.x(), y = rect.y(), line = 0;
+        for (auto *item : items)
+        {
+            const auto size = item->sizeHint();
+            if (x > rect.x() && x + size.width() > rect.right() + 1)
+            {
+                x = rect.x();
+                y += line + gap;
+                line = 0;
+            }
+            if (apply)
+                item->setGeometry(QRect(QPoint(x, y), size));
+            x += size.width() + gap;
+            line = std::max(line, size.height());
+        }
+        return y + line - rect.y();
+    }
+
+public:
+    using QLayout::QLayout;
+    ~SftpFlowLayout() override
+    {
+        while (auto *item = takeAt(0))
+            delete item;
+    }
+    void addItem(QLayoutItem *item) override { items << item; }
+    int count() const override { return int(items.size()); }
+    QLayoutItem *itemAt(int i) const override { return items.value(i); }
+    QLayoutItem *takeAt(int i) override { return i >= 0 && i < items.size() ? items.takeAt(i) : nullptr; }
+    Qt::Orientations expandingDirections() const override { return {}; }
+    bool hasHeightForWidth() const override { return true; }
+    int heightForWidth(int width) const override { return arrange(QRect(0, 0, width, 0), false); }
+    void setGeometry(const QRect &rect) override
+    {
+        QLayout::setGeometry(rect);
+        arrange(rect, true);
+    }
+    QSize sizeHint() const override { return minimumSize(); }
+    QSize minimumSize() const override
+    {
+        QSize size; // the widest button: the narrowest the row can get
+        for (auto *item : items)
+            size = size.expandedTo(item->minimumSize());
+        return size;
+    }
+};
+
+// Rename in place in the list (F2, "Rename"): the name is edited in its row, as in Finder or Explorer. The row keeps
+// its old name until the server's listing shows the new one; renamed gets the old and the new name.
+class SftpRenameDelegate : public QStyledItemDelegate
+{
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+    std::function<void(const QString &, const QString &)> renamed;
+
+    void setEditorData(QWidget *editor, const QModelIndex &index) const override
+    {
+        auto *edit = qobject_cast<QLineEdit *>(editor);
+        if (!edit)
+            return QStyledItemDelegate::setEditorData(editor, index);
+        const auto name = index.data().toString();
+        edit->setText(name);
+        // The name without its extension selected, for a file ("report" of "report.pdf").
+        const int dot = name.lastIndexOf('.');
+        if (!index.data(Qt::UserRole).toBool() && dot > 0)
+            QTimer::singleShot(0, edit, [edit, dot] { edit->setSelection(0, dot); });
+        else
+            edit->selectAll();
+    }
+    void setModelData(QWidget *editor, QAbstractItemModel *, const QModelIndex &index) const override
+    {
+        auto *edit = qobject_cast<QLineEdit *>(editor);
+        const auto old = index.data().toString(), next = edit ? edit->text().trimmed() : QString();
+        if (renamed && !next.isEmpty() && next != old)
+            renamed(old, next);
     }
 };
 
@@ -526,7 +700,7 @@ class SftpPanel : public QWidget
             row->note.clear();
             row->state = "queued";
             row->item->setText(1, fileSizeText(size));
-            row->item->setToolTip(3, {});
+            row->bar->setToolTip({});
             row->bar->setRange(0, 100);
             row->bar->setValue(0);
             showState(row);
@@ -744,6 +918,16 @@ class SftpPanel : public QWidget
 #endif
     }
 
+    // The status of a row is written inside its progress bar (the Status column stays hidden, so the queue needs
+    // no horizontal scrolling): the percentage with the speed while running, the state otherwise.
+    void setStatus(Transfer &t, const QString &text)
+    {
+        t.item->setText(3, text);
+        if (t.state == "running")
+            t.bar->setFormat(t.rate.text().isEmpty() ? "%p%" : "%p% · " + t.rate.text());
+        else
+            t.bar->setFormat(text.isEmpty() ? "%p%" : text);
+    }
     void showState(const std::shared_ptr<Transfer> &t)
     {
         static const QHash<QString, const char *> labels{{"queued", N("Queued")},
@@ -752,11 +936,11 @@ class SftpPanel : public QWidget
                                                          {"failed", N("Failed")},
                                                          {"cancelled", N("Cancelled")}};
         if (t->state == "running" && !t->rate.text().isEmpty())
-            t->item->setText(3, t->rate.text()); // speed and time left, once known
+            setStatus(*t, t->rate.text()); // speed and time left, once known
         else if (t->state == "done" && !t->note.isEmpty())
-            t->item->setText(3, L("Completed") + ": " + t->note.section('\n', 0, 0)); // all of it in the tooltip
+            setStatus(*t, L("Completed") + ": " + t->note.section('\n', 0, 0)); // all of it in the tooltip
         else if (t->state != "failed")
-            t->item->setText(3, L(labels.value(t->state, "")));
+            setStatus(*t, L(labels.value(t->state, "")));
         t->item->setIcon(0, icon(t->upload ? "upload" : "download", 16));
         if (t->state == "done")
             t->bar->setRange(0, 100), t->bar->setValue(100);
@@ -787,7 +971,7 @@ class SftpPanel : public QWidget
             if (program.isEmpty() || directory.isEmpty() || name.isEmpty() || local.isEmpty() || !command.error.isEmpty())
             {
                 t->state = "failed";
-                t->item->setText(3,
+                setStatus(*t,
                                  L("Failed") + ": " + (command.error.isEmpty() ? L("Invalid path.") : describe(command.error)));
                 continue;
             }
@@ -871,7 +1055,7 @@ class SftpPanel : public QWidget
             if (t->size > 0)
                 t->bar->setValue(int(std::min<qint64>(99, done * 100 / t->size)));
             if (t->rate.add(done, t->size))
-                t->item->setText(3, t->rate.text());
+                setStatus(*t, t->rate.text());
         }
     }
 
@@ -996,20 +1180,26 @@ private:
         queueView->setRootIsDecorated(false);
         queueView->setColumnCount(4);
         queueView->setMaximumHeight(150);
-        queueView->setColumnWidth(0, 110);
-        queueView->setColumnWidth(1, 60);
-        queueView->setColumnWidth(2, 90);
+        // As wide as the panel, never wider: name and progress share the width, the size fits its text.
+        queueView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        queueView->setColumnHidden(3, true);
+        queueView->header()->setStretchLastSection(false);
+        queueView->header()->setMinimumSectionSize(30);
+        queueView->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+        queueView->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        queueView->header()->setSectionResizeMode(2, QHeaderView::Stretch);
         box->addWidget(queueView);
-        auto *row = new QHBoxLayout;
+        auto *row = new SftpFlowLayout;
+        row->setSpacing(4);
         auto *cancel = texts.text(new QPushButton, N("Cancel"));
         auto *resume = texts.text(new QPushButton, N("Resume"));
-        auto *clear = texts.text(new QPushButton, N("Clear finished"));
+        auto *clear = texts.text(new QPushButton, N("Clear"));
+        texts.tip(clear, N("Clear finished"));
         for (auto *b : {cancel, resume, clear})
         {
             b->setStyleSheet("padding: 2px 8px;");
             row->addWidget(b);
         }
-        row->addStretch();
         box->addLayout(row);
         connect(cancel, &QPushButton::clicked, this, [this] { cancelTransfer(selectedTransfer()); });
         connect(resume, &QPushButton::clicked, this, [this] { resumeTransfer(selectedTransfer()); });
@@ -1066,14 +1256,14 @@ private:
                         t->state = "done";
                         // "put -r" and "get -r" skip what is not a file or a folder (links) and still end well.
                         t->note = error.split(QRegularExpression("[\\r\\n]+")).filter("not a regular file").join('\n');
-                        t->item->setToolTip(3, t->note);
+                        t->bar->setToolTip(t->note);
                     }
                     else
                     {
                         t->state = "failed";
-                        t->item->setText(3,
+                        setStatus(*t,
                                          L("Failed") + ": " + (error.isEmpty() ? L("SFTP operation failed.") : error.left(200)));
-                        t->item->setToolTip(3, error);
+                        t->bar->setToolTip(error);
                         if (!connected)
                             setLink(2);
                     }
@@ -1162,7 +1352,7 @@ private:
                     if (e != QProcess::FailedToStart)
                         return;
                     t->state = "failed";
-                    t->item->setText(3, L("Failed") + ": " + mover->errorString());
+                    setStatus(*t, L("Failed") + ": " + mover->errorString());
                     if (auto edit = edited.find(t->local); t->edit && edit != edited.end())
                         edit->stamp = {}; // not on the server
                     setLink(2);
@@ -1708,16 +1898,16 @@ public:
             [this]
             {
                 const auto names = selectedNames();
-                if (names.size() != 1)
+                if (names.size() != 1 || busy())
                     return;
-                const auto directory = listed; // the folder may be listed again while the dialog is open
-                const auto next = QInputDialog::getText(this, L("Rename"), L("New name:"), QLineEdit::Normal, names[0]).trimmed();
-                if (next.isEmpty() || next == names[0] || sftpQuote(names[0]).isEmpty() || refused(directory, next))
-                    return;
-                // "-l": the plain rename request, which fails on an existing name (sftp's default one replaces it on
-                // OpenSSH servers). Except for a change of case alone, the same file on a case-insensitive server.
-                const bool sameFile = directory == listed && next.compare(names[0], Qt::CaseInsensitive) == 0;
-                run(directory, {QString(sameFile ? "rename " : "rename -l ") + sftpQuote(names[0]) + " " + sftpQuote(next)});
+                for (auto *item : files->selectedItems())
+                {
+                    if (item->text(0) != names[0])
+                        continue;
+                    item->setFlags(item->flags() | Qt::ItemIsEditable);
+                    files->scrollToItem(item);
+                    files->editItem(item, 0);
+                }
             },
             QKeySequence(Qt::Key_F2));
 
@@ -1737,6 +1927,26 @@ public:
 
         retranslate();
         files->setRootIsDecorated(false);
+        // Only F2 and "Rename" edit a name: a double click opens.
+        files->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        auto *renamer = new SftpRenameDelegate(files);
+        renamer->renamed = [this](const QString &old, const QString &next)
+        {
+            const auto directory = listed;
+            if (sftpQuote(old).isEmpty() || refused(directory, next))
+                return;
+            // "-l": the plain rename request, which fails on an existing name (sftp's default one replaces it on
+            // OpenSSH servers). Except for a change of case alone, the same file on a case-insensitive server.
+            const bool sameFile = next.compare(old, Qt::CaseInsensitive) == 0;
+            // After the editor has closed: the listing that follows replaces the rows.
+            QTimer::singleShot(0, this,
+                               [this, directory, sameFile, old, next]
+                               {
+                                   run(directory, {QString(sameFile ? "rename " : "rename -l ") + sftpQuote(old) + " " +
+                                                   sftpQuote(next)});
+                               });
+        };
+        files->setItemDelegateForColumn(0, renamer);
         files->setSelectionMode(QAbstractItemView::ExtendedSelection);
         files->setUniformRowHeights(true);
         files->setIconSize(QSize(16, 16));
@@ -1805,12 +2015,8 @@ public:
                                    {
                                        // The current mode as the starting value: a confirmed default must not drop
                                        // setuid, setgid or sticky.
-                                       bool ok = false;
-                                       const auto mode =
-                                           QInputDialog::getText(this, L("Permissions"), L("Octal mode (e.g. 644, 755):"),
-                                                                 QLineEdit::Normal, sftpOctalMode(access), &ok)
-                                               .trimmed();
-                                       if (ok && QRegularExpression("^[0-7]{3,4}$").match(mode).hasMatch())
+                                       const auto mode = sftpPermissionsDialog(this, remotePath, sftpOctalMode(access));
+                                       if (!mode.isEmpty())
                                            run(listed, {"chmod " + mode + " " + sftpQuote(remotePath)});
                                    });
                     menu.exec(files->viewport()->mapToGlobal(at));
