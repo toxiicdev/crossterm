@@ -51,7 +51,8 @@ Catalogs live in `i18n/*.json`. After changing user-visible strings run `python 
 
 ## Tests
 
-- `tests\test_*.cpp`: one executable per area, collected by CTest.
+- Sources are in `src\`; tests in `tests\`.
+- `tests\test.cpp` and `tests\test_*.cpp`: one executable per area, collected by CTest.
 - `CrossTerm.exe --smoke-test`: local terminal, Tab and focus.
 - `CrossTerm.exe --config <sessions.json> --e2e <folder>`: end-to-end run against a test SSH/SFTP server (first profile, key authentication). It saves screenshots and `e2e.txt` in the folder.
 

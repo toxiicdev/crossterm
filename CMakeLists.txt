@@ -12,8 +12,10 @@ target_include_directories(vterm PUBLIC vendor/libvterm/include)
 set_target_properties(vterm PROPERTIES C_STANDARD 99)
 
 # Terminal-independent logic: profiles, vault, proxy, monitoring, X server, MobaXterm session import.
-add_library(relaycore STATIC profiles.cpp foreign.cpp credentials.cpp proxy.cpp monitor.cpp xserver.cpp mobaimport.cpp ftp.cpp servers.cpp vnc.cpp rdp.cpp)
-target_include_directories(relaycore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_library(relaycore STATIC ${SRC}/profiles.cpp ${SRC}/foreign.cpp ${SRC}/credentials.cpp ${SRC}/proxy.cpp
+            ${SRC}/monitor.cpp ${SRC}/xserver.cpp ${SRC}/mobaimport.cpp ${SRC}/ftp.cpp ${SRC}/servers.cpp ${SRC}/vnc.cpp ${SRC}/rdp.cpp)
+target_include_directories(relaycore PUBLIC ${SRC})
 target_link_libraries(relaycore PUBLIC Qt6::Core Qt6::Widgets Qt6::Network)
 if(WIN32)
     target_link_libraries(relaycore PUBLIC advapi32 bcrypt ole32 oleaut32 uuid)
@@ -21,14 +23,14 @@ elseif(APPLE)
     # AppKit + objc: askpass helper processes stay out of the Dock (setActivationPolicy, main.cpp).
     # LocalAuthentication: Touch ID before saved passwords are used (touchid.mm).
     enable_language(OBJCXX)
-    target_sources(relaycore PRIVATE touchid.mm)
-    set_source_files_properties(touchid.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_sources(relaycore PRIVATE ${SRC}/touchid.mm)
+    set_source_files_properties(${SRC}/touchid.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(relaycore PUBLIC "-framework Security" "-framework CoreFoundation" "-framework AppKit"
                           "-framework LocalAuthentication" objc)
 endif()
 
 # Terminal and transports (PTY, telnet, rlogin, serial, mosh).
-add_library(termwidget STATIC terminal.cpp transports.cpp mosh.cpp)
+add_library(termwidget STATIC ${SRC}/terminal.cpp ${SRC}/transports.cpp ${SRC}/mosh.cpp)
 target_link_libraries(termwidget PUBLIC relaycore vterm Qt6::Widgets Qt6::Network)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(termwidget PUBLIC util)
@@ -46,7 +48,7 @@ elseif(APPLE)
     set_source_files_properties(assets/crossterm.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     list(APPEND APP_ICON_SOURCES assets/crossterm.icns)
 endif()
-add_executable(CrossTerm WIN32 MACOSX_BUNDLE main.cpp ${APP_ICON_SOURCES})
+add_executable(CrossTerm WIN32 MACOSX_BUNDLE ${SRC}/main.cpp ${APP_ICON_SOURCES})
 file(GLOB TRANSLATIONS CONFIGURE_DEPENDS i18n/*.json)
 list(FILTER TRANSLATIONS EXCLUDE REGEX "keys\\.json$")
 qt_add_resources(CrossTerm "translations" PREFIX "/" BASE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${TRANSLATIONS})
@@ -64,7 +66,7 @@ if(APPLE)
 endif()
 
 enable_testing()
-add_executable(profile_tests test.cpp)
+add_executable(profile_tests tests/test.cpp)
 target_link_libraries(profile_tests PRIVATE relaycore)
 target_compile_definitions(profile_tests PRIVATE CROSSTERM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME profiles COMMAND profile_tests)

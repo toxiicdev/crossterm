@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <wincred.h>
 #elif defined(Q_OS_MACOS)
+#include <QHash>
 #include <QSettings>
 #include <Security/Security.h>
 #else
@@ -86,6 +87,14 @@ CFMutableDictionaryRef keychainQuery(const QString &target)
     CFRelease(account);
     return query;
 }
+
+// Entries already read in this run: macOS asks for Keychain access (and Touch ID) once per entry per launch, not at
+// every SSH, SFTP or monitoring connection.
+QHash<QString, QString> &readCache()
+{
+    static QHash<QString, QString> cache;
+    return cache;
+}
 } // namespace
 
 bool vaultAvailable()
@@ -113,11 +122,15 @@ bool storeSecret(const QString &target, const QString &, const QString &secret)
     CFRelease(query);
     CFRelease(data);
     wipe(bytes);
+    if (status == errSecSuccess)
+        readCache().insert(target, secret);
     return status == errSecSuccess;
 }
 
 std::optional<QString> readSecret(const QString &target)
 {
+    if (const auto cached = readCache().constFind(target); cached != readCache().cend())
+        return *cached;
     CFMutableDictionaryRef query = keychainQuery(target);
     // Touch ID once per run, only when there is a saved password to read (the existence check reads no data).
     static bool confirmed = false;
@@ -146,11 +159,17 @@ std::optional<QString> readSecret(const QString &target)
     const QString secret =
         QString::fromUtf8(reinterpret_cast<const char *>(CFDataGetBytePtr(data)), qsizetype(CFDataGetLength(data)));
     CFRelease(result);
+    readCache().insert(target, secret);
     return secret;
 }
 
 bool removeSecret(const QString &target)
 {
+    if (auto cached = readCache().find(target); cached != readCache().end())
+    {
+        cached->fill(QChar(0));
+        readCache().erase(cached);
+    }
     CFMutableDictionaryRef query = keychainQuery(target);
     const OSStatus status = SecItemDelete(query);
     CFRelease(query);

@@ -1,7 +1,7 @@
 // UI appearances: valid and complete style sheets, keys, contrast, macOS tab painting.
 // With CROSSTERM_APPEARANCE_PREVIEW set, saves appearance-mac-light.png and appearance-mac-dark.png.
 #include <QtWidgets>
-#include "../appearance.h"
+#include "appearance.h"
 #include <cmath>
 #include <cstdio>
 
@@ -22,7 +22,7 @@ static void collect(QtMsgType type, const QMessageLogContext &, const QString &m
 // darkStyle read from main.cpp, so the test follows the real default sheet.
 static QString classicDarkStyle()
 {
-    QFile file(CROSSTERM_SOURCE_DIR "/main.cpp");
+    QFile file(CROSSTERM_SOURCE_DIR "/src/main.cpp");
     if (!file.open(QIODevice::ReadOnly))
         return {};
     const QString source = QString::fromUtf8(file.readAll());

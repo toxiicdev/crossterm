@@ -1,7 +1,7 @@
 // Drag from the SFTP browser to the outside: formats, deferred rendering and cache.
 // Network part against the test server 127.0.0.1:2222 (reads only); "--network" makes it mandatory.
 #include <QtWidgets> // icons.h assumes QMap is already included
-#include "../sftp-panel.h"
+#include "sftp-panel.h"
 #include <QTcpSocket>
 #include <cstdio>
 

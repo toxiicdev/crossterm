@@ -23,7 +23,7 @@ def unescape(text):
 
 keys = []
 for name in ("main.cpp", "sftp-panel.h", "terminal.cpp", "profiles.cpp", "askpass.h", "transports.cpp", "monitor.cpp", "xserver.cpp", "proxy.cpp", "mosh.cpp", "foreign.cpp", "mobaimport.cpp", "ftp.cpp", "servers.cpp", "vnc.cpp", "appearance.h", "rdp.cpp"):
-    source = open(os.path.join(ROOT, name), encoding="utf-8").read()
+    source = open(os.path.join(ROOT, "src", name), encoding="utf-8").read()
     for pattern in PATTERNS:
         if pattern.pattern.startswith(r'\{') and name != "profiles.cpp":
             continue
