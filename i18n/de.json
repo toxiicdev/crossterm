@@ -32,6 +32,7 @@
  "Allow uploads": "Uploads zulassen",
  "Already exists": "Bereits vorhanden",
  "Always": "Immer",
+ "Ask for Touch ID before using saved passwords": "Vor der Verwendung gespeicherter Passwörter nach Touch ID fragen",
  "Authentication": "Authentifizierung",
  "Authentication cancelled": "Authentifizierung abgebrochen",
  "Authentication failed": "Authentifizierung fehlgeschlagen",

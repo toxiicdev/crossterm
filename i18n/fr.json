@@ -32,6 +32,7 @@
  "Allow uploads": "Autoriser les envois",
  "Already exists": "Existe déjà",
  "Always": "Toujours",
+ "Ask for Touch ID before using saved passwords": "Demander Touch ID avant d’utiliser les mots de passe enregistrés",
  "Authentication": "Authentification",
  "Authentication cancelled": "Authentification annulée",
  "Authentication failed": "Échec de l'authentification",

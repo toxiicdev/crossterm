@@ -32,6 +32,7 @@
  "Allow uploads": "اجازه بارگذاری",
  "Already exists": "از قبل وجود دارد",
  "Always": "همیشه",
+ "Ask for Touch ID before using saved passwords": "پیش از استفاده از گذرواژه‌های ذخیره‌شده Touch ID بخواه",
  "Authentication": "احراز هویت",
  "Authentication cancelled": "احراز هویت لغو شد",
  "Authentication failed": "احراز هویت ناموفق بود",

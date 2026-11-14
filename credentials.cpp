@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <wincred.h>
 #elif defined(Q_OS_MACOS)
+#include <QSettings>
 #include <Security/Security.h>
 #else
 #include <QLibrary>
@@ -118,6 +119,22 @@ bool storeSecret(const QString &target, const QString &, const QString &secret)
 std::optional<QString> readSecret(const QString &target)
 {
     CFMutableDictionaryRef query = keychainQuery(target);
+    // Touch ID once per run, only when there is a saved password to read (the existence check reads no data).
+    static bool confirmed = false;
+    if (!confirmed && QSettings().value("vault/touchId", true).toBool())
+    {
+        if (SecItemCopyMatching(query, nullptr) != errSecSuccess)
+        {
+            CFRelease(query);
+            return std::nullopt;
+        }
+        if (!confirmOwner(QStringLiteral("use saved passwords")))
+        {
+            CFRelease(query);
+            return std::nullopt;
+        }
+        confirmed = true;
+    }
     CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
     CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
     CFTypeRef result = nullptr;

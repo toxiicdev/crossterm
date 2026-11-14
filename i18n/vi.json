@@ -32,6 +32,7 @@
  "Allow uploads": "Cho phép tải lên",
  "Already exists": "Đã tồn tại",
  "Always": "Luôn luôn",
+ "Ask for Touch ID before using saved passwords": "Yêu cầu Touch ID trước khi dùng mật khẩu đã lưu",
  "Authentication": "Xác thực",
  "Authentication cancelled": "Đã hủy xác thực",
  "Authentication failed": "Xác thực thất bại",

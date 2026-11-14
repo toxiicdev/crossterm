@@ -32,6 +32,7 @@
  "Allow uploads": "Yüklemelere izin ver",
  "Already exists": "Zaten var",
  "Always": "Her zaman",
+ "Ask for Touch ID before using saved passwords": "Kayıtlı parolaları kullanmadan önce Touch ID iste",
  "Authentication": "Kimlik doğrulama",
  "Authentication cancelled": "Kimlik doğrulama iptal edildi",
  "Authentication failed": "Kimlik doğrulama başarısız oldu",

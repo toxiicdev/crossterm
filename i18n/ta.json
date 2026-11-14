@@ -32,6 +32,7 @@
  "Allow uploads": "பதிவேற்றங்களை அனுமதி",
  "Already exists": "ஏற்கெனவே உள்ளது",
  "Always": "எப்போதும்",
+ "Ask for Touch ID before using saved passwords": "சேமித்த கடவுச்சொற்களைப் பயன்படுத்தும் முன் Touch ID கேள்",
  "Authentication": "அங்கீகாரம்",
  "Authentication cancelled": "அங்கீகாரம் ரத்துசெய்யப்பட்டது",
  "Authentication failed": "அங்கீகாரம் தோல்வியடைந்தது",

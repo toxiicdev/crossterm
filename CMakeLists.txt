@@ -19,7 +19,12 @@ if(WIN32)
     target_link_libraries(relaycore PUBLIC advapi32 bcrypt ole32 oleaut32 uuid)
 elseif(APPLE)
     # AppKit + objc: askpass helper processes stay out of the Dock (setActivationPolicy, main.cpp).
-    target_link_libraries(relaycore PUBLIC "-framework Security" "-framework CoreFoundation" "-framework AppKit" objc)
+    # LocalAuthentication: Touch ID before saved passwords are used (touchid.mm).
+    enable_language(OBJCXX)
+    target_sources(relaycore PRIVATE touchid.mm)
+    set_source_files_properties(touchid.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(relaycore PUBLIC "-framework Security" "-framework CoreFoundation" "-framework AppKit"
+                          "-framework LocalAuthentication" objc)
 endif()
 
 # Terminal and transports (PTY, telnet, rlogin, serial, mosh).

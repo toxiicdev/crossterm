@@ -32,6 +32,7 @@
  "Allow uploads": "Permitir subidas",
  "Already exists": "Ya existe",
  "Always": "Siempre",
+ "Ask for Touch ID before using saved passwords": "Pedir Touch ID antes de usar las contraseñas guardadas",
  "Authentication": "Autenticación",
  "Authentication cancelled": "Autenticación cancelada",
  "Authentication failed": "Error de autenticación",

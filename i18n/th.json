@@ -32,6 +32,7 @@
  "Allow uploads": "อนุญาตการอัปโหลด",
  "Already exists": "มีอยู่แล้ว",
  "Always": "เสมอ",
+ "Ask for Touch ID before using saved passwords": "ขอ Touch ID ก่อนใช้รหัสผ่านที่บันทึกไว้",
  "Authentication": "การยืนยันตัวตน",
  "Authentication cancelled": "ยกเลิกการยืนยันตัวตนแล้ว",
  "Authentication failed": "การยืนยันตัวตนล้มเหลว",

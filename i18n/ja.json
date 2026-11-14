@@ -32,6 +32,7 @@
  "Allow uploads": "アップロードを許可",
  "Already exists": "既に存在します",
  "Always": "常に使用",
+ "Ask for Touch ID before using saved passwords": "保存したパスワードを使う前に Touch ID を要求する",
  "Authentication": "認証",
  "Authentication cancelled": "認証がキャンセルされました",
  "Authentication failed": "認証に失敗しました",

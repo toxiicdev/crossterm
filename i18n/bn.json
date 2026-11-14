@@ -32,6 +32,7 @@
  "Allow uploads": "আপলোডের অনুমতি দিন",
  "Already exists": "ইতিমধ্যে বিদ্যমান",
  "Always": "সবসময়",
+ "Ask for Touch ID before using saved passwords": "সংরক্ষিত পাসওয়ার্ড ব্যবহারের আগে Touch ID চান",
  "Authentication": "প্রমাণীকরণ",
  "Authentication cancelled": "প্রমাণীকরণ বাতিল করা হয়েছে",
  "Authentication failed": "প্রমাণীকরণ ব্যর্থ হয়েছে",

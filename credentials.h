@@ -12,3 +12,7 @@ QString credentialTarget(const QJsonObject &profile, const QString &application)
 bool storeSecret(const QString &target, const QString &user, const QString &secret);
 std::optional<QString> readSecret(const QString &target);
 bool removeSecret(const QString &target);
+#ifdef Q_OS_MACOS
+// Touch ID (or the Mac password) before the first saved password is read; "vault/touchId" setting, on by default.
+bool confirmOwner(const QString &reason);
+#endif

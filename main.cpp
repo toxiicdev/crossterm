@@ -1690,6 +1690,11 @@ private:
         parallel->setRange(1, 20);
         parallel->setValue(std::clamp(settings.value("sftp/parallel", 5).toInt(), 1, 20));
         form->addRow(L("Simultaneous SFTP transfers"), parallel);
+#ifdef Q_OS_MACOS
+        auto *touchId = new QCheckBox(L("Ask for Touch ID before using saved passwords"));
+        touchId->setChecked(settings.value("vault/touchId", true).toBool());
+        form->addRow(QString(), touchId);
+#endif
         auto pemField = [&](const QString &key)
         {
             auto *edit = new QLineEdit(settings.value(key).toString());
@@ -1739,6 +1744,9 @@ private:
         applyThemeKey(theme->currentData().toString());
         settings.setValue("mosh/prediction", prediction->currentData().toString());
         settings.setValue("sftp/parallel", parallel->value());
+#ifdef Q_OS_MACOS
+        settings.setValue("vault/touchId", touchId->isChecked());
+#endif
         settings.setValue("servers/ftpCertificate", ftpCertificate->text().trimmed());
         settings.setValue("servers/ftpKey", ftpKey->text().trimmed());
         applyScheme(scheme->currentText());

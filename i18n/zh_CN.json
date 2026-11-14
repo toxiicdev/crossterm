@@ -32,6 +32,7 @@
  "Allow uploads": "允许上传",
  "Already exists": "已存在",
  "Always": "始终",
+ "Ask for Touch ID before using saved passwords": "使用已保存的密码前要求 Touch ID",
  "Authentication": "身份验证",
  "Authentication cancelled": "身份验证已取消",
  "Authentication failed": "身份验证失败",
