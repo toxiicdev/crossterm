@@ -191,9 +191,11 @@ bool saveVault()
 
 bool unlockVault()
 {
-    static bool unlocked = false;
-    if (unlocked)
-        return true;
+    // Asked once per run: a refusal (Touch ID or Keychain cancelled) is not asked again at every connection.
+    static bool unlocked = false, refused = false;
+    if (unlocked || refused)
+        return unlocked;
+    refused = true;
     const QStringList legacy = legacyAccounts();
     const bool bundle = itemExists(Bundle);
     if (bundle || !legacy.isEmpty())
@@ -206,25 +208,26 @@ bool unlockVault()
         {
             auto bytes = itemRead(Bundle);
             if (!bytes)
-                return false; // Keychain access denied: asked again at the next use
+                return false; // Keychain access denied: asked again at the next launch
             entries() = QJsonDocument::fromJson(*bytes).object();
             wipe(*bytes);
         }
-        // Earlier versions: move the separate items into the single one (one last prompt each, then never again).
-        QStringList moved;
+        // Earlier versions: copy the separate items into the single one (one last prompt each, then never again).
+        // They are left in place and ignored afterwards: deleting them would ask for the password once more each.
+        bool moved = false;
         for (const auto &name : legacy)
             if (!entries().contains(name))
                 if (auto bytes = itemRead(name))
                 {
                     entries()[name] = QString::fromUtf8(*bytes);
                     wipe(*bytes);
-                    moved << name;
+                    moved = true;
                 }
-        if (!moved.isEmpty() && saveVault())
-            for (const auto &name : moved)
-                itemDelete(name);
+        if (moved)
+            saveVault();
     }
     unlocked = true;
+    refused = false;
     return true;
 }
 
