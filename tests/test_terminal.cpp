@@ -151,5 +151,16 @@ int main(int argc, char **argv)
     CHECK(terminal.finished())
     CHECK(terminal.allText().contains("Session stopped"))
     CHECK(terminal.allText().contains("bye"))
+
+    // Process on a pseudo terminal: TERM describes this emulator (Windows sets none, so ssh sent none to the server).
+#ifdef Q_OS_WIN
+    Terminal process(Command{"powershell.exe", {"-NoProfile", "-Command", "'term=' + $env:TERM"}, {}, {}});
+#else
+    Terminal process(Command{"/bin/sh", {"-c", "echo term=$TERM"}, {}, {}});
+#endif
+    QDeadlineTimer deadline(10000);
+    while (!process.allText().contains("term=xterm-256color") && !deadline.hasExpired())
+        QApplication::processEvents(QEventLoop::AllEvents, 50);
+    CHECK(process.allText().contains("term=xterm-256color"))
     return 0;
 }

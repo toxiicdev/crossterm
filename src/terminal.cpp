@@ -896,6 +896,9 @@ Terminal::Terminal(const Command &command, QWidget *parent) : QWidget(parent), s
             QByteArray memory(qsizetype(size), '\0');
             STARTUPINFOEXW info{};
             info.StartupInfo.cb = sizeof(info);
+            // Null standard handles: otherwise a child of a CrossTerm whose own output is redirected (a launcher, a
+            // script, ctest) writes to those pipes instead of the pseudo console.
+            info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
             info.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(memory.data());
             if (InitializeProcThreadAttributeList(info.lpAttributeList, 1, 0, &size))
             {
@@ -903,22 +906,21 @@ Terminal::Terminal(const Command &command, QWidget *parent) : QWidget(parent), s
                 for (const auto &arg : command.arguments)
                     line += " " + quote(arg);
                 PROCESS_INFORMATION child{};
-                // Current process environment plus the command variables (UTF-16 block terminated by a double NUL).
+                // Current process environment plus TERM and the command variables (UTF-16 block terminated by a double
+                // NUL). Windows sets no TERM: without it ssh announces none and clear, top, vim fail on the server.
                 QString environment;
-                if (!command.environment.isEmpty())
-                {
-                    auto variables = QProcessEnvironment::systemEnvironment();
-                    for (const auto &entry : command.environment)
-                        variables.insert(entry.section('=', 0, 0), entry.section('=', 1));
-                    for (const auto &entry : variables.toStringList())
-                        environment += entry + QChar(0);
-                    environment += QChar(0);
-                }
+                auto variables = QProcessEnvironment::systemEnvironment();
+                variables.insert("TERM", "xterm-256color");
+                for (const auto &entry : command.environment)
+                    variables.insert(entry.section('=', 0, 0), entry.section('=', 1));
+                for (const auto &entry : variables.toStringList())
+                    environment += entry + QChar(0);
+                environment += QChar(0);
                 if (UpdateProcThreadAttribute(info.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, s.console,
                                               sizeof(HPCON), nullptr, nullptr) &&
                     CreateProcessW(reinterpret_cast<LPCWSTR>(program.utf16()), reinterpret_cast<LPWSTR>(line.data()), nullptr,
                                    nullptr, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                                   command.environment.isEmpty() ? nullptr : environment.data(),
+                                   environment.data(),
                                    reinterpret_cast<LPCWSTR>(QDir::homePath().utf16()), &info.StartupInfo, &child))
                 {
                     s.process = child.hProcess;
@@ -942,7 +944,9 @@ Terminal::Terminal(const Command &command, QWidget *parent) : QWidget(parent), s
             argv << arg.data();
         argv << nullptr;
         // The whole environment is built before fork: between fork and exec only async-signal-safe calls.
+        // TERM describes this emulator, not the one CrossTerm was started from (unset when started from a desktop).
         auto variables = QProcessEnvironment::systemEnvironment();
+        variables.insert("TERM", "xterm-256color");
         for (const auto &entry : command.environment)
             variables.insert(entry.section('=', 0, 0), entry.section('=', 1));
         QList<QByteArray> environment;
