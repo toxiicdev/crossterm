@@ -462,7 +462,11 @@ static void testSession()
     CHECK((view.framebuffer().pixel(37, 81) & 0xFFFFFF) == (colour2(37, 81) & 0xFFFFFF));
     CHECK((view.framebuffer().pixel(119, 89) & 0xFFFFFF) == (colour2(119, 89) & 0xFFFFFF));
 
-    // Clipboard: ServerCutText UTF-8 -> QClipboard, QClipboard -> ClientCutText.
+    // Clipboard: ServerCutText UTF-8 -> QClipboard, QClipboard -> ClientCutText. Only while the view has the focus.
+    view.show();
+    view.activateWindow();
+    view.setFocus();
+    CHECK(spin([&] { return view.hasFocus(); }));
     const QString clip = QString::fromUtf8("h\xC3\xA9llo w\xC3\xB6rld");
     s->write(Out().u8(3).u8(0).u16(0).u32(quint32(clip.toUtf8().size())).b + clip.toUtf8());
     CHECK(spin([&] { return QGuiApplication::clipboard()->text() == clip; }));

@@ -410,14 +410,14 @@ static void testXServer()
     // '/' separators: valid on Windows and recognized by QFileInfo on every platform.
     const XServerInfo vcxsrv{"VcXsrv", "C:/X/vcxsrv.exe"}, xming{"Xming", "C:/X/Xming.exe"},
         xwin{"Cygwin/X", "C:/cygwin64/bin/XWin.exe"}, x410{"X410", "C:/X/X410.exe"};
-    CHECK(xserverCommand(vcxsrv, 0, "multiwindow").arguments == QStringList({":0", "-multiwindow", "-clipboard", "-wgl", "-ac"}))
-    CHECK(xserverCommand(vcxsrv, 3, "rootless").arguments == QStringList({":3", "-rootless", "-clipboard", "-wgl", "-ac"}))
+    CHECK(xserverCommand(vcxsrv, 0, "multiwindow").arguments == QStringList({":0", "-multiwindow", "-clipboard", "-wgl"}))
+    CHECK(xserverCommand(vcxsrv, 3, "rootless").arguments == QStringList({":3", "-rootless", "-clipboard", "-wgl"}))
     CHECK(xserverCommand(vcxsrv, 1, "xdmcp", "unix.example").arguments ==
-          QStringList({":1", "-query", "unix.example", "-clipboard", "-wgl", "-ac"}))
-    CHECK(xserverCommand(xming, 2, "fullscreen").arguments == QStringList({":2", "-fullscreen", "-clipboard", "-ac"}))
-    CHECK(xserverCommand(xming, 0, "broadcast").arguments == QStringList({":0", "-broadcast", "-clipboard", "-ac"}))
+          QStringList({":1", "-query", "unix.example", "-clipboard", "-wgl"}))
+    CHECK(xserverCommand(xming, 2, "fullscreen").arguments == QStringList({":2", "-fullscreen", "-clipboard"}))
+    CHECK(xserverCommand(xming, 0, "broadcast").arguments == QStringList({":0", "-broadcast", "-clipboard"}))
     CHECK(xserverCommand(xwin, 0, "multiwindow").arguments ==
-          QStringList({":0", "-multiwindow", "-clipboard", "-listen", "tcp", "-ac"}))
+          QStringList({":0", "-multiwindow", "-clipboard", "-listen", "tcp"}))
     CHECK(xserverCommand(xwin, 0, "multiwindow").program == xwin.executable)
     CHECK(xserverCommand(x410, 0, "multiwindow").arguments == QStringList({"/wm"}))
     CHECK(xserverCommand(x410, 0, "fullscreen").arguments == QStringList({"/desktop"}))

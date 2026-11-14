@@ -34,7 +34,17 @@ int main(int argc, char **argv)
     CHECK(command.program == "ssh")
     CHECK(command.arguments.contains("-X"))
     CHECK(command.arguments.last() == "server.example")
-    CHECK(command.arguments.contains("ServerAliveInterval=30"))
+    CHECK(command.arguments.contains("ServerAliveInterval=10") && command.arguments.contains("ServerAliveCountMax=3"))
+    // Session end: a logout is not an error; a lost, closed or refused connection is told apart from ssh's last line.
+    CHECK(sshExitError(0, "logout\n", "h").isEmpty())
+    CHECK(sshExitError(1, "exit 1\n", "h").isEmpty())
+    CHECK(sshExitError(255, "$ \nTimeout, server h not responding.\n", "h") == "Connection to h lost")
+    CHECK(sshExitError(255, "client_loop: send disconnect: Broken pipe\n", "h") == "Connection to h lost")
+    CHECK(sshExitError(-1, "", "h") == "Connection to h lost")
+    CHECK(sshExitError(255, "Connection to h closed by remote host.\n", "h") == "Connection closed by the server")
+    CHECK(sshExitError(255, "ssh: connect to host h port 22: Connection refused\n", "h") == "Could not connect to h")
+    CHECK(sshExitError(255, "user@h: Permission denied (publickey).\n", "h") == "Could not connect to h")
+    CHECK(sshExitError(255, "ssh: Could not resolve hostname h: nodename nor servname\n", "h") == "Could not connect to h")
     {
         auto proxied = ssh;
         proxied["proxyType"] = "socks5";

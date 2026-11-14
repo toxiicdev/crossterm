@@ -27,6 +27,7 @@ typedef struct
   unsigned int font      : 4; /* 0 to 9 */
   unsigned int small     : 1;
   unsigned int baseline  : 2;
+  unsigned int dim       : 1;
 
   /* Extra state storage that isn't strictly pen-related */
   unsigned int protected_cell : 1;
@@ -425,6 +426,9 @@ static int setpenattr(VTermAttr attr, VTermValue *val, void *user)
   case VTERM_ATTR_BOLD:
     screen->pen.bold = val->boolean;
     return 1;
+  case VTERM_ATTR_DIM:
+    screen->pen.dim = val->boolean;
+    return 1;
   case VTERM_ATTR_UNDERLINE:
     screen->pen.underline = val->number;
     return 1;
@@ -546,7 +550,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
   while(old_row >= 0) {
     int old_row_end = old_row;
     /* TODO: Stop if dwl or dhl */
-    while(screen->reflow && old_lineinfo && old_row >= 0 && old_lineinfo[old_row].continuation)
+    while(screen->reflow && old_lineinfo && old_row > 0 && old_lineinfo[old_row].continuation)
       old_row--;
     int old_row_start = old_row;
 
@@ -608,7 +612,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
 #endif
 
     if(new_row_start < 0) {
-      if(old_row_start <= old_cursor.row && old_cursor.row < old_row_end) {
+      if(old_row_start <= old_cursor.row && old_cursor.row <= old_row_end) {
         new_cursor.row = 0;
         new_cursor.col = old_cursor.col;
         if(new_cursor.col >= new_cols)
@@ -672,9 +676,10 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
   }
 
   /* We really expect the cursor position to be set by now */
+  /* CrossTerm: never abort the whole application (every open session) on a resize: bring the cursor in range. */
   if(active && (new_cursor.row == -1 || new_cursor.col == -1)) {
-    fprintf(stderr, "screen_resize failed to update cursor position\n");
-    abort();
+    new_cursor.row = 0;
+    new_cursor.col = 0;
   }
 
   if(old_row >= 0 && bufidx == BUFIDX_PRIMARY) {
@@ -707,6 +712,7 @@ static void resize_buffer(VTermScreen *screen, int bufidx, int new_rows, int new
         }
 
         dst->pen.bold      = src->attrs.bold;
+        dst->pen.dim       = src->attrs.dim;
         dst->pen.underline = src->attrs.underline;
         dst->pen.italic    = src->attrs.italic;
         dst->pen.blink     = src->attrs.blink;
@@ -999,6 +1005,7 @@ int vterm_screen_get_cell(const VTermScreen *screen, VTermPos pos, VTermScreenCe
   }
 
   cell->attrs.bold      = intcell->pen.bold;
+  cell->attrs.dim       = intcell->pen.dim;
   cell->attrs.underline = intcell->pen.underline;
   cell->attrs.italic    = intcell->pen.italic;
   cell->attrs.blink     = intcell->pen.blink;
@@ -1120,6 +1127,8 @@ void vterm_screen_set_damage_merge(VTermScreen *screen, VTermDamageSize size)
 static int attrs_differ(VTermAttrMask attrs, ScreenCell *a, ScreenCell *b)
 {
   if((attrs & VTERM_ATTR_BOLD_MASK)       && (a->pen.bold != b->pen.bold))
+    return 1;
+  if((attrs & VTERM_ATTR_DIM_MASK)        && (a->pen.dim != b->pen.dim))
     return 1;
   if((attrs & VTERM_ATTR_UNDERLINE_MASK)  && (a->pen.underline != b->pen.underline))
     return 1;

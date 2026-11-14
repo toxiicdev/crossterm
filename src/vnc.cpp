@@ -1,13 +1,18 @@
 #include "vnc.h"
+#include "keepalive.h"
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QKeyEvent>
 #include <QPainter>
+#include <QPushButton>
 #include <QStringDecoder>
 #include <QTcpSocket>
 #include <QtEndian>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
 
 static QString ui(const char *text)
 {
@@ -128,6 +133,7 @@ struct Bits
     qsizetype size, pos;
     quint32 buf;
     int cnt;
+    qsizetype limit; // maximum window size
 
     int need(int n)
     {
@@ -196,6 +202,8 @@ static bool codes(Bits &b, QByteArray &window, const Huffman &lengths, const Huf
 {
     for (;;)
     {
+        if (window.size() > b.limit)
+            return false; // decompression bomb
         int symbol = decode(b, lengths);
         if (symbol < 0)
             return false;
@@ -263,7 +271,7 @@ static bool dynamic(Bits &b, QByteArray &window)
     return codes(b, window, table, distances);
 }
 
-bool VncInflater::feed(const QByteArray &data, QByteArray &out)
+bool VncInflater::feed(const QByteArray &data, QByteArray &out, qsizetype maxOutput)
 {
     static Huffman fixedLengths, fixedDistances;
     static const bool ready = []
@@ -294,7 +302,8 @@ bool VncInflater::feed(const QByteArray &data, QByteArray &out)
         header = true;
     }
     const qsizetype start = window.size();
-    Bits b{reinterpret_cast<const uchar *>(pending.constData()), pending.size(), 0, bitbuf, bitcnt};
+    const qsizetype limit = maxOutput < 0 ? std::numeric_limits<qsizetype>::max() : start + maxOutput;
+    Bits b{reinterpret_cast<const uchar *>(pending.constData()), pending.size(), 0, bitbuf, bitcnt, limit};
     while (!finished)
     {
         const Bits saved = b;
@@ -318,6 +327,7 @@ bool VncInflater::feed(const QByteArray &data, QByteArray &out)
                     throw Underflow();
                 window.append(reinterpret_cast<const char *>(b.data + b.pos + 4), len);
                 b.pos += 4 + len;
+                ok = window.size() <= b.limit;
             }
             else if (type == 1)
                 ok = codes(b, window, fixedLengths, fixedDistances);
@@ -336,6 +346,8 @@ bool VncInflater::feed(const QByteArray &data, QByteArray &out)
             break;
         }
     }
+    if (window.size() > limit)
+        return false;
     bitbuf = b.buf;
     bitcnt = b.cnt;
     pending.remove(0, b.pos);
@@ -343,6 +355,114 @@ bool VncInflater::feed(const QByteArray &data, QByteArray &out)
     if (window.size() > 32768)
         window = window.right(32768);
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Card over the view while it is connecting or disconnected.
+
+namespace
+{
+constexpr int CardPadding = 22, CardLine = 6, CardGap = 16, CardRadius = 12;
+constexpr int CardText = Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap;
+} // namespace
+
+RemoteCard::RemoteCard(QWidget *parent) : QWidget(parent), button(new QPushButton(this))
+{
+    // The application stylesheet may give every QWidget a background: the card paints its own rounded one.
+    setObjectName("remoteCard");
+    setStyleSheet("#remoteCard { background: transparent; }");
+    button->setDefault(true);
+    button->setFocusPolicy(Qt::NoFocus); // the keyboard stays with the view, which handles Return/Enter
+    connect(button, &QPushButton::clicked, this,
+            [this]
+            {
+                if (onReconnect)
+                    onReconnect();
+            });
+    parent->installEventFilter(this);
+    hide();
+}
+
+void RemoteCard::present(const QString &message, const QString &line, bool reconnect)
+{
+    text = message;
+    detail = line;
+    setAccessibleName(detail.isEmpty() ? text : text + "\n" + detail);
+    button->setText(ui("Reconnect"));
+    button->setVisible(reconnect);
+    place();
+    show();
+    raise();
+    update();
+}
+
+bool RemoteCard::offersReconnect() const
+{
+    return !isHidden() && !button->isHidden();
+}
+
+// Size from the texts (wrapped when the parent is narrow), centred in the parent.
+void RemoteCard::place()
+{
+    const QWidget *parent = parentWidget();
+    const QFontMetrics metrics(font());
+    const int room = qMax(140, qMin(440, parent->width() - 32) - 2 * CardPadding);
+    const auto measure = [&](const QString &s)
+    { return s.isEmpty() ? QSize(0, 0) : metrics.boundingRect(QRect(0, 0, room, 10000), CardText, s).size(); };
+    const QSize t = measure(text), d = measure(detail);
+    const QSize b = button->isHidden() ? QSize(0, 0) : button->sizeHint().expandedTo(QSize(120, 0));
+    const int w = qMin(room, qMax(qMax(t.width(), d.width()), qMax(b.width(), 200))) + 2 * CardPadding;
+    const int h =
+        2 * CardPadding + t.height() + (d.isEmpty() ? 0 : CardLine + d.height()) + (b.isEmpty() ? 0 : CardGap + b.height());
+    setGeometry((parent->width() - w) / 2, (parent->height() - h) / 2, w, h);
+    if (!b.isEmpty())
+        button->setGeometry((w - b.width()) / 2, h - CardPadding - b.height(), b.width(), b.height());
+}
+
+bool RemoteCard::eventFilter(QObject *watched, QEvent *e)
+{
+    if (watched == parent() && e->type() == QEvent::Resize && !isHidden())
+        place();
+    return QWidget::eventFilter(watched, e);
+}
+
+void RemoteCard::changeEvent(QEvent *e)
+{
+    QWidget::changeEvent(e);
+    if (e->type() == QEvent::LanguageChange)
+        button->setText(ui("Reconnect"));
+    if ((e->type() == QEvent::LanguageChange || e->type() == QEvent::FontChange || e->type() == QEvent::StyleChange) &&
+        !isHidden())
+        place();
+}
+
+void RemoteCard::paintEvent(QPaintEvent *)
+{
+    const QColor ink = palette().color(QPalette::WindowText);
+    const bool dark = ink.lightness() > 127;
+    // Theme background, slightly raised. Stylesheet themes set it on the window; if it does not contrast with
+    // the text colour (no theme, mixed palettes) a neutral colour of the right lightness is used.
+    QColor base = window()->palette().color(QPalette::Window);
+    if ((base.lightness() < 128) != dark)
+        base = dark ? QColor(0x2c, 0x2c, 0x2e) : QColor(0xf6, 0xf6, 0xf6);
+    const qreal lift = dark ? 0.09 : 0.6;
+    const QColor fill(int(base.red() + (255 - base.red()) * lift), int(base.green() + (255 - base.green()) * lift),
+                      int(base.blue() + (255 - base.blue()) * lift));
+    QColor edge = ink, dim = ink;
+    edge.setAlpha(dark ? 56 : 44);
+    dim.setAlpha(160);
+
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(edge, 1));
+    painter.setBrush(fill);
+    painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), CardRadius, CardRadius);
+    const QRect area = rect().adjusted(CardPadding, CardPadding, -CardPadding, -CardPadding);
+    QRect used;
+    painter.setPen(ink);
+    painter.drawText(area, CardText, text, &used);
+    painter.setPen(dim);
+    painter.drawText(area.adjusted(0, used.height() + CardLine, 0, 0), CardText, detail);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -378,8 +498,19 @@ static QByteArray be32(quint32 v)
     return b;
 }
 
+// Black framebuffer; null if empty or beyond 2^28 pixels (1 GiB): a server may announce up to 65535x65535.
+static QImage framebufferImage(int w, int h)
+{
+    if (qint64(w) * h > (qint64(1) << 28))
+        return {};
+    QImage image(w, h, QImage::Format_RGB32);
+    image.fill(Qt::black);
+    return image;
+}
+
 VncView::VncView(const QString &host, quint16 port, std::function<QString()> passwordProvider, QWidget *parent)
-    : QWidget(parent), onPasswordNeeded(std::move(passwordProvider)), socket(new QTcpSocket(this))
+    : QWidget(parent), onPasswordNeeded(std::move(passwordProvider)), socket(new QTcpSocket(this)), card(new RemoteCard(this)),
+      host(host), port(port)
 {
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
@@ -399,17 +530,16 @@ VncView::VncView(const QString &host, quint16 port, std::function<QString()> pas
                 busy = false;
             });
     connect(socket, &QTcpSocket::disconnected, this, [this] { fail(ui("Connection closed by the server")); });
-    connect(socket, &QTcpSocket::errorOccurred, this, [this] { fail(socket->errorString()); });
-    connect(QGuiApplication::clipboard(), &QClipboard::dataChanged, this,
-            [this]
+    connect(socket, &QTcpSocket::errorOccurred, this,
+            [this](QAbstractSocket::SocketError error)
             {
-                const QString text = QGuiApplication::clipboard()->text();
-                if (!connected || viewOnly || text == serverText)
-                    return;
-                serverText = text;
-                const QByteArray latin = text.toLatin1(); // RFB: ClientCutText is Latin-1
-                send(QByteArray("\x06\0\0\0", 4) + be32(quint32(latin.size())) + latin);
+                fail(error == QAbstractSocket::RemoteHostClosedError ? ui("Connection closed by the server")
+                                                                     : socket->errorString());
             });
+    connect(QGuiApplication::clipboard(), &QClipboard::dataChanged, this, [this] { sendClipboard(); });
+    enableKeepAlive(socket); // RFB servers send nothing while the screen is static: detect a dead link
+    card->onReconnect = [this] { reconnect(); };
+    card->present(ui("Connecting…"), address(), false);
     socket->connectToHost(host, port);
 }
 
@@ -426,17 +556,58 @@ void VncView::fail(const QString &reason)
         return;
     closed = true;
     connected = false;
-    lastError = reason;
     socket->abort();
+    card->present(reason, address(), true);
     update();
     if (onDisconnected)
         onDisconnected(reason);
+}
+
+QString VncView::address() const
+{
+    return (host.contains(':') ? "[" + host + "]" : host) + ":" + QString::number(port);
+}
+
+void VncView::reconnect()
+{
+    // The socket's own disconnected/error signals are ignored while it is reset.
+    closed = true;
+    socket->abort();
+    ++session;
+    in.clear();
+    rd = 0;
+    state = Version;
+    zlib = VncInflater(); // ZRLE: one zlib stream per connection
+    dirty = QRect();
+    wheel = QPoint();
+    pressed.clear();
+    buttons = rects = 0;
+    skip = 0;
+    inRect = fullNext = connected = false;
+    closed = false;
+    card->present(ui("Connecting…"), address(), false);
+    update(); // the last frame stays, dimmed, until the new framebuffer arrives
+    socket->connectToHost(host, port);
 }
 
 void VncView::send(const QByteArray &data)
 {
     if (!closed)
         socket->write(data);
+}
+
+// The clipboard goes to the server only while this view has the keyboard focus: what is copied while working in
+// other tabs or applications stays local unless the user comes back here.
+void VncView::sendClipboard()
+{
+    if (!connected || viewOnly || !hasFocus())
+        return;
+    const QString text = QGuiApplication::clipboard()->text();
+    if (text == serverText)
+        return;
+    serverText = text;
+    const QByteArray latin = text.toLatin1(); // RFB: ClientCutText is Latin-1
+    send(QByteArray("\x06\0\0\0", 4) + be32(quint32(latin.size())) + latin);
 }
 
 bool VncView::failWithReason(int skip, const char *fallback)
@@ -529,7 +700,15 @@ bool VncView::step()
             return false;
         const QByteArray challenge = in.mid(rd, 16);
         rd += 16;
+        const int asked = session;
         const QString password = onPasswordNeeded ? onPasswordNeeded() : QString();
+        if (asked != session)
+        {
+            // reconnect() during the prompt: this challenge belongs to the old connection. readyRead is not
+            // emitted from inside its own slot, so what the new connection already sent is read here.
+            in += socket->readAll();
+            return !closed;
+        }
         if (closed)
             return false;
         if (password.isEmpty())
@@ -557,19 +736,25 @@ bool VncView::step()
         return true;
     case Init:
     {
-        if (!has(24) || !has(24 + qint64(u32(at() + 20))))
+        if (!has(24))
+            return false;
+        const quint32 len = u32(at() + 20);
+        if (len > (1u << 16))
+        {
+            fail(ui("Invalid data from the VNC server"));
+            return false;
+        }
+        if (!has(24 + qint64(len)))
             return false;
         const int w = u16(at()), h = u16(at() + 2);
-        const quint32 len = u32(at() + 20);
         name = QString::fromUtf8(in.mid(rd + 24, len));
         rd += 24 + len;
-        fb = QImage(w, h, QImage::Format_RGB32);
+        fb = framebufferImage(w, h);
         if (fb.isNull())
         {
             fail(ui("Desktop too large"));
             return false;
         }
-        fb.fill(Qt::black);
         // SetPixelFormat: 32 bpp, depth 24, little-endian, true colour, max 255, shift 16/8/0.
         send(QByteArray("\0\0\0\0\x20\x18\0\x01\0\xff\0\xff\0\xff\x10\x08\0\0\0\0", 20));
         const qint32 encodings[] = {16, 5, 2, 1, 0, -223}; // ZRLE, Hextile, RRE, CopyRect, Raw, DesktopSize
@@ -580,12 +765,21 @@ bool VncView::step()
         requestUpdate(false);
         connected = true;
         state = Message;
+        card->hide();
         updateGeometry();
         update();
         return true;
     }
     case Message:
     {
+        if (skip > 0)
+        {
+            // Rest of a ServerCutText that is not accepted: dropped as it arrives.
+            const qint64 n = qMin<qint64>(skip, in.size() - rd);
+            rd += n;
+            skip -= n;
+            return skip == 0;
+        }
         if (!has(1))
             return false;
         switch (at()[0])
@@ -616,6 +810,14 @@ bool VncView::step()
                 fail(ui("Invalid data from the VNC server"));
                 return false;
             }
+            // The server replaces the local clipboard only while this view has the keyboard focus, and with at most
+            // 1 MiB of text; anything else is consumed and dropped.
+            if (len > (1u << 20) || !hasFocus())
+            {
+                rd += 8;
+                skip = len;
+                return true;
+            }
             if (!has(8 + qint64(len)))
                 return false;
             const QByteArray text = in.mid(rd + 8, len);
@@ -639,7 +841,19 @@ bool VncView::step()
             state = Message;
             requestUpdate(!fullNext);
             fullNext = false;
-            update();
+            // Repaints only the widget area of the changed rectangles (one pixel more for the smooth scaling).
+            const QRectF t = target();
+            if (dirty.contains(fb.rect()) || t.isEmpty())
+                update();
+            else if (!dirty.isEmpty())
+            {
+                const qreal sx = t.width() / fb.width(), sy = t.height() / fb.height();
+                const QRect r = dirty.adjusted(-1, -1, 1, 1);
+                update(QRectF(t.x() + r.x() * sx, t.y() + r.y() * sy, r.width() * sx, r.height() * sy)
+                           .toAlignedRect()
+                           .adjusted(-1, -1, 1, 1));
+            }
+            dirty = QRect();
             return true;
         }
         if (!inRect)
@@ -663,6 +877,10 @@ bool VncView::step()
         }
         if (!decodeRect())
             return false;
+        if (encoding == -223)
+            dirty = fb.rect();
+        else if (rw > 0 && rh > 0)
+            dirty |= QRect(rx, ry, rw, rh);
         inRect = false;
         --rects;
         return true;
@@ -711,10 +929,14 @@ bool VncView::decodeRect()
             fail(ui("Invalid data from the VNC server"));
             return false;
         }
-        const QImage source = fb.copy(sx, sy, rw, rh);
-        for (int j = 0; j < rh; ++j)
-            std::copy_n(reinterpret_cast<const quint32 *>(source.constScanLine(j)), rw,
-                        reinterpret_cast<quint32 *>(fb.scanLine(ry + j)) + rx);
+        // In place, rows in the order that does not overwrite the source (the areas may overlap).
+        uchar *bits = fb.bits();
+        const qsizetype stride = fb.bytesPerLine();
+        for (int i = 0; i < rh; ++i)
+        {
+            const int j = ry > sy ? rh - 1 - i : i;
+            memmove(bits + (ry + j) * stride + rx * 4, bits + (sy + j) * stride + sx * 4, size_t(rw) * 4);
+        }
         return true;
     }
     case 2: // RRE
@@ -722,6 +944,11 @@ bool VncView::decodeRect()
         if (!has(8))
             return false;
         const qint64 n = u32(at()), size = 8 + n * 12;
+        if (n > qint64(rw) * rh) // more subrectangles than pixels: refused instead of buffering up to 48 GB
+        {
+            fail(ui("Invalid data from the VNC server"));
+            return false;
+        }
         if (!has(size))
             return false;
         fill(rx, ry, rw, rh, pixel(at() + 4));
@@ -790,12 +1017,24 @@ bool VncView::decodeRect()
     }
     case 16: // ZRLE
     {
-        if (!has(4) || !has(4 + qint64(u32(at()))))
+        if (!has(4))
+            return false;
+        // ZRLE needs at most 4 bytes per pixel plus the tile headers: larger data or output is refused.
+        const qint64 maxSize = qint64(rw) * rh * 5 + (1 << 20);
+        if (u32(at()) > maxSize)
+        {
+            fail(ui("Invalid data from the VNC server"));
+            return false;
+        }
+        if (!has(4 + qint64(u32(at()))))
             return false;
         const QByteArray data = in.mid(rd + 4, u32(at()));
         rd += 4 + data.size();
         QByteArray plain;
-        if (!zlib.feed(data, plain) || !zrle(plain))
+        // The server flushes the stream after every rectangle: what is left of a block that has not ended is the
+        // start of the flush marker at most (Z_PARTIAL_FLUSH, one byte). More than that is refused: an unfinished
+        // block is decoded again from its start with every rectangle that follows.
+        if (!zlib.feed(data, plain, maxSize) || (zlib.unread() > 8 && !zlib.atEnd()) || !zrle(plain))
         {
             fail(ui("Invalid data from the VNC server"));
             return false;
@@ -803,13 +1042,12 @@ bool VncView::decodeRect()
         return true;
     }
     case -223: // DesktopSize
-        fb = QImage(rw, rh, QImage::Format_RGB32);
+        fb = framebufferImage(rw, rh);
         if (fb.isNull())
         {
             fail(ui("Desktop too large"));
             return false;
         }
-        fb.fill(Qt::black);
         fullNext = true;
         updateGeometry();
         return true;
@@ -823,6 +1061,8 @@ bool VncView::decodeRect()
 bool VncView::zrle(const QByteArray &data)
 {
     const uchar *p = reinterpret_cast<const uchar *>(data.constData()), *end = p + data.size();
+    quint32 *const bits = reinterpret_cast<quint32 *>(fb.bits()); // once: scanLine() per pixel costs a detach check
+    const qsizetype stride = fb.bytesPerLine() / 4;
     auto cpixel = [&](quint32 &c)
     {
         if (end - p < 3)
@@ -836,7 +1076,7 @@ bool VncView::zrle(const QByteArray &data)
         for (int tx = rx; tx < rx + rw; tx += 64)
         {
             const int tw = qMin(64, rx + rw - tx), th = qMin(64, ry + rh - ty), total = tw * th;
-            auto px = [&](int i) -> quint32 & { return reinterpret_cast<quint32 *>(fb.scanLine(ty + i / tw))[tx + i % tw]; };
+            auto px = [&](int i) -> quint32 & { return bits[(ty + i / tw) * stride + tx + i % tw]; };
             if (p == end)
                 return false;
             const int sub = *p++, colours = sub & 127;
@@ -915,6 +1155,8 @@ bool VncView::zrle(const QByteArray &data)
                     if (p == end)
                         return false;
                     run += *p;
+                    if (run > total - i) // checked per byte: a long run of 255s must not overflow the counter
+                        return false;
                 } while (*p++ == 255);
                 if (run > total - i)
                     return false;
@@ -940,29 +1182,41 @@ void VncView::setScaled(bool on)
     update();
 }
 
-QRect VncView::target() const
+// Widget area (logical coordinates) covered by the desktop.
+QRectF VncView::target() const
 {
-    if (!scaled || fb.isNull())
-        return QRect(QPoint(0, 0), fb.size());
-    const QSize s = fb.size().scaled(size(), Qt::KeepAspectRatio);
-    return QRect(QPoint((width() - s.width()) / 2, (height() - s.height()) / 2), s);
+    if (fb.isNull())
+        return {};
+    const qreal ratio = devicePixelRatioF();
+    const QSizeF native = QSizeF(fb.size()) / ratio; // one remote pixel = one physical pixel
+    const qreal fit = qMin(width() / native.width(), height() / native.height());
+    // A fit up to 2 % above 1:1 is not worth blurring: the desktop is shown 1:1 instead.
+    if (scaled && (fit < 1 || fit > 1.02))
+    {
+        const QSize s = fb.size().scaled(size(), Qt::KeepAspectRatio);
+        return QRectF(QPoint((width() - s.width()) / 2, (height() - s.height()) / 2), s);
+    }
+    // 1:1: centred when smaller than the widget, on whole physical pixels. A widget that never received a size
+    // (640x480 placeholder) has nothing to centre in.
+    const bool sized = testAttribute(Qt::WA_Resized);
+    const auto origin = [&](int widget, int pixels)
+    { return sized ? qMax(0.0, std::floor((widget * ratio - pixels) / 2 + 1e-6) / ratio) : 0.0; };
+    return QRectF(QPointF(origin(width(), fb.width()), origin(height(), fb.height())), native);
 }
 
 void VncView::paintEvent(QPaintEvent *)
 {
     QPainter painter(this);
-    painter.fillRect(rect(), Qt::black);
-    if (!fb.isNull())
-    {
-        painter.setRenderHint(QPainter::SmoothPixmapTransform, scaled);
-        painter.drawImage(target(), fb);
-    }
+    // Letterbox bars in the theme background (stylesheet themes set it on the window's palette).
+    painter.fillRect(rect(), window()->palette().color(QPalette::Window));
+    if (fb.isNull())
+        return;
+    const QRectF t = target();
+    // Within 2 % of 1:1 the pixels are copied as they are: smoothing would blur text.
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, qAbs(t.width() * devicePixelRatioF() / fb.width() - 1) > 0.02);
+    painter.drawImage(t, fb);
     if (!connected)
-    {
-        painter.setPen(Qt::white);
-        painter.drawText(QWidget::rect(), Qt::AlignCenter | Qt::TextWordWrap,
-                         lastError.isEmpty() ? ui("Connecting…") : lastError);
-    }
+        painter.fillRect(rect(), QColor(0, 0, 0, 150)); // scrim over the frozen frame, under the card
 }
 
 bool VncView::event(QEvent *e)
@@ -1018,6 +1272,11 @@ static quint32 keysym(const QKeyEvent *e)
 
 void VncView::keyPressEvent(QKeyEvent *e)
 {
+    if (card->offersReconnect() && (e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter))
+    {
+        reconnect();
+        return;
+    }
     const quint32 sym = keysym(e);
     if (!sym)
         return QWidget::keyPressEvent(e);
@@ -1033,6 +1292,12 @@ void VncView::keyReleaseEvent(QKeyEvent *e)
     sendKey(pressed.contains(e->key()) ? pressed.take(e->key()) : keysym(e), false);
 }
 
+void VncView::focusInEvent(QFocusEvent *e)
+{
+    QWidget::focusInEvent(e);
+    sendClipboard(); // once, if it changed while the focus was elsewhere
+}
+
 void VncView::focusOutEvent(QFocusEvent *e)
 {
     for (quint32 sym : std::as_const(pressed))
@@ -1043,11 +1308,14 @@ void VncView::focusOutEvent(QFocusEvent *e)
 
 void VncView::sendPointer(const QPointF &position)
 {
-    const QRect t = target();
+    const QRectF t = target();
     if (!connected || viewOnly || t.isEmpty())
         return;
-    const int x = qBound(0, int((position.x() - t.x()) * fb.width() / t.width()), fb.width() - 1);
-    const int y = qBound(0, int((position.y() - t.y()) * fb.height() / t.height()), fb.height() - 1);
+    // Remote pixel under the pointer; the epsilon absorbs the rounding of fractional device pixel ratios.
+    const auto map = [](qreal offset, qreal extent, int pixels)
+    { return qBound(0, int(std::floor(offset * pixels / extent + 1e-6)), pixels - 1); };
+    const int x = map(position.x() - t.x(), t.width(), fb.width());
+    const int y = map(position.y() - t.y(), t.height(), fb.height());
     send(QByteArray(1, 5) + char(buttons) + be16(quint16(x)) + be16(quint16(y)));
 }
 
@@ -1076,12 +1344,23 @@ void VncView::mouseMoveEvent(QMouseEvent *e)
 
 void VncView::wheelEvent(QWheelEvent *e)
 {
-    // ponytail: one click per event; accumulate angleDelta if high-resolution touchpads scroll too much.
-    const int bit = e->angleDelta().y() > 0 ? 8 : e->angleDelta().y() < 0 ? 16 : 0;
-    if (!bit)
-        return;
-    buttons |= bit;
-    sendPointer(e->position());
-    buttons &= ~bit;
-    sendPointer(e->position());
+    // One click (buttons 4/5 vertical, 6/7 horizontal) per 120 units: high-resolution deltas accumulate.
+    // Only the dominant axis of each event counts: the sideways drift of a vertical trackpad scroll must not
+    // add up to horizontal clicks.
+    const QPoint delta = e->angleDelta();
+    const bool vertical = qAbs(delta.y()) >= qAbs(delta.x());
+    (vertical ? wheel.rx() : wheel.ry()) = 0;
+    const int d = vertical ? delta.y() : delta.x();
+    int &total = vertical ? wheel.ry() : wheel.rx();
+    if ((d > 0 && total < 0) || (d < 0 && total > 0))
+        total = 0; // direction reversed: the remainder is dropped
+    total += d;
+    const int bit = vertical ? (total > 0 ? 8 : 16) : (total > 0 ? 32 : 64);
+    for (; qAbs(total) >= 120; total -= total > 0 ? 120 : -120)
+    {
+        buttons |= bit;
+        sendPointer(e->position());
+        buttons &= ~bit;
+        sendPointer(e->position());
+    }
 }

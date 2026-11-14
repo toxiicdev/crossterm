@@ -7,7 +7,8 @@
 #include <optional>
 
 bool vaultAvailable();
-// Vault entry name: "<app>:<user>@<host>:<port>", shared by SSH, SFTP and tunnels.
+// Vault entry name: "<app>:<user>@<host>:<port>", shared by SSH, SFTP, mosh and tunnels; any other protocol has
+// its own entry, "<app>/<protocol>:<user>@<host>:<port>".
 QString credentialTarget(const QJsonObject &profile, const QString &application);
 bool storeSecret(const QString &target, const QString &user, const QString &secret);
 std::optional<QString> readSecret(const QString &target);

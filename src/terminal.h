@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 class QIODevice;
+class QKeyEvent;
 // Predicted character (local echo) in a screen cell, drawn over the real content.
 struct PredictedCell
 {
@@ -36,9 +37,16 @@ public:
     ~Terminal() override;
     QString contents() const;
     void paste(const QString &text);
+    // The paste shortcut of this platform (Cmd+V; Ctrl+Shift+V or Shift+Insert elsewhere).
+    static bool isPasteKey(const QKeyEvent *event);
+    // Called after a paste made with the mouse (middle or right click), with the pasted text: the window replicates
+    // it to the other terminals with MultiExec and records it in a macro, as it does for keys.
+    std::function<void(const QString &text)> onMousePaste;
     bool finished() const;
     // Searches the visible text and the scrollback starting from the last match; selects and reveals the result.
+    // Every other occurrence on screen gets a soft highlight until clearFind() (or an empty text, or typing).
     bool find(const QString &text, bool backward, Qt::CaseSensitivity cs = Qt::CaseInsensitive);
+    void clearFind(); // search closed: removes the highlights of the matches
     QString selection() const;
     QString allText() const;              // scrollback + screen, one line per terminal row
     bool setLogFile(const QString &path); // records the session output to a text file
@@ -46,6 +54,12 @@ public:
     QString workingDirectory() const;
     // Called after "Session stopped": Enter closes the tab, R restarts the session.
     std::function<void()> onClose, onRestart;
+    // Local process sessions (ssh...): turns the exit code (-1 = killed by a signal) into an error shown in red above
+    // "Session stopped", e.g. "Connection to host lost". Empty result, or no function: a normal end, nothing shown.
+    std::function<QString(int exitCode)> describeExit;
+    // Called once when the session ends, after the notice is written: error = it ended with an error shown in red
+    // (connection lost, refused...), false for a normal end.
+    std::function<void(bool error)> onEnded;
     // Ctrl+wheel zoom: new font size in points (the window saves it per session).
     std::function<void(int)> onZoom;
     void setFontPointSize(int points);
@@ -63,6 +77,12 @@ public:
     // session. done(nullopt) on Ctrl+C, Escape or when the session ends.
     void prompt(const QString &text, bool echo, std::function<void(std::optional<QString>)> done);
     bool prompting() const;
+    // SSH session: keys typed before ssh has logged in are kept instead of sent. Sent at once they would wait in
+    // the terminal and reach the remote shell as a command, a password typed before its prompt included. They go
+    // to the password prompt if one opens, to the session once it is logged in. Only for a session that gets a
+    // remote terminal (ssh makes its own raw at login: that is the signal); nothing is kept on Windows.
+    void holdKeysUntilLogin();
+    bool holdingKeys() const; // a key typed now would be kept
     // Writes text (with ANSI sequences) to the screen locally, without sending it to the session: welcome banner.
     void printLocal(const QString &text);
     // Output lines removed before they reach the screen (harmless client warnings, e.g. X11 without xauth).
@@ -84,11 +104,20 @@ private:
     struct State;
     std::unique_ptr<State> state;
     void setup();
-    void stop(const QString &reason = {}); // shows "Session stopped"
+    // Shows "Session stopped", after the reason (in red when error is set).
+    void stop(const QString &reason = {}, bool error = true);
     void readDevice();
+    bool readPty();   // reads the local process output available now; false once its side is closed
+    void checkExit(); // local process: ends the session once it exited
     void write(const QByteArray &data);
     void finishPrompt(std::optional<QString> answer);
+    void dropHeldKeys();
+    void replayHeldKeys();
+    void releaseHeldKeys(); // once logged in
     void feed(QByteArray data);
+    void outputChanged(); // repaints after session output, at most every 16 ms
+    // Link under the mouse (active = Cmd/Ctrl held): underlined, with a pointing hand cursor.
+    void hoverLink(const QPoint &pixel, bool active);
     QPoint cellAt(const QPoint &pixel) const;
     QString selectedText() const;
 };

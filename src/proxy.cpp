@@ -231,7 +231,7 @@ int runProxyConnect(const QStringList &arguments)
         if (!writeStd(1, buffer, n))
             break;
     }
-    // ponytail: the stdin thread stays blocked on read; it ends with the process, which exits right after.
+    // The detached stdin thread may still be blocked on read: main() returns right after, ending the process.
     closesocket(s);
     return 0;
 }

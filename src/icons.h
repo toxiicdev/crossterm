@@ -2,17 +2,21 @@
 // Icons: system icon font glyphs where available, otherwise drawn at runtime with QPainter.
 #include <QFontDatabase>
 #include <QFontMetrics>
+#include <QGuiApplication>
 #include <QHash>
 #include <QIcon>
+#include <QList>
 #include <QMap>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QScreen>
 #include <QtMath>
 
 // Modern icons from the system icon font (Windows 11: Segoe Fluent Icons, Windows 10: Segoe MDL2 Assets),
 // one glyph and accent colour per name. Names without a glyph, or systems without the font, use the drawings below.
-static bool fluentIcon(const QString &name, int size, QPixmap &out)
+// Painted in logical pixels: the device pixel ratio of the target scales the glyph.
+static bool fluentIcon(const QString &name, int size, QPainter &p)
 {
     static const QHash<QString, std::pair<char16_t, const char *>> glyphs{
         {"session", {0xE7F4, "#3b8eea"}},  {"servers", {0xE968, "#29b6f6"}},   {"tools", {0xE90F, "#f06a5a"}},
@@ -21,7 +25,7 @@ static bool fluentIcon(const QString &name, int size, QPixmap &out)
         {"packages", {0xE7B8, "#5fa8ff"}}, {"settings", {0xE713, "#5f9bf5"}},  {"help", {0xE897, "#3b8eea"}},
         {"xserver", {0xE770, "#e5534b"}},  {"exit", {0xE7E8, "#e5534b"}},      {"macros", {0xE768, "#f39a1e"}},
         {"sftp", {0xE774, "#e8a33d"}},     {"monitor", {0xE9D9, "#3cb44a"}},   {"user", {0xE77B, "#d9a35b"}},
-        {"home", {0xE80F, "#e5534b"}},     {"plus", {0xE710, "#c8c8c8"}},      {"ok", {0xE73E, "#3cb44a"}},
+        {"home", {0xE80F, "#e5534b"}},     {"plus", {0xE710, "#848484"}},      {"ok", {0xE73E, "#3cb44a"}},
         {"refresh", {0xE72C, "#3cb44a"}},  {"parent", {0xE74A, "#5c9ded"}},    {"download", {0xE896, "#2f7fe0"}},
         {"upload", {0xE898, "#1fb5a8"}},   {"delete", {0xE74D, "#e5534b"}},    {"rename", {0xE8AC, "#9a7cf0"}},
         {"folder", {0xE8D5, "#f5c518"}},   {"newfolder", {0xE8F4, "#f5c518"}}, {"file", {0xE8A5, "#b8c0cc"}},
@@ -47,9 +51,6 @@ static bool fluentIcon(const QString &name, int size, QPixmap &out)
     const QChar glyph(it->first);
     if (!QFontMetrics(font).inFont(glyph))
         return false;
-    out = QPixmap(size, size);
-    out.fill(Qt::transparent);
-    QPainter p(&out);
     p.setRenderHint(QPainter::TextAntialiasing);
     p.setFont(font);
     p.setPen(QColor(it->second));
@@ -57,15 +58,9 @@ static bool fluentIcon(const QString &name, int size, QPixmap &out)
     return true;
 }
 
-static QIcon icon(const QString &name, int size = 32)
+// Drawings on a 32 x 32 grid; the colours do not depend on the appearance.
+static void paintIcon(QPainter &p, const QString &name)
 {
-    if (QPixmap fluent; fluentIcon(name, size, fluent))
-        return QIcon(fluent);
-    QPixmap pix(size, size);
-    pix.fill(Qt::transparent);
-    QPainter p(&pix);
-    p.setRenderHint(QPainter::Antialiasing);
-    p.scale(size / 32.0, size / 32.0);
     const QColor yellow("#ffcc00"), blue("#2f8fe8"), green("#3cb44a"), red("#e8432e"), grey("#9aa4ad"), white("#f2f2f2"),
         dark("#2a2a2a"), orange("#f39a1e"), purple("#8a5cf0");
     auto monitor = [&](QColor screen)
@@ -111,7 +106,11 @@ static QIcon icon(const QString &name, int size = 32)
     };
     auto text = [&](const QString &t, QColor c, int px, QRectF r = QRectF(0, 0, 32, 32))
     {
+#ifdef Q_OS_WIN
         QFont f("Segoe UI");
+#else
+        QFont f = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+#endif
         f.setPixelSize(px);
         f.setBold(true);
         p.setFont(f);
@@ -220,8 +219,9 @@ static QIcon icon(const QString &name, int size = 32)
             p.setPen(Qt::NoPen);
             p.setBrush(blue);
             p.drawEllipse(c, r * 0.8, r * 0.8);
-            p.setBrush(QColor("#141414"));
+            p.setCompositionMode(QPainter::CompositionMode_Clear); // hole: transparent on every background
             p.drawEllipse(c, r * 0.35, r * 0.35);
+            p.setCompositionMode(QPainter::CompositionMode_SourceOver);
         };
         gear({12, 20}, 8);
         gear({23, 9}, 5.5);
@@ -360,7 +360,7 @@ static QIcon icon(const QString &name, int size = 32)
     }
     else if (name == "plus")
     {
-        p.setPen(QPen(QColor("#9a9a9a"), 4)); // gray: readable on both the dark and the light theme
+        p.setPen(QPen(QColor("#848484"), 4)); // gray: at least 3:1 on the button of every appearance
         p.drawLine(QPointF(16, 6), QPointF(16, 26));
         p.drawLine(QPointF(6, 16), QPointF(26, 16));
     }
@@ -400,22 +400,69 @@ static QIcon icon(const QString &name, int size = 32)
         else
             text(name.left(1).toUpper(), colors.value(name, grey), 18);
     }
-    return QIcon(pix);
 }
 
-// Icon with a dimmed "off" state (side stripe, matching inactive tabs).
-static QIcon toggleIcon(const QString &name)
+// Device pixel ratios every icon is drawn at: 1x, 2x, 3x and the exact ratio of each screen (fractional scaling).
+static QList<qreal> iconScales()
 {
-    const auto on = icon(name).pixmap(64); // sharp at the 34px of the side strip and on high-DPI screens
-    QPixmap off(on.size());
-    off.fill(Qt::transparent);
-    QPainter p(&off);
-    p.setOpacity(0.35);
-    p.drawPixmap(0, 0, on);
-    p.end();
+    QList<qreal> scales{1, 2, 3};
+    for (const QScreen *screen : QGuiApplication::screens())
+        if (const qreal ratio = screen->devicePixelRatio(); !scales.contains(ratio))
+            scales << ratio;
+    return scales;
+}
+
+// One pixmap per device pixel ratio, each drawn at its real resolution: sharp on high-DPI screens.
+static QIcon drawIcon(const QString &name, int size)
+{
     QIcon result;
-    result.addPixmap(off, QIcon::Normal, QIcon::Off);
-    result.addPixmap(on, QIcon::Normal, QIcon::On);
-    result.addPixmap(on, QIcon::Active, QIcon::On);
+    for (const qreal scale : iconScales())
+    {
+        const int pixels = qRound(size * scale);
+        QPixmap pix(pixels, pixels);
+        pix.setDevicePixelRatio(qreal(pixels) / size);
+        pix.fill(Qt::transparent);
+        QPainter p(&pix);
+        if (!fluentIcon(name, size, p))
+        {
+            p.setRenderHint(QPainter::Antialiasing);
+            p.scale(size / 32.0, size / 32.0);
+            paintIcon(p, name);
+        }
+        p.end();
+        result.addPixmap(pix);
+    }
+    return result;
+}
+
+// Drawn once per name and size: session trees and remote file lists ask for the same icons on every row.
+static QIcon icon(const QString &name, int size = 32)
+{
+    static QHash<std::pair<QString, int>, QIcon> cache;
+    const std::pair<QString, int> key{name, size};
+    if (const auto it = cache.constFind(key); it != cache.constEnd())
+        return *it;
+    return *cache.insert(key, drawIcon(name, size));
+}
+
+// Icon with a dimmed "off" state (side stripe, matching inactive tabs), drawn at the 34px of the side strip.
+static QIcon toggleIcon(const QString &name, int size = 34)
+{
+    const QIcon base = icon(name, size);
+    QIcon result;
+    for (const qreal scale : iconScales())
+    {
+        const auto on = base.pixmap(QSize(size, size), scale);
+        QPixmap off(on.size());
+        off.setDevicePixelRatio(on.devicePixelRatio());
+        off.fill(Qt::transparent);
+        QPainter p(&off);
+        p.setOpacity(0.35);
+        p.drawPixmap(0, 0, on);
+        p.end();
+        result.addPixmap(off, QIcon::Normal, QIcon::Off);
+        result.addPixmap(on, QIcon::Normal, QIcon::On);
+        result.addPixmap(on, QIcon::Active, QIcon::On);
+    }
     return result;
 }

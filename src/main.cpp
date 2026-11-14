@@ -23,6 +23,7 @@
 #include <QtWidgets>
 #include <QJsonDocument>
 #include <QProcess>
+#include <QProgressDialog>
 #include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
@@ -83,6 +84,7 @@ QToolButton:pressed, QToolButton:checked { background: #253545; border-color: #3
 QToolButton::menu-indicator { image: none; width: 0; }
 QLineEdit, QPlainTextEdit, QSpinBox, QComboBox { background: #1c1c1c; border: 1px solid #6a6a6a; padding: 1px 3px; selection-background-color: #2f5f8f; }
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #fefefe; }
+QLineEdit, QPlainTextEdit { placeholder-text-color: #8a8a8a; }
 QLineEdit#quick { font-size: 12pt; color: #e6e6e6; padding-left: 8px; }
 QLineEdit#sftpPath { color: #9fda9f; }
 QTreeView, QListView { background: #141414; border: none; outline: 0; show-decoration-selected: 1; }
@@ -129,7 +131,11 @@ static bool systemDark()
 }
 static QString themed(const QString &dark)
 {
-    return appearanceColors(appearance, dark);
+    auto style = appearanceColors(appearance, dark);
+    // Amber "needs review": too pale on light backgrounds, a darker one there.
+    if (!appearanceIsDark(appearance))
+        style.replace("#e8b04a", "#9a6700");
+    return style;
 }
 
 // UI font per appearance (not in the stylesheet, which would also force it on the terminal).
@@ -143,19 +149,65 @@ static void applyAppearanceFont(Appearance look)
     }
     else
     {
+#ifdef Q_OS_WIN
         font.setFamily("Segoe UI");
+#else
+        font = QFontDatabase::systemFont(QFontDatabase::GeneralFont); // no Segoe UI outside Windows
+#endif
         font.setPointSize(9);
     }
     qApp->setFont(font);
 }
 
+// Tab icon of an ended session: greyed after a normal end, with a red dot at the bottom right after an error.
+static QIcon endedIcon(const QIcon &icon, bool error)
+{
+    QIcon result;
+    for (const qreal ratio : {1.0, 2.0})
+    {
+        auto pixmap = icon.pixmap(QSize(16, 16), ratio, error ? QIcon::Normal : QIcon::Disabled);
+        if (error)
+        {
+            QPainter p(&pixmap);
+            p.setRenderHint(QPainter::Antialiasing);
+            p.setPen(Qt::NoPen);
+            // Transparent ring around the dot: it stands out from the icon on any tab color.
+            p.setCompositionMode(QPainter::CompositionMode_Clear);
+            p.drawEllipse(QPointF(12, 12), 4.5, 4.5);
+            p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+            p.setBrush(QColor("#e5484d"));
+            p.drawEllipse(QPointF(12, 12), 3.5, 3.5);
+        }
+        result.addPixmap(pixmap);
+    }
+    return result;
+}
+
 // Trapezoid tabs; the Home tab shows only its icon.
 class Tabs : public QTabBar
 {
+    int hovered = -1; // tab under the mouse
+
 public:
-    using QTabBar::QTabBar;
+    explicit Tabs(QWidget *parent = nullptr) : QTabBar(parent) { setMouseTracking(true); }
 
 protected:
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        QTabBar::mouseMoveEvent(event);
+        setHovered(tabAt(event->position().toPoint()));
+    }
+    void leaveEvent(QEvent *event) override
+    {
+        QTabBar::leaveEvent(event);
+        setHovered(-1);
+    }
+    // Tabs added, closed or moved: another tab may now be under the mouse.
+    void tabLayoutChange() override
+    {
+        QTabBar::tabLayoutChange();
+        setHovered(underMouse() ? tabAt(mapFromGlobal(QCursor::pos())) : -1);
+    }
     // Without this the minimum width includes the scroll arrows even when every tab fits,
     // which leaves a gap between the last tab (Home at startup) and the "+" button.
     QSize minimumSizeHint() const override
@@ -165,12 +217,13 @@ protected:
     }
     QSize tabSizeHint(int index) const override
     {
+        // Room for the icon, the title and the 18px close button.
         if (appearanceIsMac(appearance))
-            return macTabSizeHint(tabText(index), fontMetrics());
+            return macTabSizeHint(tabText(index), fontMetrics()) + QSize(tabText(index).isEmpty() ? 0 : 12, 0);
         if (tabText(index).isEmpty())
             return {48, 26};
         const int text = fontMetrics().horizontalAdvance(tabText(index));
-        return {std::clamp(text + 70, 90, 240), 26};
+        return {std::clamp(text + 80, 90, 240), 26};
     }
     void paintEvent(QPaintEvent *) override
     {
@@ -184,21 +237,40 @@ protected:
     }
 
 private:
+    void setHovered(int index)
+    {
+        if (index == hovered)
+            return;
+        for (const int i : {hovered, index})
+        {
+            if (i >= 0 && i < count())
+                update(tabRect(i));
+        }
+        hovered = index;
+    }
+
     void paintTab(QPainter &p, int i)
     {
+        const bool current = i == currentIndex();
         if (appearanceIsMac(appearance))
         {
-            paintMacTab(p, tabRect(i), tabIcon(i), tabText(i), i == currentIndex(), appearanceIsDark(appearance), fontMetrics());
+            // Elided here: paintMacTab draws the title 34px from the left and would run it under the close button.
+            auto text = tabText(i);
+            if (const auto *close = tabButton(i, QTabBar::RightSide))
+                text = fontMetrics().elidedText(text, Qt::ElideRight, close->x() - 2 - (tabRect(i).left() + 34));
+            paintMacTab(p, tabRect(i), tabIcon(i), text, current, appearanceIsDark(appearance), fontMetrics(), i == hovered);
             return;
         }
         const QRectF r = tabRect(i);
-        const bool current = i == currentIndex();
         const QPolygonF shape{{r.left() + 1, r.bottom() + 1},
                               {r.left() + 10, r.top() + 3},
                               {r.right() - 10, r.top() + 3},
                               {r.right() - 1, r.bottom() + 1}};
         p.setPen(QColor(themed("#6a6a6a")));
-        p.setBrush(QColor(themed(current ? "#1c1c1c" : "#2a2a2a")));
+        // Inactive tab under the mouse: slightly lighter.
+        const bool lit = !current && i == hovered;
+        p.setBrush(lit ? QColor(appearanceIsDark(appearance) ? "#363636" : "#f4f4f4")
+                       : QColor(themed(current ? "#1c1c1c" : "#2a2a2a")));
         p.drawPolygon(shape);
         if (current)
         {
@@ -210,7 +282,7 @@ private:
         if (tabText(i).isEmpty())
             return;
         p.setPen(QColor(themed(current ? "#ffffff" : "#b0b0b0")));
-        const QRect textBox(iconBox.right() + 6, int(r.top()) + 3, int(r.width()) - 64, int(r.height()) - 3);
+        const QRect textBox(iconBox.right() + 6, int(r.top()) + 3, int(r.width()) - 76, int(r.height()) - 3);
         p.drawText(textBox, Qt::AlignVCenter | Qt::AlignLeft,
                    fontMetrics().elidedText(tabText(i), Qt::ElideRight, textBox.width()));
     }
@@ -227,6 +299,16 @@ struct Page
     RemoteMonitor *monitor = nullptr;    // Remote monitoring of the SSH session
     MonitorStats stats;
     QString monitorError;
+    QString name;                                    // session name, for the log file of a restarted session
+    bool closeConfirmed = false;                     // the user accepted closing with transfers or edits pending
+    bool restarting = false, closeRequested = false; // closing during a restart (mosh bootstrap) is deferred
+    QIcon icon;                                      // tab icon of the running session
+    enum
+    {
+        Running,
+        Ended,
+        Failed
+    } state = Running; // Failed: ended with an error (connection lost...)
 };
 
 class Window : public QMainWindow
@@ -257,6 +339,7 @@ class Window : public QMainWindow
     QList<std::pair<QPointer<QWidget>, QString>> inlineStyles;
     void style(QWidget *w, const QString &dark)
     {
+        inlineStyles.removeIf([](const auto &entry) { return !entry.first; }); // closed tabs and dialogs
         inlineStyles.append({w, dark});
         w->setStyleSheet(themed(dark));
     }
@@ -264,7 +347,7 @@ class Window : public QMainWindow
     bool recording = false, playing = false;
     QListWidget *macroList = new QListWidget;
     QLabel *macroHint = new QLabel;
-    QPushButton *recoverButton = new QPushButton;
+    QPushButton *recoverButton = new QPushButton, *startButton = new QPushButton;
     QWidget *findBar = new QWidget;
     QLineEdit *findText = new QLineEdit;
     QCheckBox *findCase = new QCheckBox;
@@ -278,6 +361,8 @@ class Window : public QMainWindow
     QWidget *leftPanel = nullptr;
     QAction *multiAction = nullptr, *undoImport = nullptr;
     bool multiExec = false, forwarding = false;
+    QMenu *openTabMenu = nullptr; // tab context menu while it is open
+    QPointer<Terminal> active;    // terminal that last took the keyboard focus: in a split, not always the current tab
 
 public:
     bool persistGeometry = true;
@@ -287,6 +372,21 @@ private:
 
     Page *page(int index) const { return index < 0 ? nullptr : reinterpret_cast<Page *>(bar->tabData(index).value<quintptr>()); }
     Page *current() const { return page(bar->currentIndex()); }
+    // The terminal the user is working in: the split pane that has the focus, otherwise the current tab's. Menu
+    // commands and macros go there, never to a pane the user is not typing in.
+    Terminal *activeTerminal() const
+    {
+        if (active && active->isVisible())
+        {
+            for (int i = 0; i < bar->count(); ++i)
+            {
+                if (page(i)->terminal == active)
+                    return active;
+            }
+        }
+        auto *p = current();
+        return p ? p->terminal : nullptr;
+    }
 
     void showSide(int index)
     {
@@ -298,22 +398,42 @@ private:
     void addPage(Page *p, const QString &title, const QIcon &tabIcon)
     {
         p->widget->hide();
+        p->icon = tabIcon;
         const int index = bar->addTab(tabIcon, title);
         bar->setTabData(index, quintptr(p));
-        bar->setTabToolTip(index, title);
+        bar->setTabToolTip(index, Qt::convertFromPlainText(title)); // a session name is text, not HTML
         if (p != home)
         {
             auto *close = new QToolButton;
             close->setText(QString::fromUtf8("×"));
             texts.tip(close, N("Close tab"));
-            close->setFixedSize(16, 16);
-            close->setStyleSheet(
-                "QToolButton { color: #c0c0c0; font-size: 12pt; border: none; background: transparent; padding: 0 0 2px 0; }QToolButton:hover { color: #ffffff; background: #c42b1c; }");
+            close->setFixedSize(18, 18);
+            // "white" is not a hex color: it stays white in the light appearances.
+            style(close, "QToolButton { color: #c0c0c0; font-size: 12pt; border: none; border-radius: 4px;"
+                         " background: transparent; padding: 0 0 2px 0; }"
+                         "QToolButton:hover { color: white; background: #c42b1c; }");
             connect(close, &QToolButton::clicked, this, [this, p] { closePage(p); });
             bar->setTabButton(index, QTabBar::RightSide, close);
+            showState(p); // a session that could not start is already ended
         }
         bar->setCurrentIndex(index);
         layoutPages();
+    }
+
+    // Tab icon and tooltip of a session: red dot and "Disconnected" once it ended with an error, greyed icon after
+    // a normal end, the plain icon while it runs (again after Restart).
+    void showState(Page *p)
+    {
+        for (int i = 0; i < bar->count(); ++i)
+        {
+            if (page(i) != p || p == home)
+                continue;
+            bar->setTabIcon(i, p->state == Page::Running ? p->icon : endedIcon(p->icon, p->state == Page::Failed));
+            // The tooltip shows the full (unelided) name.
+            bar->setTabToolTip(i, Qt::convertFromPlainText((p->state == Page::Failed ? L("Disconnected") + " — " : QString()) +
+                                                           bar->tabText(i)));
+            return;
+        }
     }
 
     // Columns taken by text in the terminal: wide CJK characters take two, combining marks none.
@@ -415,12 +535,26 @@ private:
     Terminal *makeTerminal(Page *p)
     {
         Terminal *t = nullptr;
+        p->state = Page::Running;
         if (!p->device)
             t = new Terminal(p->command, area);
         else if (auto *device = p->device())
             t = new Terminal(device, area);
         else
+        {
+            p->state = Page::Failed;
             return new Terminal(Command{p->profile["protocol"].toString(), {}, {}}, area); // shows "Cannot start"
+        }
+        // Tab badge once the session ends; a device that could not be opened has already ended.
+        if (t->finished())
+            p->state = Page::Failed;
+        t->onEnded = [this, p](bool error)
+        {
+            if (!isOpen(p))
+                return;
+            p->state = error ? Page::Failed : Page::Ended;
+            showState(p);
+        };
         // Last Ctrl+wheel zoom of this session.
         const auto key = sessionKey(p->profile);
         if (const int zoom = QSettings().value(key + "/zoom").toInt(); zoom > 0)
@@ -429,6 +563,16 @@ private:
         // Harmless X11 notices: Windows ssh has no xauth, and servers without xauth refuse forwarding.
         t->hideOutput({"Warning: No xauth data; using fake authentication data for X11 forwarding.",
                        "X11 forwarding request failed on channel 0"});
+        t->onMousePaste = [this, t](const QString &text) { pasted(t, text); };
+        // A crashed server or a lost network ends ssh with an error: say so in red, like MobaXterm, instead of only
+        // "Session stopped". t outlives its own callback.
+        const auto protocol = p->profile["protocol"].toString();
+        if (!p->device && (protocol == "ssh" || protocol == "sftp"))
+            t->describeExit = [t, host = p->profile["host"].toString()](int code)
+            { return sshExitError(code, t->contents(), host); };
+        // A password typed before its prompt appears must not reach the remote shell as a command.
+        if (!p->device && protocol == "ssh")
+            t->holdKeysUntilLogin();
         if (!t->finished())
             t->printLocal(welcomeBanner(p->profile, p->command));
         return t;
@@ -438,6 +582,7 @@ private:
                   std::function<QIODevice *()> device = {})
     {
         auto *p = new Page;
+        p->name = name;
         p->profile = profile;
         p->command = command;
         p->device = std::move(device);
@@ -456,7 +601,7 @@ private:
             // terminal's folder is listed; until then the sidebar stays where it was.
             p->sftp->onConnected = [this, p]
             {
-                if (current() != p)
+                if (activePage() != p)
                     return;
                 updateFileBrowser();
                 showSide(3);
@@ -499,23 +644,63 @@ private:
             QTimer::singleShot(0, this,
                                [this, p]
                                {
+                                   // Enter then R in the same pass: the tab is already closed.
+                                   // R pressed twice: the session is already running again.
+                                   if (!isOpen(p) || p->restarting || !p->terminal->finished())
+                                       return;
                                    auto *old = p->terminal;
-                                   for (auto &entry : p->command.environment)
+                                   renewAskpass(p->command.environment); // fresh attempt counter and access key
+                                   // Mosh bootstraps in a nested event loop: a close meanwhile waits until it returns.
+                                   p->restarting = true;
+                                   auto *fresh = makeTerminal(p);
+                                   p->restarting = false;
+                                   if (p->closeRequested)
                                    {
-                                       if (entry.startsWith("CROSSTERM_ASKPASS_TOKEN="))
-                                           entry =
-                                               "CROSSTERM_ASKPASS_TOKEN=" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+                                       delete fresh;
+                                       closePage(p);
+                                       return;
                                    }
-                                   p->terminal = makeTerminal(p);
+                                   p->terminal = fresh;
                                    p->terminal->installEventFilter(this);
+                                   startLog(p->terminal, p->name);
                                    p->widget = p->terminal;
                                    wire(p);
+                                   showState(p); // normal tab icon and tooltip again
                                    old->hide();
                                    old->setParent(area);
                                    old->deleteLater();
                                    layoutPages();
+                                   // R was typed in this pane: what is typed next belongs to it, not to the current tab.
+                                   if (p->terminal->isVisible())
+                                       p->terminal->setFocus();
                                });
         };
+    }
+
+    static bool unfinishedWork(const Page *p)
+    {
+        if (!p)
+            return false;
+        if (const auto *ftp = dynamic_cast<const FtpPanel *>(p->widget); ftp && !ftp->transfersIdle())
+            return true;
+        return p->sftp && (!p->sftp->transfersIdle() || p->sftp->unsavedEdits() > 0);
+    }
+
+    bool confirmUnfinished()
+    {
+        return QMessageBox::question(this, "CrossTerm",
+                                     L("File transfers or remote edits not uploaded yet are still in progress. Close anyway?"),
+                                     QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+    }
+
+    bool isOpen(const Page *p) const
+    {
+        for (int i = 0; i < bar->count(); ++i)
+        {
+            if (page(i) == p)
+                return true;
+        }
+        return false;
     }
 
     void closePage(Page *p)
@@ -524,10 +709,40 @@ private:
         {
             if (page(i) != p || p == home)
                 continue;
+            if (p->restarting)
+            {
+                p->closeRequested = true;
+                return;
+            }
+            if (openTabMenu)
+                openTabMenu->close(); // its actions point at pages and views that may be this one
+            // A drag to the desktop is downloading in a nested event loop that still uses the panel: stop it and
+            // close once it has unwound.
+            if (p->sftp && p->sftp->dragActive())
+            {
+                p->sftp->onDragEnded = [this, p]
+                {
+                    if (isOpen(p))
+                        closePage(p);
+                };
+                p->sftp->cancelDrag();
+                return;
+            }
+            // A transfer killed half-way leaves a truncated file; edits not uploaded yet would be lost.
+            if (unfinishedWork(p) && !p->closeConfirmed)
+            {
+                if (!confirmUnfinished() || !isOpen(p))
+                    return;
+                p->closeConfirmed = true;
+                return closePage(p); // tabs may have moved while the question was open
+            }
             // Detach from the splitters before removeTab: currentChanged rebuilds the Split and would delete the widget.
             p->widget->hide();
             p->widget->setParent(area);
             bar->removeTab(i);
+            releaseAskpass(p->command.environment); // its password prompts and vault access end with the tab
+            if (p->terminal)
+                p->terminal->onEnded = nullptr; // points at this page
             p->widget->deleteLater();
             if (p->sftp)
             {
@@ -550,6 +765,9 @@ private:
     // Split: 1 terminal, 2 side by side, 2 stacked, 4 in a grid (current tab and the following ones).
     void layoutPages()
     {
+        // The pane the user is typing in: a rebuild (monitoring toggled, another pane restarted) must not move the
+        // focus to another server.
+        QPointer<Terminal> focused = dynamic_cast<Terminal *>(QApplication::focusWidget());
         // Sizes the user gave the split panes: kept when the same arrangement is rebuilt.
         QList<QList<int>> oldSizes;
         Qt::Orientation oldOrientation = Qt::Vertical;
@@ -618,14 +836,29 @@ private:
             monitorBar->showError(L("Loading…")); // until the first data arrives
         updateFileBrowser();
         updateTitle();
-        if (now->terminal)
+        if (focused && focused->isVisible() && activeTerminal() == focused)
+            focused->setFocus();
+        else if (now->terminal)
             now->terminal->setFocus();
     }
 
     // File browser section (globe in the sidebar strip): shown only for a tab whose SFTP folder is already listed.
+    // The page of the pane the user is working in (split view), otherwise the current tab.
+    Page *activePage() const
+    {
+        const auto *t = activeTerminal();
+        for (int i = 0; t && i < bar->count(); ++i)
+        {
+            if (page(i)->terminal == t)
+                return page(i);
+        }
+        return current();
+    }
+
+    // In a split the browser shows the files of the pane being typed in, not of another server.
     void updateFileBrowser()
     {
-        auto *now = current();
+        auto *now = activePage();
         const bool ready = now && now->sftp && now->sftp->connected();
         sftpStack->setCurrentIndex(0);
         if (ready)
@@ -654,7 +887,9 @@ private:
 
     QStringList folderPath(const QString &folder) const
     {
-        return folder.split(QRegularExpression("[\\\\/]"), Qt::SkipEmptyParts);
+        // Compiled once: called for every session at each refresh (every key typed in the filter).
+        static const QRegularExpression separators("[\\\\/]");
+        return folder.split(separators, Qt::SkipEmptyParts);
     }
 
     void refresh()
@@ -704,12 +939,17 @@ private:
             row->setData(0, Qt::UserRole, i);
             row->setData(0, Qt::UserRole + 1, true);
             row->setIcon(0, icon(protocol));
-            row->setToolTip(0, QString("%1\n%2 %3%4")
-                                   .arg(name, protocol.toUpper(), p["host"].toString(),
-                                        review ? "\n" + L("Needs review: ") + describe(p["issues"].toArray().first().toString())
-                                               : QString()));
+            // Names and hosts may come from an imported file: shown as text, never interpreted as HTML (images, links).
+            row->setToolTip(0, Qt::convertFromPlainText(QString("%1\n%2 %3%4")
+                                                            .arg(name, protocol.toUpper(), p["host"].toString(),
+                                                                 review ? "\n" + L("Needs review: ") +
+                                                                              describe(p["issues"].toArray().first().toString())
+                                                                        : QString())));
             if (review)
-                row->setForeground(0, QColor("#e8b04a"));
+            {
+                row->setData(0, Qt::UserRole + 3, true); // recolored when the appearance changes
+                row->setForeground(0, QColor(themed("#e8b04a")));
+            }
         }
         // Favorites: copies of the starred sessions, at the top of the tree.
         QTreeWidgetItem *favorites = nullptr;
@@ -786,7 +1026,12 @@ private:
         QSaveFile file(storage);
         const auto bytes =
             QJsonDocument(QJsonObject{{"version", 1}, {"sessions", next}, {"tunnels", tunnels}, {"macros", macros}}).toJson();
-        if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
+        // Hosts, user names and macros (which may hold typed text): readable by the owner only.
+        // Best effort: file systems without permissions must not make the save fail.
+        const bool opened = file.open(QIODevice::WriteOnly);
+        if (opened)
+            file.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+        if (!opened || file.write(bytes) != bytes.size() || !file.commit())
         {
             QMessageBox::warning(this, L("Save"), file.errorString());
             return false;
@@ -841,7 +1086,9 @@ private:
             if (it == decrypted.constEnd())
                 continue;
             const auto target = credentialTarget(profile, QCoreApplication::applicationName());
-            if (!handled.contains(target) && targetInUse(target) && storeSecret(target, profile["user"].toString(), it.value()))
+            // Only where nothing is saved yet: a password saved in CrossTerm is not replaced by the imported one.
+            if (!handled.contains(target) && targetInUse(target) && !readSecret(target) &&
+                storeSecret(target, profile["user"].toString(), it.value()))
             {
                 handled.insert(target);
                 ++saved;
@@ -929,6 +1176,14 @@ private:
                 if (profile["name"].toString().isEmpty())
                     continue;
                 profile["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+                // A file from someone else must not connect on its own at the next launch, pin a TLS certificate for
+                // a real server, or carry text for the remote shell (mosh port range).
+                profile.remove("autostart");
+                profile.remove("ftpFingerprint");
+                profile.remove("rdpFingerprint");
+                static const QRegularExpression portRange("^\\d{1,5}(:\\d{1,5})?$");
+                if (!portRange.match(profile["moshPorts"].toString()).hasMatch())
+                    profile.remove("moshPorts");
                 imported.profiles.append(profile);
             }
         }
@@ -976,7 +1231,7 @@ private:
         {
             auto *notice = new QLabel(L("Needs review: ") + warnings.join(' '));
             notice->setWordWrap(true);
-            notice->setStyleSheet("color: #e8b04a;");
+            style(notice, "color: #e8b04a;");
             layout->addWidget(notice);
         }
         const QStringList protocols{"ssh", "telnet", "rsh", "rlogin", "rdp", "vnc", "ftp", "sftp", "serial", "mosh", "wsl"};
@@ -1272,8 +1527,23 @@ private:
         }
     }
 
+    // Askpass variables of an ssh launch for a session. Its jump hosts and the name ssh_config gives it ("ssh -G")
+    // go along: a password prompt of any other host, also a jump host that only ssh_config names, is never answered
+    // with the session's password.
+    QStringList askpassFor(const QJsonObject &profile, bool interactive, const QString &terminal = {})
+    {
+        auto ssh = profile;
+        ssh["protocol"] = "ssh";
+        ssh["x11"] = false;
+        const auto command = sessionCommand(ssh, platform(), false);
+        return askpassEnvironment(credentialTarget(profile, QCoreApplication::applicationName()), interactive, terminal,
+                                  profile["jumps"].toArray(),
+                                  command.error.isEmpty() ? sshPromptIdentity(command.program, command.arguments) : QString());
+    }
+
     // Mosh: starts mosh-server over SSH (askpass for passwords), reads "MOSH CONNECT" and opens the UDP channel.
-    QIODevice *moshConnect(const QJsonObject &profile)
+    // cancelled: set when the user gave up while waiting, which needs no error message.
+    QIODevice *moshConnect(const QJsonObject &profile, bool *cancelled = nullptr)
     {
         auto ssh = profile;
         ssh["protocol"] = "ssh";
@@ -1285,19 +1555,46 @@ private:
         QProcess bootstrap;
         hideConsoleWindow(&bootstrap);
         auto environment = QProcessEnvironment::systemEnvironment();
-        for (const auto &entry : askpassEnvironment(credentialTarget(profile, QCoreApplication::applicationName()), true))
+        for (const auto &entry : askpassFor(profile, true))
             environment.insert(entry.section('=', 0, 0), entry.section('=', 1));
         bootstrap.setProcessEnvironment(environment);
         bootstrap.setProcessChannelMode(QProcess::MergedChannels);
-        const auto remote = moshServerArguments(profile["moshPorts"].toString()).join(' ');
+        // The port range becomes part of the command run by the remote shell: digits only ("60001" or "60001:60010").
+        static const QRegularExpression portRange("^\\d{1,5}(:\\d{1,5})?$");
+        const auto ports = profile["moshPorts"].toString().trimmed();
+        if (!ports.isEmpty() && !portRange.match(ports).hasMatch())
+            return nullptr;
+        const auto remote = moshServerArguments(ports).join(' ');
         bootstrap.start(program, QStringList{"-tt"} + command.arguments + QStringList{remote});
         QEventLoop loop;
+        // ssh takes up to 30 s to start mosh-server. The window takes no input meanwhile: keys typed in another tab
+        // must not end up in the new one when it appears and takes the focus, and the window cannot close under
+        // this function. Cancel gives up at once.
+        QProgressDialog wait(L("Connecting to %1…").arg(profile["host"].toString()), L("Cancel"), 0, 0, this);
+        wait.setWindowTitle("CrossTerm");
+        wait.setWindowModality(Qt::ApplicationModal);
+        wait.setMinimumDuration(0);
+        wait.setAutoClose(false);
+        wait.setAutoReset(false);
+        connect(&wait, &QProgressDialog::canceled, &loop, &QEventLoop::quit);
+        wait.show();
         connect(&bootstrap, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), &loop, &QEventLoop::quit);
+        // A start failure emits no finished(): without this the window would wait for the whole timeout.
+        connect(&bootstrap, &QProcess::errorOccurred, &loop,
+                [&loop](QProcess::ProcessError error)
+                {
+                    if (error == QProcess::FailedToStart)
+                        loop.quit();
+                });
         QTimer::singleShot(30000, &loop, &QEventLoop::quit);
         if (bootstrap.state() != QProcess::NotRunning)
             loop.exec();
         if (bootstrap.state() != QProcess::NotRunning)
             bootstrap.kill();
+        if (cancelled)
+            *cancelled = wait.wasCanceled();
+        wait.hide();
+        releaseAskpass(bootstrap.processEnvironment().toStringList());
         int udpPort = 0;
         QByteArray key;
         if (!parseMoshConnect(bootstrap.readAll(), udpPort, key))
@@ -1310,44 +1607,84 @@ private:
         return nullptr;
     }
 
+    // Saved password of a session that is not SSH. One saved when the entry name had no protocol in it is moved to
+    // the session's own entry, unless an SSH session uses that name: its password is not this session's.
+    std::optional<QString> savedPassword(const QJsonObject &profile) const
+    {
+        const auto application = QCoreApplication::applicationName();
+        const auto target = credentialTarget(profile, application);
+        if (auto saved = readSecret(target))
+            return saved;
+        auto plain = profile;
+        plain.remove("protocol");
+        const auto old = credentialTarget(plain, application);
+        if (old == target || targetInUse(old))
+            return std::nullopt;
+        auto saved = readSecret(old);
+        if (saved && storeSecret(target, profile["user"].toString(), *saved))
+            removeSecret(old);
+        return saved;
+    }
+
+    // Certificate accepted by the user: the fingerprint is stored in the saved session and not asked again.
+    void rememberFingerprint(const QString &id, const QString &key, const QString &fingerprint)
+    {
+        auto next = profiles;
+        for (int i = 0; i < next.size(); ++i)
+        {
+            auto stored = next[i].toObject();
+            if (!id.isEmpty() && stored["id"].toString() == id)
+            {
+                stored[key] = fingerprint;
+                next.replace(i, stored);
+                save(next);
+            }
+        }
+    }
+
 public:
     // FTP: file browser inside the tab. Password: vault, then session memory, then prompt.
     FtpPanel *openFtp(const QJsonObject &profile)
     {
         const auto target = credentialTarget(profile, QCoreApplication::applicationName());
-        auto password = [this, target, profile]() -> QString
+        // A typed password is kept for the run only once the server accepted it; after a rejected login neither the
+        // saved nor the remembered one is offered again (every retry would be another failed login).
+        const auto typedNow = std::make_shared<QString>();
+        const auto rejected = std::make_shared<bool>(false);
+        auto password = [this, target, profile, typedNow, rejected]() -> QString
         {
-            if (const auto saved = readSecret(target))
-                return *saved;
-            if (const auto cached = SessionSecrets::instance().get(target))
-                return *cached;
+            if (!*rejected)
+            {
+                if (const auto saved = savedPassword(profile))
+                    return *saved;
+                if (const auto cached = SessionSecrets::instance().get(target))
+                    return *cached;
+            }
             bool ok = false;
             const auto typed = QInputDialog::getText(
                 this, L("Authentication"), L("Password for %1@%2:").arg(profile["user"].toString(), profile["host"].toString()),
                 QLineEdit::Password, {}, &ok);
-            if (ok)
-                SessionSecrets::instance().put(target, typed);
+            *typedNow = ok ? typed : QString();
             return typed;
         };
         auto *p = new Page;
         p->profile = profile;
         auto *panel = new FtpPanel(profile, password, area);
-        // FTPS certificate accepted by the user: the fingerprint is stored in the profile and not asked again.
-        const auto id = profile["id"].toString();
-        panel->certificateTrusted = [this, id](const QString &fingerprint)
+        panel->onLoggedIn = [target, typedNow, rejected]
         {
-            auto next = profiles;
-            for (int i = 0; i < next.size(); ++i)
-            {
-                auto stored = next[i].toObject();
-                if (!id.isEmpty() && stored["id"].toString() == id)
-                {
-                    stored["ftpFingerprint"] = fingerprint;
-                    next.replace(i, stored);
-                    save(next);
-                }
-            }
+            if (!typedNow->isEmpty())
+                SessionSecrets::instance().put(target, *typedNow);
+            typedNow->clear();
+            *rejected = false;
         };
+        panel->onLoginRejected = [target, typedNow, rejected]
+        {
+            SessionSecrets::instance().forget(target);
+            typedNow->clear();
+            *rejected = true;
+        };
+        panel->certificateTrusted = [this, id = profile["id"].toString()](const QString &fingerprint)
+        { rememberFingerprint(id, "ftpFingerprint", fingerprint); };
         p->widget = panel;
         addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), icon("ftp"));
         return panel;
@@ -1359,7 +1696,7 @@ public:
         const auto target = credentialTarget(profile, QCoreApplication::applicationName());
         auto password = [this, target, profile]() -> QString
         {
-            if (const auto saved = readSecret(target))
+            if (const auto saved = savedPassword(profile))
                 return *saved;
             if (const auto cached = SessionSecrets::instance().get(target))
                 return *cached;
@@ -1378,10 +1715,13 @@ public:
         settings.domain = profile["domain"].toString();
         settings.redirectDrives = profile["redirectDrives"].toBool();
         settings.redirectClipboard = profile["redirectClipboard"].toBool(true);
+        settings.fingerprint = profile["rdpFingerprint"].toString();
         auto *p = new Page;
         p->profile = profile;
         auto *view = new RdpView(settings, password, area);
         view->onDisconnected = [target](const QString &) { SessionSecrets::instance().forget(target); };
+        view->onCertificateTrusted = [this, id = profile["id"].toString()](const QString &fingerprint)
+        { rememberFingerprint(id, "rdpFingerprint", fingerprint); };
         p->widget = view;
         addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), icon("rdp"));
         view->connectToHost();
@@ -1394,7 +1734,7 @@ public:
         const auto target = credentialTarget(profile, QCoreApplication::applicationName());
         auto password = [this, target, profile]() -> QString
         {
-            if (const auto saved = readSecret(target))
+            if (const auto saved = savedPassword(profile))
                 return *saved;
             if (const auto cached = SessionSecrets::instance().get(target))
                 return *cached;
@@ -1469,8 +1809,9 @@ private:
                 {}, name, profile,
                 [this, profile]
                 {
-                    auto *device = moshConnect(profile);
-                    if (!device)
+                    bool cancelled = false;
+                    auto *device = moshConnect(profile, &cancelled);
+                    if (!device && !cancelled)
                         QMessageBox::warning(
                             this, L("Open session"),
                             L("mosh-server could not be started on the remote host. Check that mosh is installed there and that the UDP ports are reachable."));
@@ -1505,7 +1846,7 @@ private:
         // Always via askpass: a password typed once stays available for SFTP, monitoring and tunnels.
         // Prompts (password, host key) appear inside the terminal tab, identified by this id.
         if (protocol == "ssh" || protocol == "sftp")
-            command.environment << askpassEnvironment(target, true, QUuid::createUuid().toString(QUuid::WithoutBraces));
+            command.environment << askpassFor(profile, true, QUuid::createUuid().toString(QUuid::WithoutBraces));
         if (command.error.isEmpty())
         {
             auto ids = QSettings().value("recent").toStringList();
@@ -1582,9 +1923,14 @@ private:
         }
         if (!save(next))
             return;
+        // Targets of the remaining sessions collected once: a folder can hold hundreds of sessions.
+        QSet<QString> inUse;
+        for (const auto &v : profiles)
+            inUse.insert(credentialTarget(v.toObject(), QCoreApplication::applicationName()));
+        targets.removeDuplicates(); // each vault removal rewrites the vault on macOS
         for (const auto &target : targets)
         {
-            if (!targetInUse(target))
+            if (!inUse.contains(target))
                 removeSecret(target);
         }
     }
@@ -1673,17 +2019,44 @@ private:
         QList<int> matches;
         QTreeWidgetItemIterator it(tree);
         for (; *it; ++it)
-            if ((*it)->data(0, Qt::UserRole + 1).toBool())
-                matches << (*it)->data(0, Qt::UserRole).toInt();
-        if (matches.size() == 1)
         {
-            open(matches[0]);
-            quick->clear();
-            return;
+            // A favorite is listed twice (Favorites and its folder): one session, one match.
+            if (const int index = (*it)->data(0, Qt::UserRole).toInt();
+                (*it)->data(0, Qt::UserRole + 1).toBool() && !matches.contains(index))
+                matches << index;
         }
         // [ssh://|telnet://][user@]host[:port]
         static const QRegularExpression target("^(?:(ssh|telnet|sftp)://)?(?:([^@\\s]+)@)?(\\[[^\\]]+\\]|[^:\\s]+)(?::(\\d+))?$");
         const auto m = target.match(text);
+        if (matches.size() == 1)
+        {
+            // The only session left by the filter opens at once when the text is its name or host, or cannot be a
+            // destination. Text that could also be another host (it only resembles the saved one) is asked about:
+            // a saved session never opens in place of the server that was typed.
+            const auto saved = profiles[matches[0]].toObject();
+            const auto name = saved["name"].toString(), host = saved["host"].toString(), user = saved["user"].toString();
+            bool openSaved =
+                !m.hasMatch() || text.compare(name, Qt::CaseInsensitive) == 0 || text.compare(host, Qt::CaseInsensitive) == 0;
+            if (!openSaved)
+            {
+                QMessageBox box(QMessageBox::Question, L("Quick connect"),
+                                L("Open the saved session \"%1\" (%2)?\n\nNo connects to \"%3\" instead.")
+                                    .arg(name, (user.isEmpty() ? QString() : user + "@") + host, text),
+                                QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel, this);
+                box.setTextFormat(Qt::PlainText); // names come from session files
+                box.setDefaultButton(QMessageBox::Yes);
+                const int answer = box.exec();
+                if (answer == QMessageBox::Cancel)
+                    return;
+                openSaved = answer == QMessageBox::Yes;
+            }
+            if (openSaved)
+            {
+                open(matches[0]);
+                quick->clear();
+                return;
+            }
+        }
         if (!m.hasMatch())
         {
             QMessageBox::warning(this, L("Quick connect"), L("Use [user@]host[:port]."));
@@ -1708,8 +2081,45 @@ private:
     {
         QDialog dialog(this);
         dialog.setWindowTitle(L("CrossTerm Configuration"));
-        auto *form = new QFormLayout(&dialog);
+        // Sections in a scroll area: on a small screen the dialog shrinks and the sections scroll.
+        struct Sections : QScrollArea
+        {
+            QSize sizeHint() const override
+            {
+                const int frame = 2 * frameWidth();
+                return widget() ? widget()->sizeHint() + QSize(frame, frame) : QScrollArea::sizeHint();
+            }
+        };
+        auto *layout = new QVBoxLayout(&dialog);
+        auto *scroll = new Sections;
+        auto *content = new QWidget;
+        auto *sections = new QVBoxLayout(content);
+        sections->setContentsMargins(0, 0, 0, 0);
+        QList<QFormLayout *> forms;
+        auto section = [&](const QString &title)
+        {
+            auto *box = new QGroupBox(title);
+            sections->addWidget(box);
+            forms << new QFormLayout(box);
+            return forms.last();
+        };
         QSettings settings;
+        auto *form = section(L("Appearance"));
+        auto *theme = new QComboBox;
+        theme->addItem(L("macOS (follow system)"), "mac-system");
+        for (const auto look : {Appearance::MacLight, Appearance::MacDark})
+            theme->addItem(L(appearanceName(look).toUtf8().constData()), appearanceKey(look));
+        theme->addItem(L("Classic (follow system)"), "system");
+        for (const auto look : {Appearance::ClassicDark, Appearance::ClassicLight})
+            theme->addItem(L(appearanceName(look).toUtf8().constData()), appearanceKey(look));
+        theme->setCurrentIndex(std::max(0, theme->findData(themeKey)));
+        form->addRow(L("Theme"), theme);
+
+        form = section(L("Terminal"));
+        auto *scheme = new QComboBox;
+        for (const auto &c : Terminal::schemes())
+            scheme->addItem(c.name);
+        scheme->setCurrentText(settings.value("terminal/scheme", "CrossTerm Dark").toString());
         auto *font = new QFontComboBox;
         font->setFontFilters(QFontComboBox::MonospacedFonts);
         font->setCurrentFont(QFont(settings
@@ -1719,22 +2129,16 @@ private:
                                        .toString()));
         auto *size = new QSpinBox;
         size->setRange(6, 32);
+        size->setSuffix(" pt");
         size->setValue(settings.value("terminal/size", 10).toInt());
         auto *paste = new QCheckBox(L("Paste using right-click"));
         paste->setChecked(settings.value("terminal/rightPaste", true).toBool());
-        auto *theme = new QComboBox;
-        theme->addItem(L("macOS (follow system)"), "mac-system");
-        for (const auto look : {Appearance::MacLight, Appearance::MacDark})
-            theme->addItem(L(appearanceName(look).toUtf8().constData()), appearanceKey(look));
-        theme->addItem(L("Classic (follow system)"), "system");
-        for (const auto look : {Appearance::ClassicDark, Appearance::ClassicLight})
-            theme->addItem(L(appearanceName(look).toUtf8().constData()), appearanceKey(look));
-        theme->setCurrentIndex(std::max(0, theme->findData(themeKey)));
-        auto *scheme = new QComboBox;
-        for (const auto &c : Terminal::schemes())
-            scheme->addItem(c.name);
-        scheme->setCurrentText(settings.value("terminal/scheme", "CrossTerm Dark").toString());
-        form->addRow(L("Theme"), theme);
+        form->addRow(L("Terminal colors"), scheme);
+        form->addRow(L("Terminal font"), font);
+        form->addRow(L("Font size"), size);
+        form->addRow(paste);
+
+        form = section(L("Connections"));
         auto *prediction = new QComboBox;
         prediction->addItem(L("Adaptive (slow connections only)"), "adaptive");
         prediction->addItem(L("Always"), "always");
@@ -1748,8 +2152,10 @@ private:
 #ifdef Q_OS_MACOS
         auto *touchId = new QCheckBox(L("Ask for Touch ID before using saved passwords"));
         touchId->setChecked(settings.value("vault/touchId", true).toBool());
-        form->addRow(QString(), touchId);
+        form->addRow(touchId);
 #endif
+
+        form = section(L("Servers"));
         auto pemField = [&](const QString &key)
         {
             auto *edit = new QLineEdit(settings.value(key).toString());
@@ -1768,10 +2174,8 @@ private:
         auto *ftpKey = pemField("servers/ftpKey");
         form->addRow(L("FTP server certificate (FTPS)"), ftpCertificate);
         form->addRow(L("FTP server private key"), ftpKey);
-        form->addRow(L("Terminal colors"), scheme);
-        form->addRow(L("Terminal font"), font);
-        form->addRow(L("Font size"), size);
-        form->addRow(paste);
+
+        form = section(L("Logging"));
         auto *logEnabled = new QCheckBox(L("Save terminal sessions to log files"));
         logEnabled->setChecked(settings.value("log/enabled").toBool());
         auto *logFolder = new QLineEdit(
@@ -1787,10 +2191,38 @@ private:
                 });
         form->addRow(logEnabled);
         form->addRow(L("Log folder"), logFolder);
+
+        // Same label column in every section, so the fields line up.
+        QList<QWidget *> labels;
+        int labelWidth = 0;
+        for (auto *f : forms)
+        {
+            for (int row = 0; row < f->rowCount(); ++row)
+            {
+                auto *item = f->itemAt(row, QFormLayout::LabelRole);
+                if (!item || !item->widget())
+                    continue;
+                labels << item->widget();
+                labelWidth = std::max(labelWidth, item->widget()->sizeHint().width());
+            }
+        }
+        for (auto *label : labels)
+            label->setMinimumWidth(labelWidth);
+        sections->addStretch(1);
+        scroll->setWidget(content);
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        // The dialog background shows through, in every appearance.
+        content->setAutoFillBackground(false);
+        scroll->viewport()->setAutoFillBackground(false);
+        layout->addWidget(scroll, 1);
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-        form->addRow(buttons);
+        layout->addWidget(buttons);
         connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
         connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        // Full height when the screen allows it (Qt alone stops at 2/3 of the screen); DialogFitter shrinks the rest.
+        dialog.resize(dialog.sizeHint());
         if (dialog.exec() != QDialog::Accepted)
             return;
         settings.setValue("terminal/font", font->currentFont().family());
@@ -1819,6 +2251,17 @@ private:
         }
     }
 
+    // Primary action of the home page: accent color of the appearance, white text.
+    static QString primaryStyle()
+    {
+        const auto accent = appearancePalette(appearance).accent;
+        return QString("QPushButton { font-size: 12pt; padding: 10px 24px; color: white; background: %1;"
+                       " border: 1px solid %3; border-radius: 6px; }"
+                       "QPushButton:hover { background: %2; }"
+                       "QPushButton:pressed { background: %3; }")
+            .arg(accent.name(), accent.lighter(112).name(), accent.darker(118).name());
+    }
+
     QWidget *homePage()
     {
         auto *w = new QWidget(area);
@@ -1829,9 +2272,10 @@ private:
         logo->setAlignment(Qt::AlignCenter);
         style(logo, "font-size: 30pt; font-weight: 600; color: #f0f0f0;");
         v->addWidget(logo);
-        auto *start = texts.text(new QPushButton(icon("session"), QString()), N("Start local terminal"));
+        auto *start = texts.text(startButton, N("Start local terminal"));
+        start->setIcon(icon("session"));
         start->setIconSize(QSize(28, 28));
-        start->setStyleSheet("font-size: 12pt; padding: 10px 24px;");
+        start->setStyleSheet(primaryStyle());
         connect(start, &QPushButton::clicked, this, [this] { terminal(localShell(), L("Local terminal")); });
         v->addWidget(start, 0, Qt::AlignHCenter);
         v->addSpacing(18);
@@ -1871,6 +2315,7 @@ private:
         }
         if (auto *view = dynamic_cast<VncView *>(p->widget))
         {
+            menu.addAction(L("Reconnect"), [view] { view->reconnect(); });
             auto *scale = menu.addAction(L("Scale to fit"), [view](bool on) { view->setScaled(on); });
             scale->setCheckable(true);
             scale->setChecked(view->isScaled());
@@ -1880,12 +2325,34 @@ private:
             menu.addAction(L("Send Ctrl+Alt+Del"), [view] { view->sendCtrlAltDel(); });
             menu.addSeparator();
         }
-        menu.addAction(L("Duplicate tab"), [&] { terminal(p->command, bar->tabText(index).section(". ", 1), p->profile); });
+        menu.addAction(L("Duplicate tab"),
+                       [&]
+                       {
+                           // Copies: opening can run a nested event loop (mosh bootstrap, password prompt) during
+                           // which this tab may be closed and its page deleted.
+                           const auto profile = p->profile;
+                           if (!p->terminal) // FTP, RDP, VNC: no command to copy, the session is opened again
+                           {
+                               openDevice(profile);
+                               return;
+                           }
+                           // Own askpass ids: the copy's prompts appear in its own tab and its password attempts
+                           // are counted apart (as on restart).
+                           auto command = p->command;
+                           renewAskpass(command.environment, true);
+                           // Telnet, rlogin, rsh, serial and mosh tabs have no command: their device is recreated.
+                           const auto device = p->device;
+                           const auto name = bar->tabText(index).section(". ", 1);
+                           terminal(command, name, profile, device); // p is not used after this
+                       });
         menu.addSeparator();
         menu.addAction(L("Close tab"), [&] { closePage(p); });
         menu.addAction(L("Close all tabs except this one"), [&] { closeAll(p); });
         menu.addAction(L("Close all tabs"), [&] { closeAll(nullptr); });
+        // The actions hold this page and its view: a tab closing while the menu is open closes the menu (closePage).
+        openTabMenu = &menu;
         menu.exec(bar->mapToGlobal(at));
+        openTabMenu = nullptr;
     }
 
     void treeMenu(const QPoint &at)
@@ -1916,8 +2383,9 @@ private:
             menu.addSeparator();
         }
         const auto folder = item ? item->data(0, Qt::UserRole + 2).toString().mid(1).replace('/', '\\') : QString();
-        menu.addAction(icon("session", 16), L("New session"),
-                       [&] { edit(-1, i >= 0 ? profiles[i].toObject()["folder"].toString() : folder); });
+        // The Favorites view ("*favorites") is not a folder: a session created from it goes to the root.
+        const auto newFolder = i >= 0 ? profiles[i].toObject()["folder"].toString() : folder.startsWith('*') ? QString() : folder;
+        menu.addAction(icon("session", 16), L("New session"), [&] { edit(-1, newFolder); });
         if (i < 0 && !folderPath(folder).isEmpty() && !folder.startsWith('*'))
             menu.addAction(icon("delete", 16), L("Delete folder"), [&] { removeFolder(folder); });
         menu.addAction(L("Import from MobaXterm..."), [&] { importWizard(); });
@@ -1990,7 +2458,7 @@ private:
         }
         auto *process = hideConsoleWindow(new QProcess(this));
         auto environment = QProcessEnvironment::systemEnvironment();
-        for (const auto &entry : askpassEnvironment(credentialTarget(profile, QCoreApplication::applicationName()), true))
+        for (const auto &entry : askpassFor(profile, true))
             environment.insert(entry.section('=', 0, 0), entry.section('=', 1));
         process->setProcessEnvironment(environment);
         process->setProcessChannelMode(QProcess::MergedChannels);
@@ -2012,6 +2480,7 @@ private:
                     const auto output = QString::fromUtf8(process->readAll()).trimmed();
                     const bool stopped = process->property("stopping").toBool();
                     running.remove(id);
+                    releaseAskpass(process->processEnvironment().toStringList());
                     process->deleteLater();
                     setTunnelStatus(id, stopped ? L("Stopped") : L("Stopped with error %1: %2").arg(code).arg(output.right(300)));
                 });
@@ -2235,16 +2704,27 @@ private:
         findText->selectAll();
     }
 
+    // Search closed or emptied: the highlighted matches go away in every tab.
+    void clearFind()
+    {
+        for (int i = 0; i < bar->count(); ++i)
+        {
+            if (auto *t = page(i)->terminal)
+                t->clearFind();
+        }
+    }
+
     void hideFind()
     {
         findBar->hide();
-        if (current()->terminal)
-            current()->terminal->setFocus();
+        clearFind();
+        if (auto *t = activeTerminal())
+            t->setFocus();
     }
 
     bool doFind(bool backward)
     {
-        auto *t = current()->terminal;
+        auto *t = activeTerminal();
         const bool found =
             t && t->find(findText->text(), backward, findCase->isChecked() ? Qt::CaseSensitive : Qt::CaseInsensitive);
         findStatus->setText(found || findText->text().isEmpty() ? QString() : L("Not found"));
@@ -2273,10 +2753,28 @@ private:
         return true;
     }
 
+    // Macro steps marked "logical" store Ctrl as Qt::ControlModifier on every platform (macros imported from MobaXterm,
+    // or recorded here and played on another system). Qt on macOS reports the Control key as Meta and Command as
+    // Control: swapped when recording and back when playing. Steps without the mark are played as stored.
+    static int logicalModifiers(int modifiers)
+    {
+#ifdef Q_OS_MACOS
+        const int control = modifiers & Qt::ControlModifier, meta = modifiers & Qt::MetaModifier;
+        modifiers &= ~(Qt::ControlModifier | Qt::MetaModifier);
+        if (control)
+            modifiers |= Qt::MetaModifier;
+        if (meta)
+            modifiers |= Qt::ControlModifier;
+#endif
+        return modifiers;
+    }
+
     void playMacro(int index, Terminal *target)
     {
         if (!target || index < 0 || index >= macros.size() || target->finished())
             return;
+        // A macro started during another one's pause must not end "playing" (no recording) for the outer one.
+        const bool wasPlaying = playing;
         playing = true;
         QPointer<Terminal> guard(target);
         for (const auto &v : macros[index].toObject()["steps"].toArray())
@@ -2284,19 +2782,30 @@ private:
             const auto step = v.toObject();
             if (step.contains("sleep")) // pause step in macros imported from MobaXterm
             {
+                // exec() returns at once while the application is quitting: the rest of the macro must not be typed
+                // without its pauses (text meant for a later prompt).
+                bool elapsed = false;
                 QEventLoop pause;
-                QTimer::singleShot(std::clamp(step["sleep"].toInt(), 0, 60000), &pause, &QEventLoop::quit);
+                QTimer::singleShot(std::clamp(step["sleep"].toInt(), 0, 60000), &pause,
+                                   [&]
+                                   {
+                                       elapsed = true;
+                                       pause.quit();
+                                   });
                 pause.exec();
-                if (!guard || target->finished())
+                if (!elapsed || !guard || target->finished())
                     break;
                 continue;
             }
-            QKeyEvent key(QEvent::KeyPress, step["key"].toInt(), Qt::KeyboardModifiers(step["modifiers"].toInt()),
+            const int modifiers = step["modifiers"].toInt();
+            QKeyEvent key(QEvent::KeyPress, step["key"].toInt(),
+                          Qt::KeyboardModifiers(step["logical"].toBool() ? logicalModifiers(modifiers) : modifiers),
                           step["text"].toString());
             QApplication::sendEvent(target, &key);
         }
-        playing = false;
-        target->setFocus();
+        playing = wasPlaying;
+        if (guard) // the tab may have been closed during a pause
+            target->setFocus();
     }
 
     void refreshMacros()
@@ -2318,7 +2827,7 @@ private:
         if (macros.isEmpty())
             menu->addAction(L("No macro recorded"))->setEnabled(false);
         for (int i = 0; i < macros.size(); ++i)
-            menu->addAction(macros[i].toObject()["name"].toString(), this, [this, i] { playMacro(i, current()->terminal); });
+            menu->addAction(macros[i].toObject()["name"].toString(), this, [this, i] { playMacro(i, activeTerminal()); });
     }
 
     void stopRecordingDialog()
@@ -2424,6 +2933,12 @@ private:
         {
             if (widget)
                 widget->setStyleSheet(themed(dark));
+        }
+        startButton->setStyleSheet(primaryStyle());
+        for (QTreeWidgetItemIterator it(tree); *it; ++it)
+        {
+            if ((*it)->data(0, Qt::UserRole + 3).toBool())
+                (*it)->setForeground(0, QColor(themed("#e8b04a"))); // "needs review" amber
         }
         bar->update();
     }
@@ -2640,8 +3155,7 @@ private:
             ssh["protocol"] = "ssh";
             ssh["x11"] = false;
             const auto command = sessionCommand(ssh, platform(), false);
-            p->monitor = new RemoteMonitor(
-                command, askpassEnvironment(credentialTarget(ssh, QCoreApplication::applicationName()), false), 5, this);
+            p->monitor = new RemoteMonitor(command, askpassFor(ssh, false), 5, this);
             p->monitor->updated = [this, p](const MonitorStats &stats)
             {
                 p->stats = stats;
@@ -2657,7 +3171,9 @@ private:
             };
             p->monitor->start();
         }
-        layoutPages();
+        // The monitoring bar shows the current tab only: a background tab (retryLogins) needs no relayout.
+        if (current() == p)
+            layoutPages();
     }
 
 public:
@@ -2715,6 +3231,7 @@ private:
         if (text.isEmpty())
             return;
         bar->setTabText(index, bar->tabText(index).section(". ", 0, 0) + ". " + text);
+        showState(p); // tooltip
         layoutPages();
     }
 
@@ -2765,6 +3282,8 @@ private:
         auto *screen = QGuiApplication::screenAt(frameGeometry().center());
         if (!screen)
             screen = QGuiApplication::primaryScreen();
+        if (!screen) // last monitor removed (screenRemoved): nothing to fit to
+            return;
         const auto frame = frameGeometry();
         const auto fitted = fitToArea(frame, screen->availableGeometry());
         if (fitted == frame)
@@ -2800,18 +3319,23 @@ private:
             QMessageBox::Yes)
             return;
         file.close();
+        const auto oldTunnels = tunnels, oldMacros = macros;
         if (doc.contains("tunnels"))
             tunnels = doc["tunnels"].toArray();
         if (doc.contains("macros"))
-        {
             macros = doc["macros"].toArray();
-            refreshMacros();
-        }
         if (save(doc["sessions"].toArray()))
         {
             QFile::remove(backup);
             undoImport->setEnabled(false);
         }
+        else
+        {
+            // Not saved: keep tunnels and macros matching the sessions still in use (the backup stays for a retry).
+            tunnels = oldTunnels;
+            macros = oldMacros;
+        }
+        refreshMacros();
     }
 
     static QStringList mobaCandidates()
@@ -3052,7 +3576,10 @@ private:
                 const auto bytes =
                     QJsonDocument(QJsonObject{{"version", 1}, {"sessions", profiles}, {"tunnels", tunnels}, {"macros", macros}})
                         .toJson();
-                if (!writable || !backup.open(QIODevice::WriteOnly) || backup.write(bytes) != bytes.size() || !backup.commit())
+                const bool backupOpen = writable && backup.open(QIODevice::WriteOnly);
+                if (backupOpen)
+                    backup.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+                if (!backupOpen || backup.write(bytes) != bytes.size() || !backup.commit())
                 {
                     QMessageBox::warning(&dialog, L("Import"), L("Cannot create the backup; nothing was imported."));
                     return;
@@ -3064,7 +3591,8 @@ private:
                     return;
                 undoImport->setEnabled(true);
                 importPasswords(&dialog, imported, chosen);
-                QMessageBox::information(&dialog, L("Import"), L("%1 new session(s).").arg(next.size() - before));
+                // profiles is what was saved: it also counts the tunnel servers added by applyExtras.
+                QMessageBox::information(&dialog, L("Import"), L("%1 new session(s).").arg(profiles.size() - before));
                 dialog.accept();
             });
         if (source->count())
@@ -3072,6 +3600,22 @@ private:
         dialog.resize(760, 520);
         dialog.setGeometry(fitToArea(dialog.geometry(), screen()->availableGeometry()));
         dialog.exec();
+    }
+
+public:
+    // Child processes are deleted by QObject after the members are gone, and their destructor emits finished():
+    // nothing of this window may run then (tunnel handlers use the member tables).
+    ~Window() override
+    {
+        for (auto *child : findChildren<QProcess *>(Qt::FindDirectChildrenOnly))
+        {
+            child->disconnect(this);
+            if (child->state() != QProcess::NotRunning)
+            {
+                child->kill();
+                child->waitForFinished(1000);
+            }
+        }
     }
 
 protected:
@@ -3084,6 +3628,26 @@ protected:
 
     void closeEvent(QCloseEvent *event) override
     {
+        bool unfinished = false;
+        for (int i = 0; i < bar->count(); ++i)
+            unfinished |= unfinishedWork(page(i));
+        if (unfinished && !confirmUnfinished())
+        {
+            event->ignore();
+            return;
+        }
+        // Same for quitting during a drag download: closed again once the drag has unwound.
+        for (int i = 0; i < bar->count(); ++i)
+        {
+            auto *p = page(i);
+            if (p->sftp && p->sftp->dragActive())
+            {
+                p->sftp->onDragEnded = [this] { close(); };
+                p->sftp->cancelDrag();
+                event->ignore();
+                return;
+            }
+        }
         for (const auto &id : running.keys())
             stopTunnel(id);
         if (serversDialog)
@@ -3100,24 +3664,65 @@ protected:
         QMainWindow::closeEvent(event);
     }
 
+    void recordPaste(const QString &text)
+    {
+        if (recording && !playing && !text.isEmpty())
+            recordingSteps.append(QJsonObject{{"key", 0}, {"modifiers", 0}, {"text", text}});
+    }
+
+    // A paste made with the mouse or the menu in source: like typed keys, it goes to the other terminals with
+    // MultiExec (a paste on one server followed by Return on all would run different commands) and into the macro
+    // being recorded.
+    void pasted(Terminal *source, const QString &text)
+    {
+        recordPaste(text);
+        if (!multiExec || forwarding)
+            return;
+        forwarding = true;
+        for (int i = 0; i < bar->count(); ++i)
+        {
+            auto *t = page(i)->terminal;
+            if (t && t != source && !t->finished() && !t->prompting() && !t->holdingKeys())
+                t->paste(text);
+        }
+        forwarding = false;
+    }
+
     // MultiExec: keys pressed in one terminal are replicated to all other open terminals.
     bool eventFilter(QObject *watched, QEvent *event) override
     {
-        if (recording && !playing && !forwarding && event->type() == QEvent::KeyPress && dynamic_cast<Terminal *>(watched))
+        auto *source = dynamic_cast<Terminal *>(watched);
+        if (source && event->type() == QEvent::FocusIn && active != source)
+        {
+            active = source;
+            updateFileBrowser();
+        }
+        // Keys that go to the session. Not those typed in an ended tab (Return closes it, R restarts it), at an
+        // inline password prompt or while ssh is still logging in (they may end up in that prompt): they must never
+        // be recorded in a macro or replicated to other servers.
+        const bool sessionKey = source && event->type() == QEvent::KeyPress && !forwarding && !source->finished() &&
+                                !source->prompting() && !source->holdingKeys();
+        if (recording && !playing && sessionKey)
         {
             const auto *key = static_cast<QKeyEvent *>(event);
-            if (key->key() < Qt::Key_Shift || key->key() > Qt::Key_Alt)
-                recordingSteps.append(
-                    QJsonObject{{"key", key->key()}, {"modifiers", int(key->modifiers())}, {"text", key->text()}});
+            // A paste is recorded as its text: replaying the shortcut would paste whatever the clipboard holds then.
+            if (Terminal::isPasteKey(key))
+                recordPaste(QApplication::clipboard()->text());
+            else if (key->key() < Qt::Key_Shift || key->key() > Qt::Key_Alt)
+                recordingSteps.append(QJsonObject{{"key", key->key()},
+                                                  {"modifiers", logicalModifiers(int(key->modifiers()))},
+                                                  {"text", key->text()},
+                                                  {"logical", true}});
         }
-        if (multiExec && !forwarding && event->type() == QEvent::KeyPress && dynamic_cast<Terminal *>(watched))
+        if (multiExec && sessionKey)
         {
             const auto *key = static_cast<QKeyEvent *>(event);
             forwarding = true;
             for (int i = 0; i < bar->count(); ++i)
             {
                 auto *t = page(i)->terminal;
-                if (!t || t == watched || t->finished())
+                // A terminal asking for a password, or about to, takes typed text as the password: skip it.
+                if (!t || t == watched || t->finished() || t->prompting() || t->holdingKeys())
                     continue;
                 QKeyEvent copy(QEvent::KeyPress, key->key(), key->modifiers(), key->text());
                 QApplication::sendEvent(t, &copy);
@@ -3405,10 +4010,9 @@ public:
             panel->setFollow(false);
 
             panel->launchEditor = false;
-            const auto local = QDir(QDir::temp().filePath("CrossTerm-sftp")).filePath("README.md");
-            QFile::remove(local);
             const int queued = panel->transferCount();
             panel->openRemote("README.md", 16);
+            const auto local = panel->editPath("README.md"); // per-panel copy
             wait(20000, [&] { return panel->transfersIdle() && panel->transferCount() == queued + 1; });
             QFile original(local);
             const auto content = original.open(QIODevice::ReadOnly) ? original.readAll() : QByteArray();
@@ -3432,7 +4036,7 @@ public:
             check(again.open(QIODevice::ReadOnly) && again.readAll() == "edited by e2e\n", "server has the edited content");
             const int beforeRestore = panel->transferCount();
             overwrite(content);
-            wait(20000, [&] { return panel->transferCount() == beforeRestore + 1 && panel->transfersIdle(); });
+            wait(20000, [&] { return panel->unsavedEdits() == 0 && panel->transfersIdle(); }); // the edit's row is reused
 
             QTemporaryDir seed;
             QFile seedFile(seed.filePath("f.txt"));
@@ -3809,7 +4413,7 @@ public:
             closePage(current());
 
             // Password session (like an imported MobaXterm one) on a real OpenSSH server: automatic login from the
-            // vault, SFTP listing in the Windows OpenSSH format, monitoring still working after several runs.
+            // vault, SFTP listing in the Windows OpenSSH format, monitoring still working after several samples.
             {
                 const QJsonObject rootProfile{{"id", QUuid::createUuid().toString(QUuid::WithoutBraces)},
                                               {"name", "linux-root"},
@@ -4594,9 +5198,6 @@ public:
         setWindowIcon(QIcon(appIconPath));
         resize(1200, 740); // restoreWindow() then applies the last saved size
         qApp->setStyle("Fusion");
-        QFont interfaceFont("Segoe UI");
-        interfaceFont.setPointSize(9);
-        qApp->setFont(interfaceFont);
         themeKey = QSettings().value("theme", "mac-system").toString();
         appearance = appearanceFromKey(themeKey, systemDark());
         connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this,
@@ -4665,26 +5266,34 @@ public:
         item(terminalMenu, N("Save terminal output..."),
              [this]
              {
-                 auto *t = current()->terminal;
+                 QPointer<Terminal> t = activeTerminal(); // the tab can close while the dialog is open
                  if (!t)
                      return;
                  const auto file = QFileDialog::getSaveFileName(this, L("Save terminal output..."), "terminal.txt",
                                                                 L("Text files (*.txt *.log)"));
-                 if (!file.isEmpty() && !saveOutput(t, file))
+                 if (!file.isEmpty() && t && !saveOutput(t, file))
                      QMessageBox::warning(this, L("Save"), L("The file could not be written."));
              });
         item(terminalMenu, N("Find..."), [this] { showFind(); })->setShortcut(keys("Ctrl+F", "Ctrl+Shift+F"));
         item(terminalMenu, N("Copy all"),
              [this]
              {
-                 if (current()->terminal)
-                     QApplication::clipboard()->setText(current()->terminal->contents());
+                 if (auto *t = activeTerminal())
+                     QApplication::clipboard()->setText(t->contents());
              });
         item(terminalMenu, N("Paste"),
              [this]
              {
-                 if (current()->terminal)
-                     current()->terminal->paste(QApplication::clipboard()->text());
+                 auto *t = activeTerminal();
+                 if (!t || t->finished() || t->prompting() || t->holdingKeys())
+                 {
+                     if (t)
+                         t->paste(QApplication::clipboard()->text()); // password prompt: this terminal only
+                     return;
+                 }
+                 const auto text = QApplication::clipboard()->text();
+                 t->paste(text);
+                 pasted(t, text);
              });
         terminalMenu->addSeparator();
         item(terminalMenu, N("Exit"), [this] { close(); }, "exit");
@@ -4732,7 +5341,7 @@ public:
         // Terminal font zoom: Ctrl +/-/0 (Cmd on macOS), like browsers and other terminals.
         auto zoomBy = [this](int steps)
         {
-            if (auto *t = current()->terminal)
+            if (auto *t = activeTerminal())
                 t->zoom(steps);
         };
         item(viewMenu, N("Zoom in"), [zoomBy] { zoomBy(1); })->setShortcut(QKeySequence("Ctrl++"));
@@ -4935,7 +5544,7 @@ public:
         macroList->setContextMenuPolicy(Qt::CustomContextMenu);
         macroLayout->addWidget(macroList, 1);
         connect(macroList, &QListWidget::itemActivated, this,
-                [this](QListWidgetItem *item) { playMacro(macroList->row(item), current()->terminal); });
+                [this](QListWidgetItem *item) { playMacro(macroList->row(item), activeTerminal()); });
         connect(macroList, &QListWidget::customContextMenuRequested, this,
                 [this](const QPoint &at)
                 {
@@ -4943,7 +5552,7 @@ public:
                     if (row < 0)
                         return;
                     QMenu menu;
-                    menu.addAction(L("Play"), [&] { playMacro(row, current()->terminal); });
+                    menu.addAction(L("Play"), [&] { playMacro(row, activeTerminal()); });
                     menu.addAction(L("Rename"),
                                    [&]
                                    {
@@ -5028,6 +5637,12 @@ public:
         connect(previous, &QPushButton::clicked, this, [this] { doFind(true); });
         connect(nextMatch, &QPushButton::clicked, this, [this] { doFind(false); });
         connect(closeFind, &QToolButton::clicked, this, [this] { hideFind(); });
+        connect(findText, &QLineEdit::textChanged, this,
+                [this](const QString &text)
+                {
+                    if (text.isEmpty())
+                        clearFind();
+                });
         connect(findText, &QLineEdit::returnPressed, this,
                 [this] { doFind(QGuiApplication::keyboardModifiers() & Qt::ShiftModifier); });
         auto *escape = new QShortcut(QKeySequence(Qt::Key_Escape), findBar, nullptr, nullptr, Qt::WidgetWithChildrenShortcut);
@@ -5053,7 +5668,12 @@ public:
         home->widget = homePage();
         addPage(home, "", icon("home"));
         bar->setTabButton(0, QTabBar::RightSide, nullptr);
-        retranslators << [this] { bar->setTabToolTip(0, L("Home")); };
+        retranslators << [this]
+        {
+            bar->setTabToolTip(0, L("Home"));
+            for (int i = 1; i < bar->count(); ++i)
+                showState(page(i)); // "Disconnected" in the tooltips
+        };
         showSide(0);
 
         connect(bar, &QTabBar::currentChanged, this, [this] { layoutPages(); });
@@ -5172,6 +5792,9 @@ public:
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
+        // Installed on the application: sees every event, so the casts below run only for Show.
+        if (event->type() != QEvent::Show)
+            return QObject::eventFilter(watched, event);
         auto *dialog = qobject_cast<QDialog *>(watched);
         // File, colour and font dialogs are native on macOS and Linux (NSOpenPanel, GTK/portal): they place
         // themselves, and moving or resizing their hidden Qt widget breaks them.
@@ -5192,6 +5815,8 @@ protected:
                                    auto *screen = QGuiApplication::screenAt(dialog->frameGeometry().center());
                                    if (!screen)
                                        screen = dialog->screen();
+                                   if (!screen)
+                                       return;
                                    const auto frame = dialog->frameGeometry();
                                    const auto fitted = fitToArea(frame, screen->availableGeometry());
                                    if (fitted == frame)
@@ -5206,7 +5831,6 @@ protected:
 // Every process started by CrossTerm (shells, ssh/sftp, tunnels, monitoring, X server, editors) dies with it,
 // also on a crash. Windows: a kill-on-close job object that children inherit; the OS closes the handle when we exit.
 // Linux/macOS: a crash handler kills our process group; terminal children also get PR_SET_PDEATHSIG (terminal.cpp).
-// ponytail: SIGKILL of CrossTerm on Linux/macOS still leaves QProcess children; per-child pdeathsig if that matters.
 #ifdef Q_OS_WIN
 static void bindChildrenToLifetime()
 {
@@ -5254,6 +5878,11 @@ int main(int argc, char **argv)
     if (isAskpassInvocation(argc))
         return runAskpass(argc, argv); // ssh prompt helper: no window unless a dialog is needed
     QApplication app(argc, argv);
+#ifdef Q_OS_MACOS
+    // Menus and tooltips with really rounded corners (translucent windows). Only where it is verified: on Windows it
+    // would drop the system shadow, on X11 without a compositor the corners would turn black.
+    installRoundedPopups(app);
+#endif
     QApplication::setWindowIcon(QIcon(appIconPath)); // Dock / taskbar while running
     // Portable mode: INI settings and sessions in CrossTerm-data next to the executable.
     const auto portable = portableRoot(QCoreApplication::applicationDirPath(), app.arguments());
@@ -5269,22 +5898,22 @@ int main(int argc, char **argv)
         app.setApplicationName("CrossTerm-Test"); // tests do not touch the user's language, window and recents
     const auto location = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
     const bool smoke = app.arguments().contains("--smoke-test");
-    QTemporaryDir temporary;
-    if (smoke && !temporary.isValid())
+    std::optional<QTemporaryDir> temporary; // smoke test only: no temporary folder created on every launch
+    if (smoke && !temporary.emplace().isValid())
         return 1;
     const int custom = app.arguments().indexOf("--config"); // alternate sessions file (test data)
-    const auto storage = smoke                                               ? temporary.filePath("sessions.json")
+    const auto storage = smoke                                               ? temporary->filePath("sessions.json")
                          : custom > 0 && custom + 1 < app.arguments().size() ? app.arguments()[custom + 1]
                          : !portable.isEmpty()                               ? portable + "/sessions.json"
                                                                              : location + "/sessions.json";
     QDir().mkpath(QFileInfo(storage).absolutePath());
+    applyLanguage(currentLanguage()); // before the first message, so that it is translated
     QLockFile lock(storage + ".lock");
     if (!lock.tryLock())
     {
         QMessageBox::warning(nullptr, "CrossTerm", L("The configuration is already in use by another CrossTerm window."));
         return 1;
     }
-    applyLanguage(currentLanguage());
     DialogFitter fitter;
     app.installEventFilter(&fitter);
     Window window(storage);

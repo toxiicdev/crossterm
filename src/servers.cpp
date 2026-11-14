@@ -1,5 +1,4 @@
 #include "servers.h"
-#include <QBuffer>
 #include <algorithm>
 #include <QCheckBox>
 #include <QCoreApplication>
@@ -10,6 +9,7 @@
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QHostInfo>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -19,6 +19,7 @@
 #include <QPushButton>
 #include <QSaveFile>
 #include <QSpinBox>
+#include <QStorageInfo>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
@@ -45,8 +46,9 @@ QString jailedPath(const QString &root, const QString &relative)
     {
         if (part == ".")
             continue;
-        // "..", drives ("C:"), alternate streams and names made only of dots/spaces (normalized by Windows) are rejected.
-        if (part.contains(':') || QString(part).remove('.').trimmed().isEmpty())
+        // "..", hidden names (".ssh", ".env": not listed, so not served or written either), drives ("C:"), alternate
+        // streams and names made only of dots/spaces (normalized by Windows) are rejected.
+        if (part.startsWith('.') || part.contains(':') || QString(part).remove('.').trimmed().isEmpty())
             return {};
         parts << part;
     }
@@ -57,6 +59,9 @@ QString jailedPath(const QString &root, const QString &relative)
     // The real path (symlinks resolved) must stay under the root; for a new file the parent folder is checked.
     const QString real = info.exists() ? info.canonicalFilePath() : QFileInfo(info.absolutePath()).canonicalFilePath();
     if (real.isEmpty() || (real != base && !real.startsWith(base.endsWith('/') ? base : base + '/')))
+        return {};
+    // A link inside the root must not lead to a hidden name of the root either.
+    if (('/' + real.mid(base.size())).contains("/."))
         return {};
     return path;
 }
@@ -125,6 +130,40 @@ QByteArray listing(const QString &path, const QString &urlPath)
     }
     return html + "</ul></body></html>\n";
 }
+
+// Host header of a request: an IP literal, "localhost" or this machine's own name, on the listening port. Any other
+// name is a page of another site whose DNS now points here (DNS rebinding) and would read the shared files.
+bool ownHost(QByteArray value, quint16 listenPort)
+{
+    QByteArray port;
+    const int colon = value.lastIndexOf(':');
+    if (colon > value.lastIndexOf(']'))
+    {
+        port = value.mid(colon + 1);
+        value.truncate(colon);
+        bool ok = false;
+        if (port.toUShort(&ok) != listenPort || !ok ||
+            !std::all_of(port.cbegin(), port.cend(), [](char c) { return c >= '0' && c <= '9'; }))
+            return false;
+    }
+    QString host = QString::fromLatin1(value).toLower();
+    if (host.startsWith('[') && host.endsWith(']'))
+        return QHostAddress(host.mid(1, host.size() - 2).section('%', 0, 0)).protocol() == QAbstractSocket::IPv6Protocol;
+    if (QHostAddress(host).protocol() == QAbstractSocket::IPv4Protocol)
+        return true;
+    if (host.endsWith('.'))
+        host.chop(1);
+    if (host.isEmpty())
+        return false;
+    // Own name with or without its domain; ".local" is the name other machines of the network use (mDNS).
+    const QString name = QHostInfo::localHostName().toLower(), domain = QHostInfo::localDomainName().toLower();
+    QStringList own{"localhost", name, name.section('.', 0, 0), name.section('.', 0, 0) + ".local"};
+    if (!domain.isEmpty())
+        own << name + '.' + domain << name.section('.', 0, 0) + '.' + domain;
+    own.removeAll(QString());
+    own.removeAll(".local");
+    return own.contains(host);
+}
 } // namespace
 
 HttpFileServer::HttpFileServer() = default;
@@ -153,11 +192,30 @@ bool HttpFileServer::start(const QString &rootDirectory, quint16 listenPort, boo
                      {
                          while (QTcpSocket *socket = server->nextPendingConnection())
                          {
+                             // Limited number of connections (sockets are children of the server): extra clients are dropped.
+                             if (server->findChildren<QTcpSocket *>(Qt::FindDirectChildrenOnly).size() > 64)
+                             {
+                                 socket->abort();
+                                 socket->deleteLater();
+                                 continue;
+                             }
+                             // Closed after 60 s without a response starting: idle clients, slow request headers. Reads
+                             // do not extend it. Once data flows, a download may stall for 10 minutes (a browser download
+                             // paused by the user) before it is dropped.
+                             auto *idle = new QTimer(socket);
+                             idle->setSingleShot(true);
+                             QObject::connect(idle, &QTimer::timeout, socket,
+                                              [socket]
+                                              {
+                                                  socket->abort();
+                                                  socket->deleteLater();
+                                              });
+                             QObject::connect(socket, &QTcpSocket::bytesWritten, idle, [idle] { idle->start(600000); });
+                             idle->start(60000);
                              QObject::connect(socket, &QTcpSocket::readyRead, socket, [this, socket] { serve(socket); });
                              QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
                          }
                      });
-    // ponytail: no timeout for idle connections; add one if the server stays exposed on the network for long.
     return true;
 }
 
@@ -205,12 +263,24 @@ void HttpFileServer::serve(QTcpSocket *socket)
         return respond(socket, 405, head, "Allow: GET, HEAD\r\n");
     QByteArray target = request[1];
     target.truncate(qMin(uint(target.indexOf('?')), uint(target.indexOf('#'))));
-    if (!target.startsWith('/'))
+    // No control characters: the target is echoed in the Location header.
+    if (!target.startsWith('/') ||
+        std::any_of(target.cbegin(), target.cend(), [](char c) { return uchar(c) < 0x20 || c == 0x7f; }))
         return respond(socket, 400, head);
     QByteArray range;
+    QList<QByteArray> hosts;
     for (const QByteArray &line : lines)
+    {
         if (line.toLower().startsWith("range:"))
             range = line.mid(6).trimmed();
+        else if (line.toLower().startsWith("host:"))
+            hosts << line.mid(5).trimmed();
+    }
+    // Browsers always send Host: a request without one (HTTP/1.0, simple clients) cannot come from a web page.
+    if (hosts.size() > 1)
+        return respond(socket, 400, head);
+    if (!hosts.isEmpty() && !ownHost(hosts.first(), socket->localPort()))
+        return respond(socket, 403, head);
 
     const QString urlPath = QString::fromUtf8(QByteArray::fromPercentEncoding(target));
     const QString path = jailedPath(root, urlPath);
@@ -222,9 +292,21 @@ void HttpFileServer::serve(QTcpSocket *socket)
     if (info.isDir())
     {
         if (!target.endsWith('/'))
-            return respond(socket, 301, head, "Location: " + target + "/\r\n");
+        {
+            // A single leading slash: "//name" or "/\name" would be read by browsers as another host.
+            int slashes = 0;
+            while (slashes < target.size() && (target[slashes] == '/' || target[slashes] == '\\'))
+                ++slashes;
+            QByteArray location = '/' + target.mid(slashes);
+            if (!location.endsWith('/'))
+                location += '/';
+            return respond(socket, 301, head, "Location: " + location + "\r\n");
+        }
         return respond(socket, 200, head, {}, listing(path, urlPath), "text/html; charset=utf-8");
     }
+    // Regular files only: opening a FIFO would block the event loop, devices have no size.
+    if (!info.isFile())
+        return respond(socket, 403, head);
     auto *file = new QFile(path, socket);
     if (!file->open(QIODevice::ReadOnly))
         return respond(socket, 403, head);
@@ -317,6 +399,17 @@ quint16 word(const QByteArray &packet, int at)
     return packet.size() < at + 2 ? 0 : quint16((uchar(packet[at]) << 8) | uchar(packet[at + 1]));
 }
 
+// Uploads: at most 1 GiB each, and the volume keeps 64 MiB free (anyone who reaches the port can write).
+const qint64 uploadCap = 1LL << 30, uploadMargin = 64LL << 20;
+const char diskFull[] = "Disk full or allocation exceeded";
+
+// Bytes an upload into `folder` may still write: 0 when the volume is (nearly) full; the cap alone if it is unknown.
+qint64 uploadRoom(const QString &folder)
+{
+    const qint64 available = QStorageInfo(folder).bytesAvailable();
+    return available < 0 ? uploadCap : qBound<qint64>(0, available - uploadMargin, uploadCap);
+}
+
 // One transfer: ephemeral socket (new TID), the last packet is retransmitted on every timeout.
 struct Transfer : QObject
 {
@@ -327,10 +420,9 @@ struct Transfer : QObject
     bool writing = false, netascii = false, final = false;
     int blksize = 512, seconds = 2, retries = 0;
     quint16 block = 0;
-    QByteArray last, received;
+    qint64 received = 0, room = 0, checkedAt = 0; // upload: bytes written, bytes allowed, last free space check
+    QByteArray last, pending;                     // netascii: converted bytes not sent yet, or a CR waiting for the next DATA
     QFile file;
-    QBuffer text;
-    QIODevice *source = nullptr;
     QSaveFile save;
 
     Transfer(QObject *parent) : QObject(parent)
@@ -348,7 +440,29 @@ struct Transfer : QObject
     }
     void sendBlock()
     {
-        const QByteArray chunk = source->read(blksize);
+        QByteArray chunk;
+        if (netascii)
+        {
+            // Converted while sending: LF -> CR LF, CR -> CR NUL.
+            while (pending.size() < blksize && !file.atEnd())
+            {
+                const QByteArray raw = file.read(blksize);
+                if (raw.isEmpty())
+                    break;
+                for (const char c : raw)
+                {
+                    if (c == '\n')
+                        pending += '\r';
+                    pending += c;
+                    if (c == '\r')
+                        pending += '\0';
+                }
+            }
+            chunk = pending.left(blksize);
+            pending.remove(0, chunk.size());
+        }
+        else
+            chunk = file.read(blksize);
         final = chunk.size() < blksize;
         send(header(DATA, block) + chunk);
     }
@@ -358,7 +472,8 @@ struct Transfer : QObject
             udp.writeDatagram(tftpError(code, message), peer, peerPort);
         timer.stop();
         udp.close();
-        deleteLater(); // an uncommitted QSaveFile is discarded
+        save.cancelWriting(); // a partial upload is discarded at once (no effect after commit())
+        deleteLater();
     }
     void expired()
     {
@@ -393,20 +508,36 @@ struct Transfer : QObject
             }
             else if (writing && opcode == DATA && number == quint16(block + 1) && !final)
             {
-                const QByteArray payload = packet.mid(4);
+                QByteArray payload = packet.mid(4);
                 if (payload.size() > blksize)
                     return close(4, "Block too large");
                 ++block;
+                const bool end = payload.size() < blksize;
                 if (netascii)
-                    received += payload;
-                else if (save.write(payload) != payload.size())
-                    return close(3, "Disk full or allocation exceeded");
-                if (payload.size() < blksize)
                 {
-                    if (netascii)
-                        save.write(received.replace("\r\n", "\n").replace(QByteArray("\r\0", 2), "\r"));
+                    // CR LF -> LF, CR NUL -> CR, block by block; a trailing CR waits for the next block.
+                    payload.prepend(pending);
+                    pending.clear();
+                    if (!end && payload.endsWith('\r'))
+                    {
+                        pending = "\r";
+                        payload.chop(1);
+                    }
+                    payload.replace("\r\n", "\n").replace(QByteArray("\r\0", 2), "\r");
+                }
+                // Size cap; the free space is read again every 4 MiB (other transfers and programs fill the disk too).
+                received += payload.size();
+                if (received - checkedAt >= (4 << 20))
+                {
+                    checkedAt = received;
+                    room = qMin(room, received + uploadRoom(QFileInfo(save.fileName()).absolutePath()));
+                }
+                if (received > room || save.write(payload) != payload.size())
+                    return close(3, diskFull);
+                if (end)
+                {
                     if (!save.commit())
-                        return close(3, "Disk full or allocation exceeded");
+                        return close(3, diskFull);
                     final = true;
                 }
                 send(header(ACK, block));
@@ -476,6 +607,9 @@ void TftpServer::request(const QByteArray &packet, const QHostAddress &peer, qui
     const QList<QByteArray> fields = packet.mid(2).split('\0');
     if ((opcode != RRQ && opcode != WRQ) || fields.size() < 3 || !packet.endsWith('\0'))
         return fail(4, "Illegal TFTP operation");
+    // Each transfer holds a socket and a file until it ends or times out: their number is limited.
+    if (transfers->children().size() >= 64)
+        return fail(0, "Too many transfers in progress");
     const QByteArray mode = fields[1].toLower();
     if (mode != "octet" && mode != "netascii")
         return fail(4, "Unsupported transfer mode");
@@ -492,6 +626,9 @@ void TftpServer::request(const QByteArray &packet, const QHostAddress &peer, qui
     transfer->netascii = mode == "netascii";
     if (transfer->writing)
     {
+        transfer->room = uploadRoom(QFileInfo(path).absolutePath());
+        if (transfer->room <= 0)
+            return fail(3, diskFull);
         transfer->save.setFileName(path);
         if (!transfer->save.open(QIODevice::WriteOnly))
             return fail(2, "Access violation: cannot create file");
@@ -503,17 +640,10 @@ void TftpServer::request(const QByteArray &packet, const QHostAddress &peer, qui
         transfer->file.setFileName(path);
         if (!transfer->file.open(QIODevice::ReadOnly))
             return fail(2, "Access violation: cannot read file");
-        transfer->source = &transfer->file;
-        if (transfer->netascii)
-        {
-            // ponytail: netascii converts the whole file in memory; fine for text files.
-            transfer->text.setData(transfer->file.readAll().replace('\r', QByteArray("\r\0", 2)).replace("\n", "\r\n"));
-            transfer->text.open(QIODevice::ReadOnly);
-            transfer->source = &transfer->text;
-        }
     }
 
-    // RFC 2347 options: blksize (8..65464), timeout (1..255 s) and tsize are accepted.
+    // RFC 2347 options: blksize (8..65464), timeout (1..255 s) and tsize are accepted; tsize is not acknowledged
+    // for netascii downloads, whose converted size is known only at the end.
     QByteArray acknowledged;
     for (int i = 2; i + 1 < fields.size(); i += 2)
     {
@@ -532,8 +662,13 @@ void TftpServer::request(const QByteArray &packet, const QHostAddress &peer, qui
             transfer->seconds = int(value);
             acknowledged += name + '\0' + QByteArray::number(value) + '\0';
         }
-        else if (name == "tsize" && value >= 0)
-            acknowledged += name + '\0' + QByteArray::number(transfer->writing ? value : transfer->source->size()) + '\0';
+        else if (name == "tsize" && value >= 0 && (transfer->writing || !transfer->netascii))
+        {
+            // Announced upload size: refused now rather than after the data (the QSaveFile goes with the transfer).
+            if (transfer->writing && value > transfer->room)
+                return fail(3, diskFull);
+            acknowledged += name + '\0' + QByteArray::number(transfer->writing ? value : transfer->file.size()) + '\0';
+        }
     }
 
     if (!transfer->udp.bind(socket->localAddress(), 0))
@@ -602,7 +737,7 @@ bool PortScanner::start(const QString &target, const QList<int> &portList, int c
     total = int(hosts.size() * ports.size());
     timeout = timeoutMs;
     holder = new QObject;
-    for (int i = 0; i < qMax(1, concurrency) && next < total; ++i)
+    for (int i = 0; i < qMax(1, concurrency) && holder && next < total; ++i) // holder: cancel() from a callback
         launch();
     return true;
 }
@@ -648,7 +783,18 @@ void PortScanner::launch()
                 finished();
         }
         else if (next < total)
-            launch();
+        {
+            // Queued, not recursive: a connection that fails at once (unreachable host) completes inside
+            // connectToHost(), and thousands of them in a row overflowed the stack. Skipped after cancel()/start().
+            QMetaObject::invokeMethod(
+                &queue,
+                [this, current = holder]
+                {
+                    if (holder == current && next < total)
+                        launch();
+                },
+                Qt::QueuedConnection);
+        }
     };
     QObject::connect(socket, &QTcpSocket::connected, socket, [complete] { complete(true); });
     QObject::connect(socket, &QTcpSocket::errorOccurred, socket, [complete] { complete(false); });
@@ -679,6 +825,9 @@ ServersDialog::ServersDialog(QWidget *parent) : QDialog(parent)
 
     const auto run = [this](Row &row, const std::function<bool()> &action, const std::function<QString()> &error)
     {
+        // No default folder: nothing is shared (least of all the home folder) before the user picks one.
+        if (row.root->text().trimmed().isEmpty())
+            return row.status->setText(ui("Choose a folder to share first."));
         const bool ok = action();
         refresh();
         if (!ok)
@@ -731,12 +880,17 @@ ServersDialog::ServersDialog(QWidget *parent) : QDialog(parent)
 ServersDialog::Row ServersDialog::addRow(int line, const QString &name, const QString &key, quint16 port, bool canWrite)
 {
     auto *grid = static_cast<QGridLayout *>(layout());
-    Row row{new QLineEdit(QDir::homePath()), new QSpinBox, canWrite ? new QCheckBox : nullptr, new QPushButton(ui("Start")),
-            new QPushButton(ui("Stop")),     new QLabel};
+    Row row{new QLineEdit,
+            new QSpinBox,
+            canWrite ? new QCheckBox : nullptr,
+            new QPushButton(ui("Start")),
+            new QPushButton(ui("Stop")),
+            new QLabel};
     auto *browse = new QToolButton;
     browse->setText("...");
     row.port->setRange(1, 65535);
     row.port->setValue(port);
+    row.root->setPlaceholderText(ui("Root folder"));
     row.root->setObjectName(key + "Root");
     row.port->setObjectName(key + "Port");
     row.start->setObjectName(key + "Start");
@@ -759,7 +913,8 @@ ServersDialog::Row ServersDialog::addRow(int line, const QString &name, const QS
     connect(browse, &QToolButton::clicked, this,
             [this, edit]
             {
-                const QString folder = QFileDialog::getExistingDirectory(this, ui("Root folder"), edit->text());
+                const QString folder = QFileDialog::getExistingDirectory(
+                    this, ui("Root folder"), edit->text().isEmpty() ? QDir::homePath() : edit->text());
                 if (!folder.isEmpty())
                     edit->setText(QDir::toNativeSeparators(folder));
             });

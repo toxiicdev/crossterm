@@ -5,10 +5,14 @@
 #include <windows.h>
 #include <wincred.h>
 #elif defined(Q_OS_MACOS)
+#include <QDir>
 #include <QJsonDocument>
+#include <QLockFile>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QStringList>
 #include <Security/Security.h>
+#include <functional>
 #else
 #include <QLibrary>
 #include <QProcess>
@@ -17,8 +21,12 @@
 
 QString credentialTarget(const QJsonObject &profile, const QString &application)
 {
-    return QString("%1:%2@%3:%4")
-        .arg(application, profile["user"].toString(), profile["host"].toString())
+    // SSH, SFTP, mosh and tunnels log in to the same sshd and share one entry. Any other protocol has its own, so
+    // a password saved for SSH is never sent to an FTP, RDP or VNC server at the same user, host and port.
+    const auto protocol = profile["protocol"].toString();
+    const bool ssh = protocol.isEmpty() || protocol == "ssh" || protocol == "sftp" || protocol == "mosh";
+    return QString("%1%2:%3@%4:%5")
+        .arg(application, ssh ? QString() : "/" + protocol, profile["user"].toString(), profile["host"].toString())
         .arg(profile["port"].toInt(22));
 }
 
@@ -97,12 +105,13 @@ CFMutableDictionaryRef keychainQuery(const QString &account)
     return query;
 }
 
-bool itemExists(const QString &account)
+// errSecSuccess, errSecItemNotFound or an error (e.g. locked Keychain, unlock cancelled).
+OSStatus itemStatus(const QString &account)
 {
     CFMutableDictionaryRef query = keychainQuery(account);
-    const bool found = SecItemCopyMatching(query, nullptr) == errSecSuccess; // attributes only: no prompt
+    const OSStatus status = SecItemCopyMatching(query, nullptr); // attributes only: no prompt
     CFRelease(query);
-    return found;
+    return status;
 }
 
 std::optional<QByteArray> itemRead(const QString &account)
@@ -174,18 +183,68 @@ QStringList legacyAccounts()
     return names;
 }
 
+// Copy of the item in this process, as of its last read or write here.
 QJsonObject &entries()
 {
     static QJsonObject vault;
     return vault;
 }
 
-bool saveVault()
+// The item as stored now; nullopt on a Keychain error, which is not an empty vault (no item yet).
+std::optional<QJsonObject> loadVault()
 {
-    QByteArray bytes = QJsonDocument(entries()).toJson(QJsonDocument::Compact);
+    const OSStatus status = itemStatus(Bundle);
+    if (status == errSecItemNotFound)
+        return QJsonObject();
+    auto bytes = status == errSecSuccess ? itemRead(Bundle) : std::nullopt;
+    if (!bytes)
+        return std::nullopt;
+    const auto vault = QJsonDocument::fromJson(*bytes).object();
+    wipe(*bytes);
+    return vault;
+}
+
+bool saveVault(const QJsonObject &vault)
+{
+    QByteArray bytes = QJsonDocument(vault).toJson(QJsonDocument::Compact);
     const bool ok = itemWrite(Bundle, bytes);
     wipe(bytes);
     return ok;
+}
+
+// The item is rewritten as a whole and other CrossTerm processes (a second window, an askpass helper without a
+// window) change it too: every change is "read the item, apply it, write" under this lock, never a write of the
+// copy read at launch. Same file for all of them, whatever their settings folder (portable mode, tests).
+struct VaultLock
+{
+    QLockFile file;
+    bool ok = false;
+
+    static QString path()
+    {
+        const auto folder = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + "/CrossTerm";
+        QDir().mkpath(folder);
+        return folder + "/vault.lock";
+    }
+    VaultLock() : file(path())
+    {
+        file.setStaleLockTime(0); // a holder may be waiting for a Keychain prompt; one that died is detected anyway
+        // Held by another process for this long: give up. A lock file that cannot be created does not block saving.
+        ok = file.tryLock(20000) || file.error() != QLockFile::LockFailedError;
+    }
+};
+
+// One change of the stored item; "change" edits the entries just read and tells whether they must be written.
+bool changeVault(const std::function<bool(QJsonObject &)> &change)
+{
+    VaultLock lock;
+    auto vault = lock.ok ? loadVault() : std::nullopt;
+    if (!vault)
+        return false;
+    if (change(*vault) && !saveVault(*vault))
+        return false;
+    entries() = *vault;
+    return true;
 }
 } // namespace
 
@@ -196,35 +255,45 @@ bool unlockVault()
     if (unlocked || refused)
         return unlocked;
     refused = true;
+    const OSStatus status = itemStatus(Bundle);
+    // Not "not found": starting from an empty vault would overwrite all saved passwords at the next save.
+    if (status != errSecSuccess && status != errSecItemNotFound)
+        return false;
     const QStringList legacy = legacyAccounts();
-    const bool bundle = itemExists(Bundle);
+    const bool bundle = status == errSecSuccess;
     if (bundle || !legacy.isEmpty())
     {
         // Touch ID (or the Mac password) once; not in offscreen runs (tests), where nobody can answer.
         if (QSettings().value("vault/touchId", true).toBool() && qEnvironmentVariable("QT_QPA_PLATFORM") != "offscreen" &&
             !confirmOwner(QStringLiteral("use saved passwords")))
             return false;
-        if (bundle)
-        {
-            auto bytes = itemRead(Bundle);
-            if (!bytes)
-                return false; // Keychain access denied: asked again at the next launch
-            entries() = QJsonDocument::fromJson(*bytes).object();
-            wipe(*bytes);
-        }
+        auto vault = loadVault();
+        if (!vault)
+            return false; // Keychain access denied: asked again at the next launch
+        entries() = *vault;
         // Earlier versions: copy the separate items into the single one (one last prompt each, then never again).
         // They are left in place and ignored afterwards: deleting them would ask for the password once more each.
-        bool moved = false;
+        QJsonObject copied;
         for (const auto &name : legacy)
             if (!entries().contains(name))
                 if (auto bytes = itemRead(name))
                 {
-                    entries()[name] = QString::fromUtf8(*bytes);
+                    copied[name] = QString::fromUtf8(*bytes);
                     wipe(*bytes);
+                }
+        const auto merge = [&](QJsonObject &stored)
+        {
+            bool moved = false;
+            for (auto it = copied.constBegin(); it != copied.constEnd(); ++it)
+                if (!stored.contains(it.key()))
+                {
+                    stored[it.key()] = it.value();
                     moved = true;
                 }
-        if (moved)
-            saveVault();
+            return moved;
+        };
+        if (!copied.isEmpty() && !changeVault(merge))
+            merge(entries()); // not written (copied again at the next launch), usable in this run
     }
     unlocked = true;
     refused = false;
@@ -238,10 +307,12 @@ bool vaultAvailable()
 
 bool storeSecret(const QString &target, const QString &, const QString &secret)
 {
-    if (!unlockVault())
-        return false;
-    entries()[target] = secret;
-    return saveVault();
+    return unlockVault() && changeVault(
+                                [&](QJsonObject &vault)
+                                {
+                                    vault[target] = secret;
+                                    return true;
+                                });
 }
 
 std::optional<QString> readSecret(const QString &target)
@@ -256,10 +327,13 @@ bool removeSecret(const QString &target)
     if (!unlockVault())
         return false;
     itemDelete(target); // separate item from an earlier version, if any
-    if (!entries().contains(target))
-        return true;
-    entries().remove(target);
-    return saveVault();
+    return changeVault(
+        [&](QJsonObject &vault)
+        {
+            const bool found = vault.contains(target);
+            vault.remove(target);
+            return found;
+        });
 }
 #else
 namespace
@@ -378,9 +452,9 @@ bool storeSecret(const QString &target, const QString &, const QString &secret)
     if (const LibSecret &lib = libsecret(); lib.loaded)
     {
         GError *error = nullptr;
-        ok = lib.store(&schema, nullptr, label.constData(), bytes.constData(), nullptr, &error, "target", name.constData(),
-                       nullptr) &&
-             succeeded(error);
+        const bool stored = lib.store(&schema, nullptr, label.constData(), bytes.constData(), nullptr, &error, "target",
+                                      name.constData(), nullptr);
+        ok = succeeded(error) && stored; // succeeded() first: it frees the error set on failure
     }
     else if (!secretTool().isEmpty())
         ok = runSecretTool({"store", "--label=" + QString::fromUtf8(label)}, target, bytes, nullptr);

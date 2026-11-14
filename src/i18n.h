@@ -140,19 +140,21 @@ inline void applyLanguage(const QString &code)
 // Text registry for persistent widgets, reapplied on every language change.
 class Texts
 {
-    QList<std::function<void()>> items;
+    struct Item
+    {
+        QPointer<QObject> object;
+        std::function<void()> apply;
+    };
+    QList<Item> items;
 
 public:
     template <class T, class Setter> T *bind(T *object, Setter setter, const char *source)
     {
-        QPointer<T> guard(object);
-        auto apply = [guard, setter, source]
-        {
-            if (guard)
-                ((*guard).*setter)(L(source));
-        };
+        auto apply = [object, setter, source] { (object->*setter)(L(source)); };
         apply();
-        items << apply;
+        // Entries of deleted widgets (closed tabs, for example) are dropped instead of piling up.
+        items.removeIf([](const Item &item) { return !item.object; });
+        items.append({object, apply});
         return object;
     }
     template <class T> T *text(T *object, const char *source) { return bind(object, &T::setText, source); }
@@ -160,6 +162,9 @@ public:
     void apply() const
     {
         for (const auto &item : items)
-            item();
+        {
+            if (item.object)
+                item.apply();
+        }
     }
 };

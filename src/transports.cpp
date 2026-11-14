@@ -1,4 +1,5 @@
 #include "transports.h"
+#include "keepalive.h"
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -12,6 +13,8 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/select.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -67,6 +70,7 @@ TelnetDevice::TelnetDevice(const QString &host, quint16 port, QObject *parent) :
                 setErrorString(socket->errorString());
                 emit readChannelFinished();
             });
+    enableKeepAlive(socket); // a server that vanished ends the session instead of freezing it
     socket->connectToHost(host, port);
 }
 
@@ -123,7 +127,8 @@ void TelnetDevice::receive()
             }
             else
             {
-                subnegotiation += ch; // IAC IAC inside the subnegotiation
+                if (subnegotiation.size() < 1024) // as in Sub: what is beyond the limit is dropped
+                    subnegotiation += ch;         // IAC IAC inside the subnegotiation
                 parse = Sub;
             }
             break;
@@ -249,6 +254,7 @@ RloginDevice::RloginDevice(const QString &host, const QString &remoteUser, quint
                 setErrorString(socket->errorString());
                 emit readChannelFinished();
             });
+    enableKeepAlive(socket); // a server that vanished ends the session instead of freezing it
     socket->connectToHost(host, port);
     // RFC 1282: "\0local-user\0remote-user\0terminal-type/speed\0" (queued until connected).
     const QByteArray zero(1, '\0');
@@ -316,14 +322,6 @@ RshDevice::RshDevice(const QString &host, const QString &remoteUser, const QStri
     const QString user = localUser.isEmpty() ? qEnvironmentVariable("USERNAME", qEnvironmentVariable("USER")) : localUser;
     connect(socket, &QTcpSocket::readyRead, this, [this] { receive(); });
     connect(socket, &QTcpSocket::disconnected, this, &QIODevice::readChannelFinished);
-    connect(socket, &QAbstractSocket::errorOccurred, this,
-            [this](QAbstractSocket::SocketError error)
-            {
-                if (error == QAbstractSocket::RemoteHostClosedError)
-                    return;
-                setErrorString(socket->errorString());
-                emit readChannelFinished();
-            });
     // rshd accepts only reserved source ports (512..1023): try from the highest.
     bool reserved = false;
     for (quint16 local = 1023; local >= 512 && !reserved; --local)
@@ -337,6 +335,17 @@ RshDevice::RshDevice(const QString &host, const QString &remoteUser, const QStri
                      .toUtf8() +
                  "\r\n";
     }
+    // Connected only now: each failed bind above emits errorOccurred, and its message would stay as errorString
+    // (shown as the reason when the session ends normally).
+    connect(socket, &QAbstractSocket::errorOccurred, this,
+            [this](QAbstractSocket::SocketError error)
+            {
+                if (error == QAbstractSocket::RemoteHostClosedError)
+                    return;
+                setErrorString(socket->errorString());
+                emit readChannelFinished();
+            });
+    enableKeepAlive(socket); // a server that vanished ends the session instead of freezing it
     socket->connectToHost(host, port);
     const QByteArray zero(1, '\0');
     socket->write("0" + zero + user.toUtf8() + zero + remoteUser.toUtf8() + zero + command.toUtf8() + zero);
@@ -365,10 +374,10 @@ void RshDevice::receive()
         if (chunk[0] == '\0' || failed)
             chunk.remove(0, 1);
     }
-    if (failed && !errorText.contains('\n'))
+    if (failed && !errorText.contains('\n') && errorText.size() < 4096)
     {
-        // Error message up to "\n"; the server then closes. It is also shown in the terminal.
-        errorText += chunk;
+        // Error message up to "\n" (4096 bytes at most); the server then closes. It is also shown in the terminal.
+        errorText += chunk.left(4096 - errorText.size());
         setErrorString(QString::fromUtf8(errorText).section('\n', 0, 0).trimmed());
     }
     if (chunk.isEmpty())
@@ -441,8 +450,9 @@ bool SerialDevice::open(OpenMode mode)
     dcb.fOutX = dcb.fInX = s.flowControl == Settings::SoftwareFlowControl;
     dcb.XonChar = 0x11;
     dcb.XoffChar = 0x13;
-    // Non-blocking read (returns immediately with whatever is available), write with a one-second timeout.
-    COMMTIMEOUTS timeouts{MAXDWORD, 0, 0, 0, 1000};
+    // Non-blocking read (returns immediately with whatever is available); a write gives up after 50 ms and send()
+    // keeps what was not sent.
+    COMMTIMEOUTS timeouts{MAXDWORD, 0, 0, 0, 50};
     if (!SetCommState(port, &dcb) || !SetCommTimeouts(port, &timeouts))
     {
         setErrorString(translated("Cannot configure %1: %2").arg(s.portName, qt_error_string(int(GetLastError()))));
@@ -451,12 +461,16 @@ bool SerialDevice::open(OpenMode mode)
     }
     handle = qintptr(port);
 #else
-    const int fd = ::open(QFile::encodeName(s.portName).constData(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    // O_CLOEXEC: shells and other programs started later must not keep the port open.
+    const int fd = ::open(QFile::encodeName(s.portName).constData(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
     {
         setErrorString(translated("Cannot open %1: %2").arg(s.portName, qt_error_string(errno)));
         return false;
     }
+    // Exclusive: a second session on the same port (duplicated tab) fails with "busy" instead of stealing half of
+    // the incoming bytes from this one.
+    ioctl(fd, TIOCEXCL);
 #ifdef Q_OS_MACOS
     const speed_t speed = speed_t(s.baud); // on BSD/macOS the speed is the numeric value
 #else
@@ -499,6 +513,20 @@ bool SerialDevice::open(OpenMode mode)
     return QIODevice::open(mode | Unbuffered);
 }
 
+#ifndef Q_OS_WIN
+// Data or end of file waiting (select(): unlike poll(), it supports devices on macOS).
+static bool readable(int fd)
+{
+    if (fd >= FD_SETSIZE)
+        return false;
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    timeval now{0, 0};
+    return select(fd + 1, &set, nullptr, nullptr, &now) > 0;
+}
+#endif
+
 void SerialDevice::poll()
 {
     char buffer[4096];
@@ -510,7 +538,11 @@ void SerialDevice::poll()
         if (!ReadFile(HANDLE(handle), buffer, sizeof(buffer), &count, nullptr))
             return fail(qt_error_string(int(GetLastError())));
 #else
-        const auto count = ::read(int(handle), buffer, sizeof(buffer));
+        auto count = ::read(int(handle), buffer, sizeof(buffer));
+        // VMIN = VTIME = 0: read() returns 0 both without data and after a hangup (USB adapter unplugged, other end of
+        // a pty closed). Readable for select() and still nothing to read is the hangup.
+        if (count == 0 && readable(int(handle)) && (count = ::read(int(handle), buffer, sizeof(buffer))) == 0)
+            return fail(qt_error_string(EIO));
         if (count < 0 && errno != EAGAIN && errno != EINTR)
             return fail(qt_error_string(errno));
 #endif
@@ -520,33 +552,78 @@ void SerialDevice::poll()
     }
     if (input.size() > before)
         emit readyRead();
+    if (!send())
+    {
+#ifdef Q_OS_WIN
+        fail(qt_error_string(int(GetLastError())));
+#else
+        fail(qt_error_string(errno));
+#endif
+    }
 }
+
+#ifdef Q_OS_WIN
+// WriteFile() blocks until the bytes are on the line or the write timeout ends: a whole paste at a slow baud rate
+// would freeze the window and lose what did not fit in the timeout. So one slice at a time, what the line carries
+// in about 20 ms; poll() sends the rest. False on an error (GetLastError()).
+bool SerialDevice::send()
+{
+    if (output.isEmpty())
+        return true;
+    if (held > 0)
+    {
+        --held;
+        return true;
+    }
+    const DWORD slice = DWORD(qBound(16, settings.baud / 500, 4096));
+    DWORD count = 0;
+    if (!WriteFile(HANDLE(handle), output.constData(), qMin(DWORD(output.size()), slice), &count, nullptr))
+    {
+        const DWORD error = GetLastError();
+        output.clear();
+        SetLastError(error);
+        return false;
+    }
+    output.remove(0, qsizetype(count));
+    held = count == 0 ? 20 : 0; // nothing accepted (flow control holds the line): next try in 200 ms
+    return true;
+}
+#else
+// Writes what the port accepts now (slow baud rate, flow control); poll() retries the rest. False on an error (errno).
+bool SerialDevice::send()
+{
+    while (!output.isEmpty())
+    {
+        const auto count = ::write(int(handle), output.constData(), size_t(output.size()));
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count < 0 && errno != EAGAIN)
+        {
+            const int error = errno;
+            output.clear();
+            errno = error;
+            return false;
+        }
+        if (count <= 0)
+            break;
+        output.remove(0, qsizetype(count));
+    }
+    return true;
+}
+#endif
 
 void SerialDevice::fail(const QString &message)
 {
     timer->stop();
     setErrorString(message);
     emit readChannelFinished();
+    release(); // the port is free again: restarting the session opens it while this device still exists
 }
 
-qint64 SerialDevice::readData(char *data, qint64 maxSize)
+void SerialDevice::release()
 {
-    return take(input, data, maxSize);
-}
-
-qint64 SerialDevice::writeData(const char *data, qint64 size)
-{
-#ifdef Q_OS_WIN
-    DWORD count = 0;
-    return WriteFile(HANDLE(handle), data, DWORD(size), &count, nullptr) ? qint64(count) : -1;
-#else
-    return ::write(int(handle), data, size_t(size));
-#endif
-}
-
-void SerialDevice::close()
-{
-    timer->stop();
+    output.clear();
+    held = 0;
     if (handle != -1)
     {
 #ifdef Q_OS_WIN
@@ -556,6 +633,26 @@ void SerialDevice::close()
 #endif
         handle = -1;
     }
+}
+
+qint64 SerialDevice::readData(char *data, qint64 maxSize)
+{
+    return take(input, data, maxSize);
+}
+
+qint64 SerialDevice::writeData(const char *data, qint64 size)
+{
+    if (handle == -1)
+        return -1;
+    // Queued: the port takes only part of a long write at once (e.g. a paste at 9600 baud).
+    output.append(data, qsizetype(size));
+    return send() ? size : -1;
+}
+
+void SerialDevice::close()
+{
+    timer->stop();
+    release();
     QIODevice::close();
 }
 

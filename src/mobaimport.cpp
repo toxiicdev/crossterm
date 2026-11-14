@@ -191,10 +191,12 @@ static void readMacros(const Section &section, MobaExtras &out)
                 // Printable keys without Ctrl/Alt already arrive as WM_CHAR: skip the duplicate.
                 const bool letter = (code >= 'A' && code <= 'Z') || (code >= '0' && code <= '9');
                 if (keys.contains(code) || (code >= 112 && code <= 123))
-                    steps.append(
-                        QJsonObject{{"key", keys.value(code, Qt::Key_F1 + code - 112)}, {"modifiers", modifiers}, {"text", ""}});
+                    steps.append(QJsonObject{{"key", keys.value(code, Qt::Key_F1 + code - 112)},
+                                             {"modifiers", modifiers},
+                                             {"text", ""},
+                                             {"logical", true}});
                 else if (letter && (modifiers & (Qt::ControlModifier | Qt::AltModifier)))
-                    steps.append(QJsonObject{{"key", code}, {"modifiers", modifiers}, {"text", ""}});
+                    steps.append(QJsonObject{{"key", code}, {"modifiers", modifiers}, {"text", ""}, {"logical", true}});
             }
             else if (message == 258)
             {
@@ -207,10 +209,12 @@ static void readMacros(const Section &section, MobaExtras &out)
                     const int key = keys.value(code, 0);
                     const auto last = steps.isEmpty() ? QJsonObject{} : steps.last().toObject();
                     if (key && !(last["key"].toInt() == key && last["text"].toString().isEmpty()))
-                        steps.append(QJsonObject{{"key", key}, {"modifiers", modifiers}, {"text", ""}});
+                        steps.append(QJsonObject{{"key", key}, {"modifiers", modifiers}, {"text", ""}, {"logical", true}});
                     else if (!key && code <= 26) // Ctrl+letter
-                        steps.append(
-                            QJsonObject{{"key", Qt::Key_A + code - 1}, {"modifiers", int(Qt::ControlModifier)}, {"text", ""}});
+                        steps.append(QJsonObject{{"key", Qt::Key_A + code - 1},
+                                                 {"modifiers", int(Qt::ControlModifier)},
+                                                 {"text", ""},
+                                                 {"logical", true}});
                 }
             }
             else if (message == 0 && f[3].trimmed().startsWith("SLEEP=", Qt::CaseInsensitive))
