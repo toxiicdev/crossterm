@@ -320,6 +320,7 @@ struct Terminal::State
     };
     QList<HeldKey> heldKeys;
     bool holding = false;
+    bool sizeWhenShown = false; // sizeWhenShown(): resizes ignored until the first show
     std::unique_ptr<MoshPredictor> predictor;
     QPoint anchor, extent;
     std::unique_ptr<QFile> log; // session log: lines scrolled off the screen + final screen
@@ -1278,12 +1279,35 @@ QString Terminal::contents() const
     return QString::fromUtf8(result.constData(), std::min(qsizetype(size), result.size()));
 }
 
+void Terminal::sizeWhenShown()
+{
+    state->sizeWhenShown = true;
+    // A widget gets a placeholder size as soon as it is created (here already applied by the constructor): back to
+    // the initial grid until it is shown.
+    if (!isVisible())
+        setGrid(24, 80);
+}
+
+void Terminal::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    if (std::exchange(state->sizeWhenShown, false))
+        resizeEvent(nullptr); // the size it has now that it is laid out and visible
+}
+
 void Terminal::resizeEvent(QResizeEvent *)
 {
+    if (state->sizeWhenShown && !isVisible())
+        return; // a placeholder size of a tab not shown yet (showEvent applies the real one)
     const QFontMetrics fm(font());
+    setGrid(std::clamp((height() - 8) / std::max(1, fm.height()), 2, 250),
+            std::clamp((width() - 8) / std::max(1, fm.horizontalAdvance('M')), 2, 500));
+}
+
+// Rows and columns of the screen, for libvterm (with reflow), the session and the pseudo terminal.
+void Terminal::setGrid(int rows, int cols)
+{
     auto &s = *state;
-    const int cols = std::clamp((width() - 8) / std::max(1, fm.horizontalAdvance('M')), 2, 500);
-    const int rows = std::clamp((height() - 8) / std::max(1, fm.height()), 2, 250);
     if (cols == s.cols && rows == s.rows)
         return;
     s.resize(rows, cols);

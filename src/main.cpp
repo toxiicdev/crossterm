@@ -619,6 +619,8 @@ private:
             p->state = Page::Failed;
             return new Terminal(Command{p->profile["protocol"].toString(), {}, {}}, area); // shows "Cannot start"
         }
+        // The banner is written now, at the top of a full-size grid: not into the 2 rows of a tab not laid out yet.
+        t->sizeWhenShown();
         // Tab badge once the session ends; a device that could not be opened has already ended.
         if (t->finished())
             p->state = Page::Failed;
@@ -3963,6 +3965,7 @@ public:
 
     // In-process end-to-end test (no global input): opens the first profile, which must point to a test
     // SSH/SFTP server, checks the SFTP browser, Split and dialogs, and saves screenshots via grab().
+
 
 
 

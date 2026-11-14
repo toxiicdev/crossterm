@@ -85,6 +85,9 @@ public:
     bool holdingKeys() const; // a key typed now would be kept
     // Writes text (with ANSI sequences) to the screen locally, without sending it to the session: welcome banner.
     void printLocal(const QString &text);
+    // Keeps the initial 80x24 grid until the terminal is first shown: the sizes a tab gets while it is still hidden
+    // (a few pixels, 2 rows) would push the welcome banner into the scrollback before the session starts writing.
+    void sizeWhenShown();
     // Output lines removed before they reach the screen (harmless client warnings, e.g. X11 without xauth).
     void hideOutput(const QList<QByteArray> &lines);
 
@@ -93,6 +96,8 @@ protected:
     void changeEvent(QEvent *) override;
     void paintEvent(QPaintEvent *) override;
     void resizeEvent(QResizeEvent *) override;
+    void showEvent(QShowEvent *) override;
+    void setGrid(int rows, int cols);
     void keyPressEvent(QKeyEvent *) override;
     void mousePressEvent(QMouseEvent *) override;
     void mouseMoveEvent(QMouseEvent *) override;

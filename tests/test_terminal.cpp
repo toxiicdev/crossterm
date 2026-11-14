@@ -152,6 +152,30 @@ int main(int argc, char **argv)
     CHECK(terminal.allText().contains("Session stopped"))
     CHECK(terminal.allText().contains("bye"))
 
+    // A tab created hidden gets a placeholder size of a few pixels (2 rows): with sizeWhenShown() the welcome banner
+    // is still written at the top of a full grid, and the session starts below it; shown, the banner stays on top.
+    {
+        // As in the window: a child widget, which Qt creates 100x30 pixels; its constructor sets the font and so
+        // the grid for that size, 2 rows.
+        QWidget host;
+        auto *tabDevice = new FakeDevice;
+        Terminal tab(tabDevice, &host);
+        tab.sizeWhenShown();
+        tab.setFontPointSize(11); // a font change recomputes the grid: still not while hidden
+        QString banner;
+        for (int i = 1; i <= 13; ++i)
+            banner += QString("banner %1\r\n").arg(i);
+        tab.printLocal(banner);
+        CHECK(tab.cursorPosition().y() == 13 && tab.contents().startsWith("banner 1"))
+        host.setAttribute(Qt::WA_ShowWithoutActivating);
+        host.resize(1200, 900);
+        host.show();
+        setGrid(tab, 80, 30);
+        tabDevice->feed("Linux motd\r\n");
+        QApplication::processEvents();
+        CHECK(tab.contents().startsWith("banner 1") && tab.contents().contains("Linux motd") && tabDevice->rows == 30)
+    }
+
     // Process on a pseudo terminal: TERM describes this emulator (Windows sets none, so ssh sent none to the server).
 #ifdef Q_OS_WIN
     Terminal process(Command{"powershell.exe", {"-NoProfile", "-Command", "'term=' + $env:TERM"}, {}, {}});
