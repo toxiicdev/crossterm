@@ -50,6 +50,14 @@ static QString shellQuote(const QString &path)
     return "'" + QString(path).replace("'", "'\\''") + "'";
 }
 
+// A word for a remote POSIX shell, always single-quoted; empty for control characters.
+static QString posixQuote(const QString &text)
+{
+    if (text.isEmpty() || text.contains(QRegularExpression("[\\x00-\\x1f\\x7f]")))
+        return {};
+    return "'" + QString(text).replace("'", "'\\''") + "'";
+}
+
 // A remote name usable as a local file name inside a folder (a name with '\' or ':' from a Unix server would
 // leave the folder on Windows).
 static bool safeLocalName(const QString &name)
@@ -289,6 +297,10 @@ class SftpPanel : public QWidget
     int link = 0;                   // 0 not connected yet or connecting, 1 last listing succeeded, 2 cannot connect
     QProcess *process = hideConsoleWindow(new QProcess(this));
     Command command;
+    Command shell; // ssh to the same server: "rm -rf" in one go instead of walking the folders over sftp
+    QProcess *remover = hideConsoleWindow(new QProcess(this));
+    QStringList removing[2]; // folders and files of the "rm -rf" in progress (for the sftp fallback)
+    int zipState = 0;        // zip on the server: 0 not known yet, 1 installed ("Download as zip" shown), -1 not
     QString listed, target;
     QString login; // user name of the session ("" when ssh picks it)
     Texts texts;
@@ -361,6 +373,7 @@ class SftpPanel : public QWidget
         QDateTime sourceTime;
         QString stamp;
         QString note; // warnings of a completed transfer (entries that sftp skipped)
+        bool temporary = false; // "Download as zip": the remote file is removed once downloaded (or the row cleared)
         QTreeWidgetItem *item = nullptr;
         QProgressBar *bar = nullptr;
         QProcess *process = nullptr; // while running
@@ -1010,10 +1023,13 @@ private:
                         const auto &state = transfers[i]->state;
                         if ((state == "done" || state == "failed" || state == "cancelled") && !transfers[i]->process)
                         {
+                            removeTemporary(*transfers[i]);
                             delete transfers[i]->item;
                             transfers.removeAt(i);
                         }
                     }
+                    if (transfers.isEmpty())
+                        queueBox->hide();
                 });
         queueBox->hide();
         layout->addWidget(queueBox);
@@ -1113,6 +1129,9 @@ private:
                     if (t->bar->maximum() == 0)
                         t->bar->setRange(0, 100);
                     showState(t);
+                    // A failed or cancelled zip download stays on the server for Resume until its row is cleared.
+                    if (t->state == "done")
+                        removeTemporary(*t);
                     if (t->state == "done" && t->upload && t->directory == listed)
                     {
                         if (process->state() == QProcess::NotRunning)
@@ -1135,6 +1154,7 @@ private:
                     if (!runningTransfers())
                         ticker->stop();
                     pump();
+                    QTimer::singleShot(2000, this, [this] { hideQueueIfIdle(); });
                 });
         connect(mover, &QProcess::errorOccurred, this,
                 [this, t, mover](QProcess::ProcessError e)
@@ -1232,7 +1252,7 @@ public:
     bool busy() const
     {
         return process->state() != QProcess::NotRunning || scanner->state() != QProcess::NotRunning || !scanQueue.isEmpty() ||
-               deletePending;
+               deletePending || remover->state() != QProcess::NotRunning;
     }
     std::function<QString()> folderSource;
     std::function<void(const QString &)> pasteToTerminal; // "Copy file path to terminal"
@@ -1307,7 +1327,166 @@ public:
             QDesktopServices::openUrl(QUrl::fromLocalFile(file));
         return !runnable;
     }
+    // Lists the current folder again, after the listing in progress if there is one.
+    void relistNow()
+    {
+        if (process->state() != QProcess::NotRunning)
+            relist = true;
+        else
+            refresh();
+    }
+    // The queue is hidden once nothing is waiting or running: completed rows go after a moment; failed and
+    // cancelled ones stay for Resume.
+    void hideQueueIfIdle()
+    {
+        for (const auto &t : std::as_const(transfers))
+        {
+            if (t->state == "queued" || t->state == "running" || t->process)
+                return;
+        }
+        for (int i = int(transfers.size()) - 1; i >= 0; --i)
+        {
+            if (transfers[i]->state == "done")
+            {
+                removeTemporary(*transfers[i]);
+                delete transfers[i]->item;
+                transfers.removeAt(i);
+            }
+        }
+        if (transfers.isEmpty())
+            queueBox->hide();
+    }
+    // Runs script in the remote shell over ssh (shell of the session's server); done gets its exit code (-1: ssh
+    // could not start or crashed), standard output and standard error. false: no ssh for this session.
+    bool runShell(const QString &script, bool interactive,
+                  const std::function<void(int, const QString &, const QString &)> &done)
+    {
+        const auto program = QStandardPaths::findExecutable(shell.program);
+        if (!shell.error.isEmpty() || shell.program != "ssh" || !shell.arguments.contains("--") || program.isEmpty())
+            return false;
+        auto *proc = hideConsoleWindow(new QProcess(this));
+        proc->setStandardInputFile(QProcess::nullDevice());
+        proc->setProcessEnvironment(sftpEnvironment(interactive));
+        auto finish = [this, proc, done](int code)
+        {
+            if (proc->property("ended").toBool())
+                return;
+            proc->setProperty("ended", true);
+            forgetAskpassAttempts(proc);
+            const auto out = QString::fromUtf8(proc->readAllStandardOutput());
+            const auto err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
+            proc->deleteLater();
+            if (done)
+                done(code, out, err);
+        };
+        connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [finish](int code, QProcess::ExitStatus exit) { finish(exit == QProcess::NormalExit ? code : -1); });
+        connect(proc, &QProcess::errorOccurred, this,
+                [finish](QProcess::ProcessError error)
+                {
+                    if (error == QProcess::FailedToStart)
+                        finish(-1);
+                });
+        QStringList arguments{"-T", "-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"};
+        if (!interactive)
+            arguments << "-o" << "NumberOfPasswordPrompts=1";
+        proc->start(program, arguments + shell.arguments + QStringList{script});
+        return true;
+    }
+    // Whether zip is installed on the server, asked once after the first listing.
+    void checkZip()
+    {
+        if (zipState)
+            return;
+        const bool started = runShell("command -v zip", false,
+                                      [this](int code, const QString &out, const QString &)
+                                      { zipState = code == 0 && !out.trimmed().isEmpty() ? 1 : -1; });
+        if (!started)
+            zipState = -1;
+    }
+    void removeTemporary(Transfer &t)
+    {
+        if (!t.temporary)
+            return;
+        t.temporary = false;
+        if (const auto quoted = posixQuote(t.directory + "/" + t.name); !quoted.isEmpty())
+            runShell("rm -f -- " + quoted, false, nullptr);
+    }
+    // Zips the selected items on the server into /tmp/download-<date time>.zip, downloads it to a file the user
+    // chooses and removes it from the server.
+    void downloadZip()
+    {
+        const auto names = selectedNames();
+        const auto directory = listed; // before the dialog: a listing may finish while it is open
+        const auto dir = posixQuote(directory);
+        if (names.isEmpty() || dir.isEmpty())
+            return;
+        const auto name = "download-" + QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss") + ".zip";
+        const auto local = QFileDialog::getSaveFileName(
+            this, L("Download as zip"),
+            QDir(QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)).filePath(name), "Zip (*.zip)");
+        if (local.isEmpty())
+            return;
+        const auto remote = "/tmp/" + name;
+        // "./": a name starting with '-' is not read as an option of zip. -y keeps links as links.
+        QString script = "cd " + dir + " && zip -r -q -y " + posixQuote(remote);
+        for (const auto &item : names)
+        {
+            if (const auto quoted = posixQuote("./" + item); !quoted.isEmpty())
+                script += " " + quoted;
+        }
+        // 18: some files could not be read; the zip holds the others.
+        script += "; code=$?; [ $code -eq 0 ] || [ $code -eq 18 ] && wc -c < " + posixQuote(remote) + "; exit $code";
+        status->setText(L("Compressing…"));
+        const bool started = runShell(
+            script, true,
+            [this, name, local](int code, const QString &out, const QString &error)
+            {
+                if (code != 0 && code != 18)
+                {
+                    status->setText(error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
+                    if (code > 0 && code != 255) // zip may have left a partial file
+                        runShell("rm -f -- " + posixQuote("/tmp/" + name), false, nullptr);
+                    return;
+                }
+                status->setText(code == 18 ? error.left(400) : QString());
+                const auto size = out.trimmed().section('\n', -1).trimmed().toLongLong();
+                enqueue("/tmp", name, local, false, false, size > 0 ? size : -1, false,
+                        [](Transfer &t) { t.temporary = true; });
+            });
+        if (!started)
+            status->setText(L("SFTP operation failed."));
+    }
+    // One "rm -rf" over ssh; servers without a POSIX shell (SFTP only, Windows) get the walk over sftp instead.
     void removeRecursive(const QStringList &directories, const QStringList &filesToRemove)
+    {
+        if (remover->state() != QProcess::NotRunning)
+        {
+            status->setText(L("Operation in progress…"));
+            return;
+        }
+        const auto program = QStandardPaths::findExecutable(shell.program);
+        QString script = "rm -rf --";
+        for (const auto &item : directories + filesToRemove)
+        {
+            if (const auto quoted = posixQuote(item); !quoted.isEmpty())
+                script += " " + quoted;
+        }
+        if (!shell.error.isEmpty() || shell.program != "ssh" || !shell.arguments.contains("--") || program.isEmpty())
+        {
+            removeBySftp(directories, filesToRemove);
+            return;
+        }
+        removing[0] = directories;
+        removing[1] = filesToRemove;
+        status->setText(L("Deleting…"));
+        files->setCursor(Qt::BusyCursor);
+        remover->setProcessEnvironment(sftpEnvironment(true));
+        remover->start(program, QStringList{"-T", "-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes", "-o",
+                                            "ConnectTimeout=10"} +
+                                    shell.arguments + QStringList{script});
+    }
+    void removeBySftp(const QStringList &directories, const QStringList &filesToRemove)
     {
         if (scanner->state() != QProcess::NotRunning || !scanQueue.isEmpty() || deletePending)
         {
@@ -1436,6 +1615,9 @@ public:
     {
         profile["protocol"] = "sftp";
         profile["x11"] = false;
+        auto sshProfile = profile;
+        sshProfile["protocol"] = "ssh";
+        shell = sessionCommand(sshProfile, platform, false);
         command = sessionCommand(profile, platform, false);
         login = profile["user"].toString();
         target = credentialTarget(profile, QCoreApplication::applicationName());
@@ -1593,6 +1775,8 @@ public:
                     else
                         menu.addAction(icon("folder", 16), L("Open"), [=] { run(remotePath); });
                     menu.addAction(icon("download", 16), L("Download"), [this] { download(); });
+                    if (zipState == 1)
+                        menu.addAction(icon("download", 16), L("Download as zip"), [this] { downloadZip(); });
                     menu.addSeparator();
                     menu.addAction(icon("delete", 16), L("Delete"), [this] { remove(); });
                     menu.addAction(icon("rename", 16), L("Rename"), renameAction, &QAction::trigger);
@@ -1678,6 +1862,55 @@ public:
                                            syncEdit(file);
                                        });
                 });
+        remover->setStandardInputFile(QProcess::nullDevice());
+        connect(remover, &QProcess::errorOccurred, this,
+                [this](QProcess::ProcessError error)
+                {
+                    if (error != QProcess::FailedToStart)
+                        return;
+                    files->unsetCursor();
+                    QTimer::singleShot(0, this, [this] { removeBySftp(removing[0], removing[1]); }); // no "finished"
+                });
+        connect(remover, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this](int code, QProcess::ExitStatus exit)
+                {
+                    files->unsetCursor();
+                    forgetAskpassAttempts(remover);
+                    const auto error = QString::fromUtf8(remover->readAllStandardError()).trimmed();
+                    if (code == 0 && exit == QProcess::NormalExit)
+                    {
+                        // Gone from the list at once; the listing that follows confirms it.
+                        for (const auto &path : removing[0] + removing[1])
+                        {
+                            for (int i = files->topLevelItemCount() - 1; i >= 0; --i)
+                            {
+                                if (join(files->topLevelItem(i)->text(0)) == path)
+                                    delete files->topLevelItem(i);
+                            }
+                        }
+                        status->clear();
+                        relistNow();
+                        return;
+                    }
+                    // ssh could not log in: the sftp walk would fail the same way.
+                    if (code == 255 || exit != QProcess::NormalExit)
+                    {
+                        relistNow();
+                        status->setText(error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
+                        return;
+                    }
+                    // rm ran and refused some items (permissions): what it could delete is gone.
+                    const auto lines = error.split('\n', Qt::SkipEmptyParts);
+                    if (!lines.isEmpty() && std::all_of(lines.begin(), lines.end(),
+                                                         [](const QString &line) { return line.startsWith("rm: "); }))
+                    {
+                        relistNow();
+                        status->setText(error.left(400));
+                        return;
+                    }
+                    // No POSIX shell or no rm (SFTP-only account, Windows server): file by file over sftp.
+                    removeBySftp(removing[0], removing[1]);
+                });
         connect(scanner, &QProcess::started, this,
                 [this]
                 {
@@ -1695,6 +1928,8 @@ public:
                         scanQueue.clear();
                         foundFiles.clear();
                         foundDirs.clear();
+                        if (reached(output))
+                            relistNow(); // what a partial walk could see is unchanged, but the list may be stale
                         status->setText(error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
                         if (!reached(output))
                             setLink(2);
@@ -1837,6 +2072,8 @@ public:
                     }
                     setLink(1);
                     status->setText(error.isEmpty() ? QString() : error.left(400));
+                    if (first)
+                        checkZip();
                     if (first && onConnected)
                         onConnected();
                 });
