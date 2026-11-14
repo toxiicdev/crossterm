@@ -346,7 +346,7 @@ private:
         QList<Row> rows;
         auto add = [&rows](const QString &plain, const QString &colored, bool centered = false)
         { rows.append({plain, colored, centered}); };
-        const QString title = QString("• CrossTerm - Open Source Terminal v%1 •").arg(CROSSTERM_VERSION);
+        const QString title = QString("• CrossTerm - Cross-platform Terminal v%1 •").arg(CROSSTERM_VERSION);
         add(title, green + title + reset, true);
         const auto subtitle = "(" + L("Remote server toolbox: SSH, SFTP, X11 and more") + ")";
         add(subtitle, yellow + subtitle + reset, true);
@@ -4109,9 +4109,9 @@ public:
             open(pw);
             auto *typed = current();
             // The terminal starts narrow and reflows once laid out: wait for the final width.
-            wait(5000, [&] { return typed->terminal->allText().contains("CrossTerm - Open Source Terminal v"); });
+            wait(5000, [&] { return typed->terminal->allText().contains("CrossTerm - Cross-platform Terminal v"); });
             const auto bannerText = typed->terminal->allText();
-            check(bannerText.contains("CrossTerm - Open Source Terminal v") &&
+            check(bannerText.contains("CrossTerm - Cross-platform Terminal v") &&
                       bannerText.contains("github.com/toxiicdev/crossterm"),
                   "welcome banner at the top of the terminal" +
                       (bannerText.contains("github.com") ? QString() : " | " + bannerText.left(300)));
