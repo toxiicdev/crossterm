@@ -18,6 +18,7 @@
 #include "rdp.h"
 #include "mobaimport.h"
 #include "titlebar.h"
+#include "syncmerge.h"
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QtWidgets>
@@ -369,6 +370,7 @@ class Window : public QMainWindow
 {
     QString storage;
     QJsonArray profiles;
+    QJsonObject savedData; // sessions, tunnels, macros and deletions as last written (SyncMerge::stamp)
     bool writable = true;
     QLineEdit *quick = new QLineEdit;
     QTreeWidget *tree = new SessionTree;
@@ -1101,8 +1103,16 @@ private:
         }
         QDir().mkpath(QFileInfo(storage).absolutePath());
         QSaveFile file(storage);
-        const auto bytes =
-            QJsonDocument(QJsonObject{{"version", 1}, {"sessions", next}, {"tunnels", tunnels}, {"macros", macros}}).toJson();
+        // Modification time of every new or changed record and deletion time of every removed one, against the
+        // last saved state: what synchronization merges with other devices (syncmerge.h).
+        QJsonObject data{{"sessions", next}, {"tunnels", tunnels}, {"macros", macros}};
+        SyncMerge::stamp(savedData, data, SyncMerge::nowMs());
+        const auto bytes = QJsonDocument(QJsonObject{{"version", 1},
+                                                     {"sessions", data["sessions"]},
+                                                     {"tunnels", data["tunnels"]},
+                                                     {"macros", data["macros"]},
+                                                     {"deleted", data["deleted"]}})
+                               .toJson();
         // Hosts, user names and macros (which may hold typed text): readable by the owner only.
         // Best effort: file systems without permissions must not make the save fail.
         const bool opened = file.open(QIODevice::WriteOnly);
@@ -1113,7 +1123,10 @@ private:
             QMessageBox::warning(this, L("Save"), file.errorString());
             return false;
         }
-        profiles = next;
+        profiles = data["sessions"].toArray();
+        tunnels = data["tunnels"].toArray();
+        macros = data["macros"].toArray();
+        savedData = data;
         refresh();
         return true;
     }
@@ -5852,6 +5865,8 @@ public:
                 profiles = doc["sessions"].toArray();
                 tunnels = doc["tunnels"].toArray();
                 macros = doc["macros"].toArray();
+                savedData = QJsonObject{
+                    {"sessions", profiles}, {"tunnels", tunnels}, {"macros", macros}, {"deleted", doc["deleted"]}};
             }
             else
                 QMessageBox::warning(this, L("Sessions"), L("The sessions file cannot be read; changes are disabled."));
