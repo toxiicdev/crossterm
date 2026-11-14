@@ -452,11 +452,14 @@ private:
             p->sftp = new SftpPanel(profile, platform(), sftpStack);
             p->sftp->folderSource = [p] { return p->terminal ? p->terminal->workingDirectory() : QString(); };
             p->sftp->onMonitoring = [this, p](bool on) { toggleMonitor(p, on); };
-            // The browser appears in the sidebar once the server answered over SFTP.
+            // The file browser section appears in the sidebar only once the server answered over SFTP and the
+            // terminal's folder is listed; until then the sidebar stays where it was.
             p->sftp->onConnected = [this, p]
             {
-                if (current() == p)
-                    sftpStack->setCurrentWidget(p->sftp);
+                if (current() != p)
+                    return;
+                updateFileBrowser();
+                showSide(3);
             };
             p->sftp->pasteToTerminal = [p](const QString &text)
             {
@@ -485,8 +488,6 @@ private:
                 QTimer::singleShot(0, p->sftp, [sftp = p->sftp] { sftp->monitoring->setChecked(true); });
         }
         addPage(p, QString("%1. %2").arg(++counter).arg(name), icon(protocol.isEmpty() ? "shell" : protocol));
-        if (p->sftp)
-            showSide(3);
         p->terminal->setFocus();
     }
 
@@ -529,7 +530,14 @@ private:
             bar->removeTab(i);
             p->widget->deleteLater();
             if (p->sftp)
+            {
+                // Its callbacks point at this page: a listing finishing before deleteLater must not reach it.
+                p->sftp->folderSource = nullptr;
+                p->sftp->onConnected = nullptr;
+                p->sftp->onMonitoring = nullptr;
+                p->sftp->pasteToTerminal = nullptr;
                 p->sftp->deleteLater();
+            }
             delete p->monitor;
             delete p;
             layoutPages();
@@ -608,12 +616,24 @@ private:
             monitorBar->show(now->stats);
         else if (now->monitor)
             monitorBar->showError(L("Loading…")); // until the first data arrives
-        sftpStack->setCurrentIndex(0);
-        if (now->sftp && now->sftp->connected())
-            sftpStack->setCurrentWidget(now->sftp);
+        updateFileBrowser();
         updateTitle();
         if (now->terminal)
             now->terminal->setFocus();
+    }
+
+    // File browser section (globe in the sidebar strip): shown only for a tab whose SFTP folder is already listed.
+    void updateFileBrowser()
+    {
+        auto *now = current();
+        const bool ready = now && now->sftp && now->sftp->connected();
+        sftpStack->setCurrentIndex(0);
+        if (ready)
+            sftpStack->setCurrentWidget(now->sftp);
+        if (strip.size() > 3)
+            strip[3]->setVisible(ready);
+        if (!ready && side->currentIndex() == 3)
+            showSide(0);
     }
 
     void updateTitle()
@@ -3212,6 +3232,8 @@ public:
         open(0);
         auto *p = current();
         check(p != home && p->terminal && p->sftp, "SSH tab opens with terminal and SFTP panel");
+        check(wait(30000, [&] { return p->sftp->connected() && side->currentIndex() == 3 && sftpStack->currentWidget() == p->sftp; }),
+              "file browser opens in the sidebar once the folder is listed");
         if (!p->sftp)
         {
             QFile f(out + "/e2e.txt");
@@ -3277,7 +3299,8 @@ public:
         terminal(localShell(), "Local terminal");
         auto *local2 = current();
         check(bar->currentIndex() == 2 && focusWidget() == local2->terminal, "new local tab gets focus");
-        check(side->currentIndex() == 3 && sftpStack->currentIndex() == 0, "SFTP sidebar shows empty state for local tab");
+        check(side->currentIndex() != 3 && !strip[3]->isVisibleTo(this) && sftpStack->currentIndex() == 0,
+              "file browser section hidden for a local tab");
         if (platform() == "windows")
         {
             wait(8000, [&] { return local2->terminal->contents().contains("PS "); });
@@ -4862,6 +4885,7 @@ public:
             stripLayout->addWidget(b);
             strip << b;
         }
+        strip[3]->hide(); // file browser: shown once a session's folder is listed (updateFileBrowser)
         stripLayout->addStretch();
         body->addWidget(stripWidget);
         tree->setHeaderHidden(true);
