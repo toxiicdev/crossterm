@@ -1,8 +1,15 @@
 #include "rdp.h"
+#include "ftp.h" // FtpClient::fingerprint
+#include "profiles.h"
+#include "vnc.h" // RemoteCard
 #include <QCoreApplication>
 #include <QDebug>
 #include <QGuiApplication>
+#include <QKeyEvent>
 #include <QResizeEvent>
+#include <QSslCertificate>
+#include <QSslConfiguration>
+#include <QSslSocket>
 #include <QTimer>
 #include <algorithm>
 #ifdef Q_OS_WIN
@@ -14,10 +21,17 @@
 #include <wrl/client.h>
 using Microsoft::WRL::ComPtr;
 #else
+#include <QDateTime>
 #include <QDesktopServices>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QLabel>
+#include <QMessageBox>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
+#include <QTemporaryFile>
 #include <QUrl>
 #include <QVBoxLayout>
 #endif
@@ -25,6 +39,11 @@ using Microsoft::WRL::ComPtr;
 static QString ui(const char *text)
 {
     return QCoreApplication::translate("CrossTerm", text);
+}
+
+static QString destination(const RdpView::Settings &settings)
+{
+    return (settings.host.contains(':') ? "[" + settings.host + "]" : settings.host) + ":" + QString::number(settings.port);
 }
 
 // User callbacks run from the event loop: they may even destroy the view without re-entering the control.
@@ -46,6 +65,7 @@ void RdpView::disconnectedEvent(const QString &text)
     QTimer::singleShot(0, this,
                        [this, text]
                        {
+                           updateCard();
                            if (onDisconnected)
                                onDisconnected(text);
                        });
@@ -207,6 +227,7 @@ struct RdpView::Private
     bool ole = false;
     HWND host = nullptr; // AtlAxWin window that contains the control
     bool embedded = false;
+    bool restart = false; // connectToHost() on an open session: connect again once it has disconnected
     ComPtr<IUnknown> control;
     ComPtr<IDispatch> dispatch;
     ComPtr<IConnectionPoint> point;
@@ -263,6 +284,14 @@ struct RdpEvents final : IDispatch
             break;
         case EvDisconnected:
         {
+            if (view->d->restart)
+            {
+                // Requested by connectToHost(): not reported, the new connection starts from the event loop.
+                view->d->restart = false;
+                view->connected = false;
+                QTimer::singleShot(0, view, [v = view] { v->connectToHost(); });
+                break;
+            }
             const int code = first.toInt();
             QVariant extended;
             VARIANT v;
@@ -294,8 +323,10 @@ static const wchar_t *const clsids[] = {L"{A0C63C30-F08D-4AB4-907C-34905D770C7D}
                                         L"{D2EA46A7-C2BF-426B-AF24-E19C44456399}", L"{4EB89FF4-7F78-4A0F-8B8D-2BF02E94E4B2}"};
 
 RdpView::RdpView(const Settings &settings, std::function<QString()> passwordProvider, QWidget *parent)
-    : QWidget(parent), d(new Private), settings(settings), passwordProvider(std::move(passwordProvider))
+    : QWidget(parent), d(new Private), card(new RemoteCard(this)), settings(settings),
+      passwordProvider(std::move(passwordProvider))
 {
+    card->onReconnect = [this] { connectToHost(); };
     setAttribute(Qt::WA_NativeWindow);
     setFocusPolicy(Qt::StrongFocus);
     d->ole = SUCCEEDED(OleInitialize(nullptr));
@@ -413,6 +444,15 @@ void RdpView::connectToHost()
         disconnectedEvent(reason);
         return;
     }
+    // Session still open or connecting (Connected: 1 or 2): Connect would fail, so it is closed first and the
+    // connection starts again from its Disconnected event.
+    if (controlProperty("Connected").toInt() != 0)
+    {
+        d->restart = true;
+        if (SUCCEEDED(invoke(d->dispatch.Get(), "Disconnect", DISPATCH_METHOD)))
+            return;
+        d->restart = false;
+    }
     const qreal ratio = devicePixelRatioF();
     const int w = settings.width > 0 ? settings.width : std::max(640, int(width() * ratio));
     const int h = settings.height > 0 ? settings.height : std::max(480, int(height() * ratio));
@@ -459,6 +499,7 @@ void RdpView::connectToHost()
         }
     }
     reason.clear();
+    updateCard();
     const HRESULT hr = invoke(d->dispatch.Get(), "Connect", DISPATCH_METHOD);
     if (FAILED(hr))
         disconnectedEvent(ui("Remote Desktop connection could not start (0x%1)").arg(ulong(hr), 8, 16, QChar('0')));
@@ -501,13 +542,18 @@ void RdpView::resizeEvent(QResizeEvent *e)
 struct RdpView::Private
 {
     QProcess *process = nullptr;
-    QByteArray prompt; // last bytes printed by xfreerdp, to recognize prompts
+    QByteArray prompt;       // last bytes printed by xfreerdp, to recognize prompts
+    int attempt = 0;         // Linux: connection attempts so far; an older certificate check is dropped
+    QLabel *label = nullptr; // macOS: explanation, hidden while the card is shown
 };
 
 RdpView::RdpView(const Settings &settings, std::function<QString()> passwordProvider, QWidget *parent)
-    : QWidget(parent), d(new Private), settings(settings), passwordProvider(std::move(passwordProvider))
+    : QWidget(parent), d(new Private), card(new RemoteCard(this)), settings(settings),
+      passwordProvider(std::move(passwordProvider))
 {
+    card->onReconnect = [this] { connectToHost(); };
 #ifdef Q_OS_MACOS
+    setFocusPolicy(Qt::StrongFocus); // Return/Enter on the card
     auto *layout = new QVBoxLayout(this);
     // One literal: i18n/extract.py does not join adjacent string literals.
     auto *label = new QLabel(
@@ -516,10 +562,12 @@ RdpView::RdpView(const Settings &settings, std::function<QString()> passwordProv
     label->setWordWrap(true);
     label->setAlignment(Qt::AlignCenter);
     layout->addWidget(label);
+    d->label = label;
 #else
     setAttribute(Qt::WA_NativeWindow);
     setAttribute(Qt::WA_OpaquePaintEvent);
-    setStyleSheet("background: black");
+    setObjectName("rdpView");
+    setStyleSheet("#rdpView { background: black; }"); // by name: the card must not inherit it
 #endif
 }
 
@@ -551,18 +599,50 @@ QVariant RdpView::controlProperty(const QString &) const
 void RdpView::connectToHost()
 {
     reason.clear();
-    const QString destination =
-        (settings.host.contains(':') ? "[" + settings.host + "]" : settings.host) + ":" + QString::number(settings.port);
+    updateCard();
 #ifdef Q_OS_MACOS
-    // rdp:// scheme of the Microsoft client; the password is not passed.
-    QString url = "rdp://full%20address=s:" + destination;
+    // .rdp file opened by the Microsoft client (rdp://full%20address=s:host:port is not a valid QUrl).
+    // The password is not passed; control characters would add lines (settings) to the file.
+    const auto field = [](QString text) { return text.remove(QRegularExpression("[\\x00-\\x1f\\x7f]")).toUtf8(); };
+    QByteArray content = "full address:s:" + field(destination(settings)) + "\r\n";
     if (!settings.user.isEmpty())
-        url += "&username=s:" + QUrl::toPercentEncoding(settings.user);
-    if (QDesktopServices::openUrl(QUrl(url, QUrl::StrictMode)))
+        content += "username:s:" + field(settings.user) + "\r\n";
+    // Own files left behind (quit before the removal below) go at a later connection, once a day old.
+    static const QRegularExpression own("^CrossTerm-[A-Za-z0-9]{6}\\.rdp$");
+    const QDateTime stale = QDateTime::currentDateTime().addDays(-1);
+    for (const QFileInfo &old : QDir(QDir::tempPath()).entryInfoList({"CrossTerm-*.rdp"}, QDir::Files | QDir::NoSymLinks))
+    {
+        if (own.match(old.fileName()).hasMatch() && old.lastModified() < stale)
+            QFile::remove(old.absoluteFilePath());
+    }
+    // openUrl() returns at once and the client reads the file later: it is removed after a minute, by a timer
+    // that outlives the tab, not when the tab closes or reconnects.
+    QTemporaryFile file(QDir::tempPath() + "/CrossTerm-XXXXXX.rdp");
+    file.setAutoRemove(false);
+    const bool written = file.open() && file.write(content) == content.size();
+    const QString path = file.fileName();
+    file.close();
+    const bool opened = written && QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+    if (opened)
+        QTimer::singleShot(60000, qApp, [path] { QFile::remove(path); });
+    else if (!path.isEmpty())
+        QFile::remove(path);
+    if (opened)
         connectedEvent();
     else
         disconnectedEvent(ui("No Remote Desktop client is installed"));
 #else
+    // Reconnect: the previous xfreerdp is stopped first, without reporting its exit.
+    if (d->process)
+    {
+        d->process->disconnect();
+        d->process->kill();
+        d->process->waitForFinished(2000);
+        d->process->deleteLater();
+        d->process = nullptr;
+        d->prompt.clear();
+        connected = false;
+    }
     QString program = QStandardPaths::findExecutable("xfreerdp");
     if (program.isEmpty())
         program = QStandardPaths::findExecutable("xfreerdp3");
@@ -571,10 +651,48 @@ void RdpView::connectToHost()
         disconnectedEvent(ui("xfreerdp was not found: install FreeRDP"));
         return;
     }
+    // xfreerdp cannot ask about a certificate while it reads the password from stdin: with /cert:tofu it accepts an
+    // unknown one by itself. So the certificate is read here first and the user decides, once per certificate; a
+    // server whose certificate was not accepted this way gets /cert:deny (only what xfreerdp already knows passes).
+    const int attempt = ++d->attempt;
+    rdpCertificateFingerprint(
+        settings.host, settings.port, this,
+        [this, program, attempt](const QString &print)
+        {
+            if (attempt != d->attempt || d->process)
+                return;
+            bool trusted = !print.isEmpty() && print.compare(settings.fingerprint, Qt::CaseInsensitive) == 0;
+            if (!trusted && !print.isEmpty())
+            {
+                const auto answer = QMessageBox::warning(
+                    this, ui("Untrusted certificate"),
+                    ui("The certificate of %1 cannot be verified.\n\nSHA-256 fingerprint:\n%2\n\nTrust this certificate for this host?")
+                        .arg(settings.host, print),
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                if (attempt != d->attempt || d->process)
+                    return;
+                if (answer != QMessageBox::Yes)
+                {
+                    disconnectedEvent(ui("Untrusted certificate"));
+                    return;
+                }
+                settings.fingerprint = print;
+                if (onCertificateTrusted)
+                    onCertificateTrusted(print);
+                trusted = true;
+            }
+            launch(program, trusted);
+        });
+#endif
+}
+
+#if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
+void RdpView::launch(const QString &program, bool trusted)
+{
     QStringList args{"/parent-window:" + QString::number(winId()),
-                     "/v:" + destination,
+                     "/v:" + destination(settings),
                      "/from-stdin:force",
-                     "/cert:tofu",
+                     trusted ? "/cert:tofu" : "/cert:deny",
                      "/dynamic-resolution",
                      "/bpp:" + QString::number(settings.colorDepth)};
     if (!settings.user.isEmpty())
@@ -587,10 +705,10 @@ void RdpView::connectToHost()
         args << QString("/size:%1x%2").arg(std::max(640, width())).arg(std::max(480, height()));
     args << (settings.redirectClipboard ? "+clipboard" : "-clipboard");
     if (settings.redirectDrives)
-        args << "/home-drive"; // ponytail: home folder only; user-chosen folders if needed
+        args << "/home-drive"; // the home folder only, not every mount point (/drives)
     if (settings.redirectPrinters)
         args << "/printer";
-    d->process = new QProcess(this);
+    d->process = hideConsoleWindow(new QProcess(this)); // Linux: ends with CrossTerm also on a crash
     d->process->setProcessChannelMode(QProcess::MergedChannels);
     // Missing credentials are prompted on stdin: answer each prompt, the password never goes into argv.
     QObject::connect(d->process, &QProcess::readyReadStandardOutput, this,
@@ -632,18 +750,19 @@ void RdpView::connectToHost()
                              disconnectedEvent(d->process->errorString());
                      });
     d->process->start(program, args);
-#endif
 }
+#endif
 
 void RdpView::disconnectFromHost()
 {
+    ++d->attempt; // a certificate check still running starts nothing
     if (d->process)
         d->process->terminate();
 }
 
 void RdpView::sendCtrlAltDel()
 {
-    // ponytail: xfreerdp has no external command for SAS; inside the session use Ctrl+Alt+End.
+    // Nothing to do: xfreerdp has no external command for SAS (inside the session Ctrl+Alt+End sends it).
 }
 
 void RdpView::resizeEvent(QResizeEvent *e)
@@ -651,3 +770,88 @@ void RdpView::resizeEvent(QResizeEvent *e)
     QWidget::resizeEvent(e); // the xfreerdp child window follows with /dynamic-resolution
 }
 #endif
+
+// The card (reason and Reconnect) is shown from a disconnection until the next connection attempt.
+void RdpView::updateCard()
+{
+    const bool show = !connected && !reason.isEmpty();
+#ifdef Q_OS_WIN
+    // The control is a native child window, always above what Qt draws: hidden while the card is shown.
+    if (d->host && d->embedded)
+        ShowWindow(d->host, show ? SW_HIDE : SW_SHOWNA);
+#elif defined(Q_OS_MACOS)
+    d->label->setVisible(!show);
+#endif
+    if (show)
+        card->present(reason, destination(settings), true);
+    else
+        card->hide();
+}
+
+void RdpView::keyPressEvent(QKeyEvent *e)
+{
+    if (card->offersReconnect() && (e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter))
+        connectToHost();
+    else
+        QWidget::keyPressEvent(e);
+}
+
+void rdpCertificateFingerprint(const QString &host, quint16 port, QObject *context,
+                               std::function<void(const QString &fingerprint)> done)
+{
+    auto *socket = new QSslSocket(context);
+    // Reports once, outside the socket's own signals (the caller may open a dialog), and drops the connection.
+    const auto report = std::make_shared<std::function<void(const QString &)>>(std::move(done));
+    const auto finish = [socket, context, report](const QString &print)
+    {
+        if (!*report)
+            return;
+        const auto call = *report;
+        *report = nullptr;
+        socket->abort();
+        socket->deleteLater();
+        QTimer::singleShot(0, context, [call, print] { call(print); });
+    };
+    auto configuration = socket->sslConfiguration();
+    configuration.setPeerVerifyMode(QSslSocket::VerifyNone); // nothing is sent: the certificate is only read
+    configuration.setProtocol(QSsl::AnyProtocol);
+    socket->setSslConfiguration(configuration);
+    QObject::connect(socket, &QSslSocket::connected, socket,
+                     [socket]
+                     {
+                         // X.224 Connection Request with an RDP negotiation request for TLS or NLA (both start with TLS).
+                         static const char request[] =
+                             "\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x03\x00\x00\x00";
+                         socket->write(request, 19);
+                     });
+    QObject::connect(socket, &QSslSocket::readyRead, socket,
+                     [socket, finish]
+                     {
+                         if (socket->mode() != QSslSocket::UnencryptedMode)
+                             return;
+                         const QByteArray head = socket->peek(4);
+                         if (head.size() < 4)
+                             return;
+                         const int length = (uchar(head[2]) << 8) | uchar(head[3]);
+                         if (head[0] != 3 || length < 11 || length > 512)
+                             return finish({});
+                         if (socket->bytesAvailable() < length)
+                             return;
+                         // Connection Confirm: a negotiation response (type 2) selecting TLS (1), NLA (2), RDSTLS (4) or NLA
+                         // extended (8); anything else is a server without TLS.
+                         const QByteArray reply = socket->read(length);
+                         if (length < 19 || reply[11] != 2 || !(uchar(reply[15]) & 0x0f))
+                             return finish({});
+                         socket->startClientEncryption();
+                     });
+    QObject::connect(socket, &QSslSocket::encrypted, socket,
+                     [socket, finish]
+                     {
+                         const auto certificate = socket->peerCertificate();
+                         finish(certificate.isNull() ? QString() : FtpClient::fingerprint(certificate));
+                     });
+    QObject::connect(socket, &QSslSocket::errorOccurred, socket, [finish] { finish({}); });
+    QObject::connect(socket, &QSslSocket::disconnected, socket, [finish] { finish({}); });
+    QTimer::singleShot(10000, socket, [finish] { finish({}); });
+    socket->connectToHost(host, port);
+}

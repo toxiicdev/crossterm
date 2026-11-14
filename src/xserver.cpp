@@ -5,6 +5,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QSet>
+#include <QSettings>
 #include <QTcpServer>
 #include <QTcpSocket>
 
@@ -33,7 +34,12 @@ QList<XServerInfo> detectXServers(const QStringList &extraDirectories)
         if (!root.isEmpty())
             dirs << root + "/VcXsrv" << root + "/Xming";
     }
-    dirs << "C:/cygwin64/bin" << "C:/cygwin/bin" << qEnvironmentVariable("LOCALAPPDATA") + "/Microsoft/WindowsApps"; // X410
+    // Cygwin: the folder its installer recorded for all users (HKLM), not a guess under C:\ that any user can create.
+    const auto cygwin =
+        QSettings("HKEY_LOCAL_MACHINE\\SOFTWARE\\Cygwin\\setup", QSettings::NativeFormat).value("rootdir").toString();
+    if (!cygwin.isEmpty())
+        dirs << cygwin + "/bin";
+    dirs << qEnvironmentVariable("LOCALAPPDATA") + "/Microsoft/WindowsApps"; // X410
     dirs << qEnvironmentVariable("PATH").split(';', Qt::SkipEmptyParts);
     static const QList<XServerInfo> kinds{
         {"VcXsrv", "vcxsrv.exe"}, {"Xming", "Xming.exe"}, {"Cygwin/X", "XWin.exe"}, {"X410", "X410.exe"}};
@@ -85,7 +91,8 @@ Command xserverCommand(const XServerInfo &server, int display, const QString &mo
         args << "-wgl";
     if (exe == "xwin.exe")
         args << "-listen" << "tcp"; // Cygwin/X does not listen on TCP by default
-    args << "-ac";                  // ssh for Windows has no xauth: cookie-less access, local only
+    // No -ac: access control stays on. Without a cookie file the server accepts this machine only, which is where
+    // ssh connects from; XDMCP clients present the cookie the server handed to the display manager.
     return {server.executable, args, {}};
 }
 
@@ -132,6 +139,9 @@ bool XServerManager::start(const XServerInfo &server, const QString &mode, const
         return false;
     }
     process = std::make_unique<QProcess>();
+#ifndef Q_OS_WIN
+    hideConsoleWindow(process.get()); // Linux: ends with CrossTerm also on a crash
+#endif
 #ifdef Q_OS_WIN
     // VcXsrv runs "%COMSPEC% /c xkbcomp ..." at startup; with Windows Terminal as the default terminal that console
     // flashes on screen. COMSPEC points to CrossTerm itself, which runs cmd in an invisible pseudoconsole.

@@ -55,6 +55,10 @@ struct Command
 Import parseMoba(const QByteArray &bytes, const QString &drive = {});
 QJsonArray mergeProfiles(QJsonArray current, const QJsonArray &incoming);
 Command sessionCommand(const QJsonObject &profile, const QString &platform, bool display);
+// Error to show when the ssh/sftp program of a terminal session ends with exit code code (-1 = killed by a signal):
+// "Could not connect to host", "Connection closed by the server" or "Connection to host lost", chosen from ssh's last
+// lines on screen; empty for a normal end (any other code is the status of the remote shell).
+QString sshExitError(int code, const QString &screen, const QString &host);
 bool validHost(const QString &host);
 int defaultPort(const QString &protocol);
 

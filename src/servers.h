@@ -19,7 +19,8 @@ class QPushButton;
 class QProgressBar;
 class QListWidget;
 
-// Real path of `relative` inside `root`, empty if it escapes the root (.., drives, external symlinks).
+// Real path of `relative` inside `root`, empty if it escapes the root (.., drives, external symlinks) or names a
+// hidden file or folder (a component starting with a dot).
 QString jailedPath(const QString &root, const QString &relative);
 
 // Read-only HTTP/1.1 server (GET/HEAD, Range, directory listing) confined to a folder.
@@ -85,6 +86,7 @@ private:
     QStringList hosts;
     QList<int> ports;
     int next = 0, done = 0, total = 0, timeout = 1500;
+    QObject queue; // context of the queued launch() calls: they are dropped with the scanner
 };
 
 // Start/stop of the HTTP, TFTP and FTP servers (the latter injected by the caller).

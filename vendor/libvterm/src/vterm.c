@@ -267,6 +267,7 @@ VTermValueType vterm_get_attr_type(VTermAttr attr)
 {
   switch(attr) {
     case VTERM_ATTR_BOLD:       return VTERM_VALUETYPE_BOOL;
+    case VTERM_ATTR_DIM:        return VTERM_VALUETYPE_BOOL;
     case VTERM_ATTR_UNDERLINE:  return VTERM_VALUETYPE_INT;
     case VTERM_ATTR_ITALIC:     return VTERM_VALUETYPE_BOOL;
     case VTERM_ATTR_BLINK:      return VTERM_VALUETYPE_BOOL;

@@ -93,7 +93,7 @@ static void testHttp(const QString &root)
     CHECK(server.isRunning() && server.port() != 0);
     const quint16 port = server.port();
 
-    QByteArray r = http(port, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n");
+    QByteArray r = http(port, "GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
     CHECK(r.startsWith("HTTP/1.1 200 OK\r\n"));
     CHECK(r.contains("Content-Type: text/plain"));
     CHECK(r.contains("Content-Length: 11\r\n"));

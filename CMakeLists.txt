@@ -14,11 +14,12 @@ set_target_properties(vterm PROPERTIES C_STANDARD 99)
 # Terminal-independent logic: profiles, vault, proxy, monitoring, X server, MobaXterm session import.
 set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(relaycore STATIC ${SRC}/profiles.cpp ${SRC}/foreign.cpp ${SRC}/credentials.cpp ${SRC}/proxy.cpp
-            ${SRC}/monitor.cpp ${SRC}/xserver.cpp ${SRC}/mobaimport.cpp ${SRC}/ftp.cpp ${SRC}/servers.cpp ${SRC}/vnc.cpp ${SRC}/rdp.cpp)
+            ${SRC}/monitor.cpp ${SRC}/xserver.cpp ${SRC}/mobaimport.cpp ${SRC}/ftp.cpp ${SRC}/servers.cpp ${SRC}/vnc.cpp ${SRC}/rdp.cpp
+            ${SRC}/keepalive.cpp)
 target_include_directories(relaycore PUBLIC ${SRC})
 target_link_libraries(relaycore PUBLIC Qt6::Core Qt6::Widgets Qt6::Network)
 if(WIN32)
-    target_link_libraries(relaycore PUBLIC advapi32 bcrypt ole32 oleaut32 uuid)
+    target_link_libraries(relaycore PUBLIC advapi32 bcrypt ole32 oleaut32 uuid ws2_32)
 elseif(APPLE)
     # AppKit + objc: askpass helper processes stay out of the Dock (setActivationPolicy, main.cpp).
     # LocalAuthentication: Touch ID before saved passwords are used (touchid.mm).

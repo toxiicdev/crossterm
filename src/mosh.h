@@ -11,6 +11,7 @@
 #include <QStringList>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 class Terminal;
 
@@ -91,6 +92,7 @@ struct Assembler
 {
     quint64 id = ~0ULL;
     int total = -1;
+    qsizetype bytes = 0; // size of the parts received so far
     QList<QByteArray> parts;
     bool add(const QByteArray &fragment, Instruction &inst); // true when the instruction is complete
 };
@@ -110,6 +112,10 @@ public:
     qint64 bytesAvailable() const override;
     void close() override;
     double srtt() const; // smoothed RTT in ms (1000 until a sample exists)
+    bool endedNormally() const { return normalEnd; } // the server closed the session (exit typed), not an error
+    qint64 silence() const;                          // ms since the server was last heard, -1 before the first contact
+    // Called when the server has been silent for 4 s and again when it is heard after that ("last contact" banner).
+    std::function<void()> onSilence;
 
 protected:
     qint64 readData(char *data, qint64 maxSize) override;
@@ -121,6 +127,7 @@ private:
     void tick();
     void receive();
     void finish(const QString &reason);
+    bool normalEnd = false;
 };
 
 // Mosh-style local echo: printable characters typed on the cursor line are shown immediately

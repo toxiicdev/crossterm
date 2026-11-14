@@ -1,18 +1,24 @@
 // Selectable UI appearances: the default one (dark/light) and macOS (light/dark).
 // Header-only: stylesheet, base colors, macOS-style tab painting.
 #pragma once
+#include <QApplication>
 #include <QColor>
 #include <QDir>
+#include <QEvent>
 #include <QImage>
 #include <QFontMetrics>
 #include <QHash>
 #include <QIcon>
 #include <QList>
+#include <QMenu>
 #include <QPainter>
 #include <QRegularExpression>
+#include <QScreen>
 #include <QString>
+#include <QTemporaryDir>
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 enum class Appearance
 {
@@ -89,7 +95,7 @@ inline AppearancePalette appearancePalette(Appearance a)
     case Appearance::ClassicLight:
         return {"#f3f3f3", "#f3f3f3", "#1e1e1e", "#6a6a6a", "#3d8fe0", "#d0d0d0", "#ffffff", 28, true};
     case Appearance::MacLight:
-        return {"#ececec", "#e3e3e8", "#1d1d1f", "#6e6e73", "#007aff", "#d1d1d6", "#ffffff", 28, true};
+        return {"#ececec", "#e3e3e8", "#1d1d1f", "#5f5f64", "#007aff", "#d1d1d6", "#ffffff", 28, true};
     case Appearance::MacDark:
         return {"#1e1e1e", "#262628", "#e5e5e7", "#98989d", "#0a84ff", "#38383a", "#1e1e1e", 28, true};
     default:
@@ -112,7 +118,7 @@ inline QString appearanceColors(Appearance a, const QString &classicDark)
     static const QHash<QString, QString> macLight{
         {"#141414", "#ececec"}, {"#1c1c1c", "#ffffff"}, {"#1f1f1f", "#f6f6f6"}, {"#e6e6e6", "#1d1d1f"}, {"#2f4f6f", "#007aff"},
         {"#ffffff", "#000000"}, {"#2a2a2a", "#ffffff"}, {"#4a4a4a", "#d1d1d6"}, {"#3a3a3a", "#d1d1d6"}, {"#6a6a6a", "#c7c7cc"},
-        {"#f0f0f0", "#1d1d1f"}, {"#b0b0b0", "#6e6e73"}, {"#c0c0c0", "#6e6e73"}, {"#8a8a8a", "#6e6e73"}, {"#9fda9f", "#248a3d"},
+        {"#f0f0f0", "#1d1d1f"}, {"#b0b0b0", "#5f5f64"}, {"#c0c0c0", "#5f5f64"}, {"#8a8a8a", "#5f5f64"}, {"#9fda9f", "#248a3d"},
         {"#8fc0ff", "#007aff"}, {"#3d8fe0", "#007aff"}};
     static const QHash<QString, QString> macDark{
         {"#141414", "#1e1e1e"}, {"#1c1c1c", "#1e1e1e"}, {"#1f1f1f", "#2c2c2e"}, {"#e6e6e6", "#e5e5e7"},
@@ -135,19 +141,28 @@ inline QString appearanceColors(Appearance a, const QString &classicDark)
 }
 
 // Indicators (arrows, check mark) drawn at runtime into the temp folder: Qt stylesheets do not accept inline images.
-// Drawn at twice the displayed size, so they stay sharp at 200% scaling.
+// Drawn at the pixel ratio of the densest screen, at least twice the displayed size: sharp up to 300% scaling.
 inline QString macIndicatorDir(bool dark)
 {
-    const QString dir = QDir::temp().filePath(dark ? "crossterm-appearance-dark" : "crossterm-appearance-light");
+    qreal ratio = 2;
+    for (const QScreen *screen : QGuiApplication::screens())
+        ratio = std::max(ratio, screen->devicePixelRatio());
+    const int scale = int(std::ceil(ratio));
+    // Private folder of this run (0700, removed at exit): a fixed name in a shared /tmp may belong to another user,
+    // who could then redirect the writes below through symbolic links.
+    static const QTemporaryDir root(QDir::temp().filePath("crossterm-appearance-XXXXXX"));
+    const QString base = root.isValid() ? root.path() : QDir::temp().filePath("crossterm-appearance");
+    // The scale is part of the path: Qt caches style sheet images by file name.
+    const QString dir = base + QString("/%1-%2x").arg(dark ? "dark" : "light").arg(scale);
     QDir().mkpath(dir);
     const QColor arrow(dark ? "#c7c7cc" : "#4a4a4f");
     auto save = [&](const QString &name, QSize size, const QColor &color, const QList<QPolygonF> &lines)
     {
-        QImage image(size * 2, QImage::Format_ARGB32_Premultiplied);
+        QImage image(size * scale, QImage::Format_ARGB32_Premultiplied);
         image.fill(Qt::transparent);
         QPainter p(&image);
         p.setRenderHint(QPainter::Antialiasing);
-        p.scale(2, 2);
+        p.scale(scale, scale);
         p.setPen(QPen(color, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         for (const auto &line : lines)
             p.drawPolyline(line);
@@ -186,14 +201,16 @@ QToolButton { background: transparent; border: 1px solid transparent; border-rad
 QToolButton:hover { background: @hover@; }
 QToolButton:pressed, QToolButton:checked { background: @pressed@; }
 QToolButton::menu-indicator { image: none; width: 0; }
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @field@; border: 1px solid @fieldBorder@; border-radius: 6px; padding: 3px 6px; selection-background-color: @selection@; selection-color: @text@; }
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @field@; border: 1px solid @fieldBorder@; border-radius: 6px; padding: 3px 6px; selection-background-color: @selection@; selection-color: @text@; placeholder-text-color: @secondary@; }
 QPlainTextEdit, QTextEdit { padding: 2px; }
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 2px solid @accentRing@; padding: 2px 5px; }
 QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled { color: @disabled@; background: @window@; }
 QComboBox { padding-right: 22px; }
-QComboBox::drop-down { border: none; background: transparent; width: 20px; subcontrol-origin: padding; subcontrol-position: center right; }
+QComboBox:focus { padding-right: 21px; } /* one pixel goes to the wider border: the text stays in place; the arrow is placed from the border edge, which does not move */
+QComboBox::drop-down { border: none; background: transparent; width: 20px; subcontrol-origin: border; subcontrol-position: center right; right: 1px; }
 QComboBox::down-arrow { image: url(@img@/chevrons.png); width: 8px; height: 12px; }
 QSpinBox, QDoubleSpinBox { padding-right: 20px; }
+QSpinBox:focus, QDoubleSpinBox:focus { padding-right: 19px; }
 QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 18px; border: none; background: transparent; }
 QSpinBox::up-button:hover, QSpinBox::down-button:hover, QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: @hover@; border-radius: 3px; }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url(@img@/up.png); width: 8px; height: 5px; }
@@ -272,7 +289,7 @@ QProgressBar::chunk { background: @accent@; border-radius: 4px; }
     static const QList<std::array<const char *, 3>> colors{{"window", "#ececec", "#1e1e1e"},
                                                            {"sidebar", "#e3e3e8", "#262628"},
                                                            {"text", "#1d1d1f", "#e5e5e7"},
-                                                           {"secondary", "#6e6e73", "#98989d"},
+                                                           {"secondary", "#5f5f64", "#98989d"},
                                                            {"disabled", "#a1a1a6", "#5f5f63"},
                                                            {"accent", "#007aff", "#0a84ff"},
                                                            {"accentTop", "#2f8fff", "#3796ff"},
@@ -315,7 +332,46 @@ inline QString appearanceStyleSheet(Appearance a, const QString &classicDarkStyl
 {
     if (appearanceIsMac(a))
         return macStyleSheet(a == Appearance::MacDark);
-    return appearanceColors(a, classicDarkStyle);
+    QString sheet = appearanceColors(a, classicDarkStyle);
+    // Placeholders default to the text color at half opacity: only 3.3:1 on the white fields of the light appearance.
+    if (a == Appearance::ClassicLight)
+        sheet += "QLineEdit, QPlainTextEdit { placeholder-text-color: #6a6a6a; }\n";
+    return sheet;
+}
+
+// Menus and tooltips with rounded corners need a translucent window: an opaque one fills the corners outside the
+// border. Set before the native window exists (menus and tooltips are polished first); already created ones are kept.
+class RoundedPopups : public QObject
+{
+public:
+    using QObject::QObject;
+
+    static void apply(QWidget *w)
+    {
+        if (!qobject_cast<QMenu *>(w) && !w->inherits("QTipLabel"))
+            return;
+        if (w->testAttribute(Qt::WA_TranslucentBackground) || w->testAttribute(Qt::WA_WState_Created))
+            return;
+        w->setAttribute(Qt::WA_TranslucentBackground);
+#ifdef Q_OS_WIN
+        // Windows: translucency needs a frameless window, and the system shadow would stay a rectangle.
+        w->setWindowFlags(w->windowFlags() | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
+#endif
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() == QEvent::Polish && watched->isWidgetType())
+            apply(static_cast<QWidget *>(watched));
+        return false;
+    }
+};
+
+// Called once at startup, before the first window.
+inline void installRoundedPopups(QApplication &app)
+{
+    app.installEventFilter(new RoundedPopups(&app));
 }
 
 // macOS tabs: rounded pills; the current one is raised with a light shadow, the others are text only.
@@ -328,7 +384,7 @@ inline QSize macTabSizeHint(const QString &text, const QFontMetrics &fm)
 }
 
 inline void paintMacTab(QPainter &p, const QRectF &rect, const QIcon &icon, const QString &text, bool current, bool dark,
-                        const QFontMetrics &fm)
+                        const QFontMetrics &fm, bool hovered = false)
 {
     const auto palette = appearancePalette(dark ? Appearance::MacDark : Appearance::MacLight);
     p.save();
@@ -344,6 +400,13 @@ inline void paintMacTab(QPainter &p, const QRectF &rect, const QIcon &icon, cons
         p.drawRoundedRect(pill.adjusted(-0.5, 0, 0.5, 2), 7.5, 7.5);
         p.setPen(QPen(dark ? QColor(255, 255, 255, 28) : QColor(0, 0, 0, 30), 0.8));
         p.setBrush(dark ? QColor("#48484a") : QColor("#ffffff"));
+        p.drawRoundedRect(pill, 7, 7);
+    }
+    else if (hovered)
+    {
+        // Faint pill under the pointer
+        p.setPen(Qt::NoPen);
+        p.setBrush(dark ? QColor(255, 255, 255, 14) : QColor(0, 0, 0, 10));
         p.drawRoundedRect(pill, 7, 7);
     }
     const int iconSize = 16;

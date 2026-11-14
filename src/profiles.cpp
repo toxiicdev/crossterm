@@ -6,6 +6,10 @@
 #ifdef Q_OS_WIN
 #define NOMINMAX
 #include <windows.h>
+#elif defined(Q_OS_LINUX)
+#include <csignal>
+#include <sys/prctl.h>
+#include <unistd.h>
 #endif
 #include <array>
 #include <cstring>
@@ -191,6 +195,17 @@ QProcess *hideConsoleWindow(QProcess *process)
             arguments->flags |= CREATE_NEW_CONSOLE;
             arguments->startupInfo->dwFlags |= STARTF_USESHOWWINDOW;
             arguments->startupInfo->wShowWindow = SW_HIDE;
+        });
+#elif defined(Q_OS_LINUX)
+    // The child ends with CrossTerm also when CrossTerm is killed (SIGKILL), which the process group cleanup cannot
+    // catch. Only async-signal-safe calls: this runs in the child between fork and exec.
+    const pid_t parent = getpid();
+    process->setChildProcessModifier(
+        [parent]
+        {
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            if (getppid() != parent) // CrossTerm died before prctl
+                _exit(1);
         });
 #endif
     return process;
@@ -521,24 +536,31 @@ QJsonArray mergeProfiles(QJsonArray current, const QJsonArray &incoming)
         return QJsonDocument(QJsonArray{p["name"], p["folder"], p["protocol"], p["host"], p["port"], p["user"]})
             .toJson(QJsonDocument::Compact);
     };
+    // Same key without the user: sessions with no user that an imported one with a user can complete.
+    auto endpoint = [](const QJsonObject &p)
+    {
+        return QJsonDocument(QJsonArray{p["name"], p["folder"], p["protocol"], p["host"], p["port"]})
+            .toJson(QJsonDocument::Compact);
+    };
     QSet<QByteArray> seen;
-    for (const auto &item : current)
-        seen.insert(key(item));
+    QHash<QByteArray, QList<int>> unnamed; // indexes in current, in order: no full scan per imported session
+    for (int i = 0; i < current.size(); ++i)
+    {
+        seen.insert(key(current[i]));
+        if (const auto p = current[i].toObject(); p["user"].toString().isEmpty())
+            unnamed[endpoint(p)].append(i);
+    }
     for (const auto &item : incoming)
     {
         const auto imported = item.toObject();
         bool repaired = false;
-        if (!imported["user"].toString().isEmpty())
+        auto candidates = imported["user"].toString().isEmpty() ? unnamed.end() : unnamed.find(endpoint(imported));
+        if (candidates != unnamed.end())
         {
-            for (int i = 0; i < current.size(); ++i)
+            for (int k = 0; k < candidates->size(); ++k)
             {
+                const int i = candidates->at(k);
                 auto previous = current[i].toObject();
-                if (!previous["user"].toString().isEmpty())
-                    continue;
-                auto compare = previous;
-                compare["user"] = imported["user"];
-                if (key(compare) != key(imported))
-                    continue;
                 QJsonArray issues;
                 for (const auto &issue : previous["issues"].toArray())
                 {
@@ -551,6 +573,7 @@ QJsonArray mergeProfiles(QJsonArray current, const QJsonArray &incoming)
                 previous["issues"] = issues;
                 current.replace(i, previous);
                 seen.insert(key(previous));
+                candidates->removeAt(k); // it has a user now
                 repaired = true;
                 break;
             }
@@ -562,6 +585,8 @@ QJsonArray mergeProfiles(QJsonArray current, const QJsonArray &incoming)
         {
             current.append(item);
             seen.insert(id);
+            if (imported["user"].toString().isEmpty())
+                unnamed[endpoint(imported)].append(int(current.size() - 1));
         }
     }
     return current;
@@ -583,7 +608,10 @@ Command sessionCommand(const QJsonObject &profile, const QString &platform, bool
     const int port = profile["port"].toInt();
     if (!profile["issues"].toArray().isEmpty())
         return {{}, {}, "Rivedi le impostazioni importate."};
-    if (!validHost(host) || port < 1 || port > 65535 || !safeUser(user) || key.startsWith('-') ||
+    // A key on a network share (a UNC path) makes Windows log in to that server just to read it: a session file
+    // from someone else could name their server. A mapped drive letter works.
+    const bool remoteKey = platform == "windows" && (key.startsWith("\\\\") || key.startsWith("//"));
+    if (!validHost(host) || port < 1 || port > 65535 || !safeUser(user) || key.startsWith('-') || remoteKey ||
         key.contains(QRegularExpression("[\\x00-\\x1f\\x7f]")))
         return {{}, {}, "Host, porta, utente o percorso della chiave non valido."};
     const auto destination = bracket(host) + ":" + QString::number(port);
@@ -635,7 +663,10 @@ Command sessionCommand(const QJsonObject &profile, const QString &platform, bool
         args << "-J" << hops.join(',');
     if (profile["compression"].toBool())
         args << "-C";
-    args << "-o" << "ServerAliveInterval=30"; // Keepalive for SSH sessions and the SFTP browser
+    // Keepalive for SSH sessions, the SFTP browser and monitoring: a crashed server or a lost network ends the session
+    // within about 30 s ("Timeout, server not responding") instead of leaving it frozen. A host that does not answer
+    // fails after 20 s instead of the system TCP timeout (over a minute).
+    args << "-o" << "ServerAliveInterval=10" << "-o" << "ServerAliveCountMax=3" << "-o" << "ConnectTimeout=20";
     // X11: on Windows ssh has no xauth for "untrusted" cookies, so use -Y (trusted) with the local X server.
     // On macOS -X makes ssh generate a cookie by connecting to the display, which starts XQuartz at every login;
     // -Y only reads the existing cookie, so XQuartz starts when a remote X program actually opens a window.
@@ -653,6 +684,31 @@ Command sessionCommand(const QJsonObject &profile, const QString &platform, bool
     }
     args << "--" << (ssh ? host : bracket(host));
     return {protocol, args, {}};
+}
+
+QString sshExitError(int code, const QString &screen, const QString &host)
+{
+    if (code >= 0 && code != 255)
+        return {};
+    const auto lines = screen.split('\n', Qt::SkipEmptyParts);
+    const auto tail = lines.mid(std::max<qsizetype>(0, lines.size() - 4)).join('\n');
+    // OpenSSH messages of a connection that never came up (resolution, refused, unreachable, authentication).
+    static const char *const notConnected[]{"connect to host",
+                                            "Could not resolve hostname",
+                                            "Permission denied",
+                                            "Host key verification failed",
+                                            "Too many authentication failures",
+                                            "kex_exchange_identification",
+                                            "Unable to negotiate",
+                                            "banner exchange"};
+    for (const auto *text : notConnected)
+    {
+        if (tail.contains(QLatin1String(text), Qt::CaseInsensitive))
+            return QCoreApplication::translate("CrossTerm", "Could not connect to %1").arg(host);
+    }
+    if (tail.contains("closed by remote host") || tail.contains("Connection closed by") || tail.contains("Received disconnect"))
+        return QCoreApplication::translate("CrossTerm", "Connection closed by the server");
+    return QCoreApplication::translate("CrossTerm", "Connection to %1 lost").arg(host); // timeout, broken pipe, reset
 }
 
 bool parseListing(const QString &line, RemoteEntry &entry)
@@ -684,17 +740,19 @@ QJsonArray applyImport(QJsonArray current, const QJsonArray &incoming, ImportPol
         return mergeProfiles(current, incoming);
     auto identity = [](const QJsonObject &p)
     { return (p["name"].toString() + "\n" + p["folder"].toString() + "\n" + p["protocol"].toString()).toCaseFolded(); };
+    QHash<QString, int> first; // identity -> first index in current
+    for (int i = int(current.size()) - 1; i >= 0; --i)
+        first.insert(identity(current[i].toObject()), i);
     for (const auto &value : incoming)
     {
         const auto item = value.toObject();
-        int found = -1;
-        for (int i = 0; i < current.size() && found < 0; ++i)
-        {
-            if (identity(current[i].toObject()) == identity(item))
-                found = i;
-        }
+        const auto id = identity(item);
+        const int found = first.value(id, -1);
         if (found < 0)
+        {
+            first.insert(id, int(current.size()));
             current.append(item);
+        }
         else if (policy == ImportPolicy::Replace)
         {
             auto replaced = item;
@@ -803,7 +861,7 @@ static QStringList csvFields(const QString &line, QChar separator)
 Import parseCsv(const QByteArray &bytes)
 {
     Import result;
-    auto text = QString::fromUtf8(bytes);
+    auto text = decode(bytes); // also UTF-16 and ANSI (Excel exports)
     if (text.startsWith(QChar(0xfeff)))
         text.remove(0, 1);
     const auto lines = text.split(QRegularExpression("[\r\n]+"), Qt::SkipEmptyParts);

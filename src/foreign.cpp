@@ -8,6 +8,8 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QStandardPaths>
+#include <QStringDecoder>
 #include <QUrl>
 #include <QUuid>
 #include <QXmlStreamReader>
@@ -125,6 +127,15 @@ Import exceed(const QString &text, const QString &file)
     return result;
 }
 
+// .reg string value: '\' and '"' are escaped with a backslash ("DOMAIN\\user").
+QString regString(const QString &value)
+{
+    QString plain;
+    for (qsizetype i = 0; i < value.size(); ++i)
+        plain += value[i] == '\\' && i + 1 < value.size() ? value[++i] : value[i];
+    return plain;
+}
+
 // PuTTY .reg export: [HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\<name>].
 Import puttyReg(const QString &text)
 {
@@ -157,17 +168,33 @@ Import puttyReg(const QString &text)
         const auto m = entry.match(t);
         if (m.hasMatch() && !name.isEmpty())
             values.insert(m.captured(1).toLower(),
-                          m.captured(3).isEmpty() ? m.captured(2) : QString::number(m.captured(3).toInt(nullptr, 16)));
+                          m.captured(3).isEmpty() ? regString(m.captured(2)) : QString::number(m.captured(3).toInt(nullptr, 16)));
     }
     flush();
     return result;
 }
 
 // XML: mRemoteNG (Node), PuTTY Connection Manager (connection_info), SuperPuTTY (SessionData), SecureCRT (VanDyke).
-Import xml(const QByteArray &data)
+Import xml(const QByteArray &data, const QString &text)
 {
     Import result;
-    QXmlStreamReader xml(data);
+    // UTF-16 files go as decoded text (encoding locked). Files declaring another encoding (iso-8859-1...) go as bytes,
+    // so the reader follows the declaration. UTF-8 or undeclared: decoded here, falling back to Latin-1 when the bytes
+    // are not valid UTF-8 (ANSI exports): the reader would otherwise reject the whole file on the first accented letter.
+    QXmlStreamReader xml;
+    static const QRegularExpression declared("^\\s*<\\?xml[^>]*encoding\\s*=\\s*[\"']([^\"']+)[\"']",
+                                             QRegularExpression::CaseInsensitiveOption);
+    const auto encoding = declared.match(QString::fromLatin1(data.left(256))).captured(1).toLower();
+    if (data.startsWith("\xff\xfe"))
+        xml.addData(text);
+    else if (!encoding.isEmpty() && encoding != "utf-8" && encoding != "utf8")
+        xml.addData(data);
+    else
+    {
+        QStringDecoder utf8(QStringDecoder::Utf8);
+        const QString decoded = utf8(data);
+        xml.addData(utf8.hasError() ? QString::fromLatin1(data) : decoded);
+    }
     QStringList containers;       // open mRemoteNG folders
     QList<bool> nodeIsContainer;  // to close nested Nodes correctly
     QHash<QString, QString> info; // PuTTYCM <connection_info> fields
@@ -272,7 +299,7 @@ Import readForeign(const QByteArray &data, const QString &fileName)
     else if (text.contains("[Xstart]", Qt::CaseInsensitive) || lower.endsWith(".xs"))
         result = exceed(text, fileName);
     else if (text.trimmed().startsWith('<'))
-        result = xml(text.toUtf8());
+        result = xml(data, text);
     else
         result = parseMoba(data, fileName.mid(1, 1) == ":" ? fileName.left(1) : QString());
     if (result.profiles.isEmpty() && result.warnings.isEmpty())
@@ -318,10 +345,16 @@ Import localSessions(const QString &source)
     }
     else if (source == "WSL")
     {
-        // "wsl -l -q" lists distributions in UTF-16; Docker Desktops internal ones are excluded.
+        // "wsl -l -q" lists distributions in UTF-16; Docker Desktops internal ones are excluded. The program is the
+        // one in System32, else the one in PATH: a bare name would also be looked up in the current folder.
+        const QString windows = qEnvironmentVariable("SystemRoot");
+        QString program = windows.isEmpty() ? QString() : QDir(windows).filePath("System32/wsl.exe");
+        if (!QFileInfo(program).isFile())
+            program = QStandardPaths::findExecutable("wsl.exe");
         QProcess wsl;
-        wsl.start("wsl.exe", {"-l", "-q"});
-        if (wsl.waitForFinished(10000) && wsl.exitCode() == 0)
+        if (!program.isEmpty())
+            wsl.start(program, {"-l", "-q"});
+        if (!program.isEmpty() && wsl.waitForFinished(10000) && wsl.exitCode() == 0)
         {
             const auto raw = wsl.readAllStandardOutput();
             const auto list = QString::fromUtf16(reinterpret_cast<const char16_t *>(raw.constData()), raw.size() / 2);

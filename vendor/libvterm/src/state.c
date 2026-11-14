@@ -1262,7 +1262,7 @@ static int on_csi(const char *leader, const long args[], int argcount, const cha
     count = CSI_ARG_COUNT(args[0]);
     col = state->pos.col + count;
     UBOUND(col, row_width);
-    while (state->pos.col < col) {
+    while (state->pos.col < col && state->pos.col + state->combine_width <= row_width && state->combine_width > 0) {
       putglyph(state, state->combine_chars, state->combine_width, state->pos);
       state->pos.col += state->combine_width;
     }
@@ -2011,6 +2011,14 @@ static int on_resize(int rows, int cols, void *user)
     UBOUND(state->scrollregion_bottom, state->rows);
   if(state->scrollregion_right > -1)
     UBOUND(state->scrollregion_right, state->cols);
+  if(SCROLLREGION_BOTTOM(state) <= state->scrollregion_top) {
+    state->scrollregion_top = 0;
+    state->scrollregion_bottom = -1;
+  }
+  if(SCROLLREGION_RIGHT(state) <= SCROLLREGION_LEFT(state)) {
+    state->scrollregion_left = 0;
+    state->scrollregion_right = -1;
+  }
 
   VTermStateFields fields = {
     .pos       = state->pos,

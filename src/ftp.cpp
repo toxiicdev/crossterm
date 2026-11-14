@@ -11,11 +11,110 @@
 #include <QTimeZone>
 #ifdef Q_OS_WIN
 #include <windows.h>
+#include <io.h>
+#else
+#include <sys/stat.h>
 #endif
 
 static QString ui(const char *text)
 {
     return QCoreApplication::translate("CrossTerm", text);
+}
+
+// ---------------------------------------------------------------- shared with the SFTP browser
+
+QString fileSizeText(qint64 bytes)
+{
+    if (bytes < 0)
+        return {};
+    if (bytes < 1024)
+        return QString::number(bytes) + " B";
+    const double kb = double(bytes) / 1024;
+    if (kb < 1023.5)
+        return QString::number(qRound64(kb)) + " KB";
+    if (kb / 1024 < 1023.95)
+        return QString::number(kb / 1024, 'f', 1) + " MB";
+    return QString::number(kb / (1024 * 1024), 'f', 1) + " GB";
+}
+
+QIcon linkIcon(const QIcon &base, bool folder)
+{
+    static QIcon cache[2];
+    auto &composed = cache[folder];
+    if (!composed.isNull())
+        return composed;
+    for (const int scale : {1, 2})
+    {
+        QPixmap pixmap(QSize(16, 16) * scale);
+        pixmap.setDevicePixelRatio(scale);
+        pixmap.fill(Qt::transparent);
+        QPainter p(&pixmap);
+        p.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
+        base.paint(&p, QRect(0, 0, 16, 16));
+        // White badge with a blue arrow pointing up and right: readable on light and dark lists.
+        p.setPen(QPen(QColor("#6b7785"), 1));
+        p.setBrush(Qt::white);
+        p.drawRoundedRect(QRectF(0.5, 8.5, 7, 7), 1.5, 1.5);
+        p.setPen(QPen(QColor("#1769e0"), 1.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.drawLine(QPointF(2.4, 13.6), QPointF(5.5, 10.5));
+        p.drawPolyline(QPolygonF{{3.3, 10.5}, {5.5, 10.5}, {5.5, 12.7}});
+        p.end();
+        composed.addPixmap(pixmap);
+    }
+    return composed;
+}
+
+QString listedLinkTarget(const QString &line, const RemoteEntry &entry)
+{
+    const QString marker = ' ' + entry.name + " -> ";
+    const auto at = entry.link ? line.indexOf(marker) : -1;
+    return at < 0 ? QString() : line.mid(at + marker.size()).trimmed();
+}
+
+bool RemoteFileItem::operator<(const QTreeWidgetItem &other) const
+{
+    if (treeWidget() && treeWidget()->sortColumn() == 1)
+        return data(1, Qt::UserRole).toLongLong() < other.data(1, Qt::UserRole).toLongLong();
+    return QTreeWidgetItem::operator<(other);
+}
+
+void TransferRate::reset()
+{
+    clock.invalidate();
+    samples.clear();
+    shownAt = 0;
+    shown.clear();
+}
+
+bool TransferRate::add(qint64 done, qint64 total)
+{
+    if (!clock.isValid())
+        clock.start();
+    const qint64 now = clock.elapsed();
+    if (!samples.isEmpty() && done < samples.last().second)
+        samples.clear(); // restarted from an earlier offset
+    if (samples.isEmpty() || now - samples.last().first >= 250)
+        samples.append({now, done});
+    while (samples.size() > 2 && now - samples[1].first >= 3000)
+        samples.removeFirst(); // the oldest sample stays about 3 s back
+    const qint64 span = now - samples.first().first;
+    if (span < 500 || (!shown.isEmpty() && now - shownAt < 1000))
+        return false;
+    const double speed = double(done - samples.first().second) * 1000 / double(span);
+    QString next = fileSizeText(qint64(speed)) + "/s";
+    if (total > 0 && speed >= 1 && done <= total)
+    {
+        const qint64 left = qRound64(double(total - done) / speed);
+        const auto two = [](qint64 n) { return QString::number(n).rightJustified(2, '0'); };
+        next += QString(" — ") +
+                (left >= 3600 ? QString::number(left / 3600) + ':' + two(left / 60 % 60) : QString::number(left / 60)) + ':' +
+                two(left % 60);
+    }
+    shownAt = now;
+    if (next == shown)
+        return false;
+    shown = next;
+    return true;
 }
 
 static QString message(int code, const QString &text)
@@ -43,21 +142,34 @@ static QString modeString(int mode, QChar type)
     return text;
 }
 
-// MLSD lines (facts;name) or LIST in Unix or DOS/IIS format.
-static QList<RemoteEntry> parseEntries(const QByteArray &bytes, bool machine)
+// MLSD lines (facts;name) or LIST in Unix or DOS/IIS format. unparsed: lines in a format that is not understood
+// (blank lines, "total 12" and the "." and ".." rows do not count): the folder is not empty, it could not be read.
+static QList<RemoteEntry> parseEntries(const QByteArray &bytes, bool machine, QHash<QString, QString> *targets = nullptr,
+                                       int *unparsed = nullptr)
 {
     static const QRegularExpression dos("^(\\d{2}-\\d{2}-\\d{2,4})\\s+(\\d{1,2}:\\d{2}[AaPp][Mm])\\s+(<DIR>|\\d+)\\s+(.+)$");
+    static const QRegularExpression total("^total\\s+\\d+$", QRegularExpression::CaseInsensitiveOption);
+    auto skipped = [&](const QString &line)
+    {
+        const auto text = line.trimmed();
+        if (unparsed && !text.isEmpty() && !total.match(text).hasMatch())
+            ++*unparsed;
+    };
     QList<RemoteEntry> entries;
     for (auto line : QString::fromUtf8(bytes).split('\n', Qt::SkipEmptyParts))
     {
         if (line.endsWith('\r'))
             line.chop(1);
         RemoteEntry e;
+        QString target; // of a link, when the server tells it
         if (machine)
         {
             const int space = line.indexOf(' ');
             if (space < 0)
+            {
+                skipped(line);
                 continue;
+            }
             e.name = line.mid(space + 1);
             int mode = -1;
             for (const auto &fact : line.left(space).split(';', Qt::SkipEmptyParts))
@@ -70,6 +182,8 @@ static QList<RemoteEntry> parseEntries(const QByteArray &bytes, bool machine)
                         e.name.clear();
                     e.dir = type == "dir";
                     e.link = type.startsWith("os.unix=sl") || type.startsWith("os.unix=symlink");
+                    if (type.startsWith("os.unix=slink:")) // "OS.unix=slink:/target"
+                        target = value.mid(14);
                 }
                 else if (key == "size")
                     e.size = value.toLongLong();
@@ -91,14 +205,24 @@ static QList<RemoteEntry> parseEntries(const QByteArray &bytes, bool machine)
         {
             const auto m = dos.match(line);
             if (!m.hasMatch())
+            {
+                if (e.name.isEmpty()) // parseListing keeps the name of the "." and ".." rows it rejects
+                    skipped(line);
                 continue;
+            }
             e.dir = m.captured(3) == "<DIR>";
             e.size = e.dir ? 0 : m.captured(3).toLongLong();
             e.modified = m.captured(1) + ' ' + m.captured(2);
             e.name = m.captured(4);
         }
+        else
+            target = listedLinkTarget(line, e);
         if (!e.name.isEmpty() && e.name != "." && e.name != "..")
+        {
             entries << e;
+            if (targets && !target.isEmpty())
+                targets->insert(e.name, target);
+        }
     }
     return entries;
 }
@@ -122,11 +246,16 @@ protected:
     }
 };
 
-// Names received from the server in downloaded folders: no separators, drives or ".." (they would escape the local folder).
+// Names received from the server and written locally: no separators, drives or ".." (they would escape the local folder).
 static bool safeName(const QString &name)
 {
-    return !name.isEmpty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !name.contains(':') &&
-           !name.contains(QChar(0));
+#ifdef Q_OS_WIN
+    // Also "\", drives/streams, and names of dots and spaces only (Windows drops trailing ones: ".. " is "..").
+    static const QRegularExpression dots("^[. ]+$");
+    if (name.contains('\\') || name.contains(':') || dots.match(name).hasMatch())
+        return false;
+#endif
+    return !name.isEmpty() && name != "." && name != ".." && !name.contains('/') && !name.contains(QChar(0));
 }
 
 static QString child(const QString &dir, const QString &name)
@@ -142,10 +271,44 @@ struct FtpClient::Plan
         QString source, target;
         qint64 size;
     };
+    struct Folder
+    {
+        QString remote, local;
+        int depth;
+    };
     QStringList dirs;
     QList<File> files;
+    QList<Folder> todo; // download: remote folders still to list
     qint64 total = 0;
 };
+
+// What the earlier attempts of one transfer left behind. Resume continues only from these, never from a file
+// that merely has the same name (new data would be spliced onto unrelated content).
+struct FtpClient::Trace
+{
+    QHash<QString, QString> done; // completed files: target -> stamp (size; uploads: and time of the local source)
+    QSet<QString> parts;          // download: ".part" files this transfer wrote
+    QString partial, stamp;       // upload: remote file whose STOR the server accepted, stamp of its local source
+};
+
+// Folders nested deeper than this are a loop (a link listed as a folder), not a real tree.
+static const int maxDepth = 64;
+
+// RFC 959: 257 "<path>" text; a quote inside the path is doubled. False if there is no quoted path.
+static bool quotedPath(const QString &text, QString &path)
+{
+    path.clear();
+    for (auto i = text.indexOf('"') + 1; i > 0 && i < text.size(); ++i)
+    {
+        if (text[i] != '"')
+            path += text[i];
+        else if (i + 1 < text.size() && text[i + 1] == '"')
+            path += text[++i];
+        else
+            return true;
+    }
+    return false;
+}
 
 QString FtpClient::fingerprint(const QSslCertificate &certificate)
 {
@@ -304,6 +467,14 @@ void FtpClient::readReplies()
         }
         dispatch(code, line.mid(4));
     }
+    if (input.size() > 65536 || multiText.size() > (1 << 20)) // endless line or multi-line reply: not an FTP server
+    {
+        input.clear();
+        multiline = 0;
+        multiText.clear();
+        loggedIn = false;
+        control->abort(); // the running job fails with "Connection closed by the server."
+    }
 }
 
 void FtpClient::dispatch(int code, const QString &text)
@@ -355,7 +526,7 @@ void FtpClient::connectToHost(const QString &host, quint16 port, const QString &
     enqueue(std::move(done),
             [=]
             {
-                loggedIn = mlsd = false;
+                loggedIn = mlsd = rejected = false;
                 epsv = true;
                 control->abort();
                 input.clear();
@@ -376,6 +547,7 @@ void FtpClient::connectToHost(const QString &host, quint16 port, const QString &
                          {
                              if (code == 230)
                                  return afterLogin();
+                             rejected = code == 530;
                              if (code != 331)
                                  return code < 200 ? void() : fail(message(code, text));
                              send("PASS " + secret,
@@ -383,6 +555,7 @@ void FtpClient::connectToHost(const QString &host, quint16 port, const QString &
                                   {
                                       if (code < 200)
                                           return;
+                                      rejected = code == 530;
                                       code == 230 || code == 202 ? afterLogin() : fail(message(code, text));
                                   });
                          });
@@ -405,6 +578,9 @@ void FtpClient::connectToHost(const QString &host, quint16 port, const QString &
                                  return fail(message(code, text));
                              afterHandshake = sendUser;
                              watchdog->start(timeout);
+                             // Replies received in clear after 234 are not trusted (injection before TLS).
+                             input.clear();
+                             multiline = 0;
                              control->startClientEncryption();
                          });
                 };
@@ -576,11 +752,13 @@ void FtpClient::secureData(QSslSocket *socket, std::function<void()> ready)
 
 // The job ends only after the server's final reply and with the data channel closed.
 void FtpClient::transfer(const QString &command, std::shared_ptr<QIODevice> source, std::function<bool(const QByteArray &)> sink,
-                         Progress progress, qint64 total, std::function<void()> then)
+                         Progress progress, qint64 total, std::function<void()> then, qint64 restart,
+                         std::function<QString(bool)> resumed, std::function<void()> began)
 {
     struct State
     {
         bool started = false, ready = false, replied = false, closed = false, closing = false, settled = false;
+        bool cut = false; // upload: the peer closed the data connection before everything was sent
         qint64 done = 0;
         QString error;
         QSslSocket *sock = nullptr;
@@ -599,6 +777,8 @@ void FtpClient::transfer(const QString &command, std::shared_ptr<QIODevice> sour
             sock->deleteLater();
         }
         closeListener();
+        if (st->error.isEmpty() && st->cut) // not complete, whatever the final reply says
+            st->error = ui("Connection closed by the server.");
         st->error.isEmpty() ? then() : fail(st->error);
     };
     auto drop = [=](const QString &error)
@@ -664,6 +844,7 @@ void FtpClient::transfer(const QString &command, std::shared_ptr<QIODevice> sour
                          [=]
                          {
                              drain();
+                             st->cut = source && (!st->closing || sock->bytesToWrite() > 0);
                              st->closed = true;
                              settle();
                          });
@@ -687,13 +868,29 @@ void FtpClient::transfer(const QString &command, std::shared_ptr<QIODevice> sour
     {
         if (code < 200)
         {
+            if (!st->started && began)
+                began();
             st->started = true;
             return pump();
         }
         st->replied = true;
         if (code >= 300)
             return drop(message(code, text)), settle();
+        if (!st->closed)
+            watchdog->start(timeout); // final reply before the end of the data: a data channel that never closes times out
         settle();
+    };
+    // RFC 3659: REST must immediately precede RETR/STOR, so it goes after PASV/EPSV/PORT/EPRT.
+    auto issue = [=]
+    {
+        if (restart <= 0 || !resumed)
+            return send(command, replied);
+        send("REST " + QString::number(restart),
+             [=](int code, const QString &)
+             {
+                 if (code >= 200)
+                     send(resumed(code == 350), replied);
+             });
     };
     if (passive)
     {
@@ -703,7 +900,7 @@ void FtpClient::transfer(const QString &command, std::shared_ptr<QIODevice> sour
                 auto *sock = new QSslSocket(ctx);
                 attach(sock);
                 sock->connectToHost(control->peerAddress(), port);
-                send(command, replied);
+                issue();
             });
     }
     openActive(
@@ -727,11 +924,11 @@ void FtpClient::transfer(const QString &command, std::shared_ptr<QIODevice> sour
                                      attach(sock);
                                  }
                              });
-            send(command, replied);
+            issue();
         });
 }
 
-void FtpClient::listing(const QString &path, std::function<void(const QList<RemoteEntry> &)> then)
+void FtpClient::listing(const QString &path, std::function<void(const QList<RemoteEntry> &)> then, bool strict)
 {
     const bool machine = usesMlsd();
     auto buffer = std::make_shared<QByteArray>();
@@ -741,7 +938,17 @@ void FtpClient::listing(const QString &path, std::function<void(const QList<Remo
                  buffer->append(bytes);
                  return true;
              },
-             {}, -1, [=] { then(parseEntries(*buffer, machine)); });
+             {}, -1,
+             [=]
+             {
+                 int unparsed = 0;
+                 targets.clear();
+                 const auto entries = parseEntries(*buffer, machine, &targets, &unparsed);
+                 // Unknown format: not an empty folder. Copying or deleting a tree needs every entry.
+                 if (unparsed && (strict || entries.isEmpty()))
+                     return fail(ui("Unrecognized folder listing from the server."));
+                 then(entries);
+             });
 }
 
 void FtpClient::list(const QString &path, Listed done)
@@ -759,6 +966,36 @@ void FtpClient::list(const QString &path, Listed done)
             });
 }
 
+// One job: another queued operation (a second navigation) cannot run between PWD and the listing.
+void FtpClient::enter(const QString &path,
+                      std::function<void(bool, const QString &, const QString &, const QList<RemoteEntry> &)> done)
+{
+    auto where = std::make_shared<QString>();
+    auto result = std::make_shared<QList<RemoteEntry>>();
+    enqueue([=](bool ok, const QString &error) { done(ok, error, *where, *result); },
+            [=]
+            {
+                auto show = [=]
+                {
+                    send("PWD",
+                         [=](int code, const QString &text)
+                         {
+                             if (code < 200)
+                                 return;
+                             if (code != 257 || !quotedPath(text, *where))
+                                 return fail(message(code, text));
+                             listing({},
+                                     [=](const QList<RemoteEntry> &entries)
+                                     {
+                                         *result = entries;
+                                         complete(true);
+                                     });
+                         });
+                };
+                path.isEmpty() ? show() : simple("CWD " + path, show);
+            });
+}
+
 void FtpClient::cwd(const QString &path, Done done)
 {
     enqueue(std::move(done), [=] { simple("CWD " + path, [this] { complete(true); }); });
@@ -773,19 +1010,18 @@ void FtpClient::pwd(std::function<void(bool, const QString &, const QString &)> 
                 send("PWD",
                      [=](int code, const QString &text)
                      {
-                         const int a = text.indexOf('"'), b = text.lastIndexOf('"');
                          if (code < 200)
                              return;
-                         if (code != 257 || a < 0 || b <= a)
+                         if (code != 257 || !quotedPath(text, *result))
                              return fail(message(code, text));
-                         *result = text.mid(a + 1, b - a - 1).replace("\"\"", "\"");
                          complete(true);
                      });
             });
 }
 
-// Single file: writes to "<local>.part" (or resumes from it, or from the local file itself) and renames at the end.
-void FtpClient::fetch(const QString &remote, const QString &local, bool resume, Progress progress, std::function<void()> then)
+// Single file: writes to "<local>.part" (or resumes the one this transfer wrote) and renames it at the end.
+void FtpClient::fetch(const QString &remote, const QString &local, std::shared_ptr<Trace> trace, Progress progress,
+                      std::function<void()> then)
 {
     send("SIZE " + remote,
          [=](int code, const QString &text)
@@ -793,28 +1029,43 @@ void FtpClient::fetch(const QString &remote, const QString &local, bool resume, 
              if (code < 200)
                  return;
              const qint64 total = code == 213 ? text.trimmed().toLongLong() : -1;
+             // Resumed folder: a file this transfer already completed, still the same size, is not fetched again.
+             const auto kept = trace->done.value(local);
+             if (!kept.isEmpty() && QFileInfo(local).isFile() && QString::number(QFileInfo(local).size()) == kept &&
+                 (total < 0 || QString::number(total) == kept))
+             {
+                 if (progress)
+                     progress(kept.toLongLong(), kept.toLongLong());
+                 return then();
+             }
              const auto part = local + ".part";
-             const auto target = resume && !QFileInfo::exists(part) && QFileInfo(local).isFile() ? local : part;
-             qint64 offset = resume && QFileInfo(target).isFile() ? QFileInfo(target).size() : 0;
+             const QFileInfo left(part);
+             // Only the partial file this transfer wrote is continued: never the local file, never through a link.
+             qint64 offset = trace->parts.contains(part) && left.isFile() && !left.isSymLink() ? left.size() : 0;
              if (total >= 0 && offset > total)
-                 offset = 0; // local file longer than the remote one: restart from zero
-             auto file = std::make_shared<QFile>(target);
+                 offset = 0; // partial file longer than the remote one: restart from zero
+             if (!offset && left.isSymLink() && !QFile::remove(part))
+                 return fail(ui("Cannot write the local file.")); // a planted link: writing would follow it
+             auto file = std::make_shared<QFile>(part);
              if (!file->open(offset ? QIODevice::OpenMode(QIODevice::Append) : QIODevice::WriteOnly | QIODevice::Truncate))
                  return fail(file->errorString());
+             trace->parts.insert(part);
              sinkFile = file;
              auto finish = [=]
              {
                  const bool flushed = file->flush();
+                 // Fewer bytes than the server announced: the data connection was cut. The .part file stays for Resume.
+                 if (flushed && total >= 0 && file->size() < total)
+                     return fail(ui("Connection closed by the server."));
                  file->close();
                  sinkFile.reset();
                  if (!flushed)
                      return fail(file->errorString());
-                 if (target != local)
-                 {
-                     QFile::remove(local);
-                     if (!QFile::rename(target, local))
-                         return fail(ui("Cannot write the local file."));
-                 }
+                 QFile::remove(local);
+                 if (!QFile::rename(part, local))
+                     return fail(ui("Cannot write the local file."));
+                 trace->parts.remove(part);
+                 trace->done.insert(local, QString::number(QFileInfo(local).size()));
                  then();
              };
              if (total >= 0 && offset == total && offset > 0)
@@ -823,45 +1074,66 @@ void FtpClient::fetch(const QString &remote, const QString &local, bool resume, 
                      progress(total, total);
                  return finish(); // already complete
              }
-             auto go = [=](qint64 from)
+             auto from = std::make_shared<qint64>(offset);
+             auto resumed = [=](bool accepted)
              {
-                 if (!from)
+                 if (!accepted)
+                 {
+                     *from = 0; // REST not supported: full download
                      file->resize(0);
+                 }
                  if (progress)
-                     progress(from, total);
-                 transfer(
-                     "RETR " + remote, nullptr, [file](const QByteArray &bytes) { return file->write(bytes) == bytes.size(); },
-                     progress ? Progress([=](qint64 n, qint64) { progress(from + n, total); }) : Progress(), total, finish);
+                     progress(*from, total);
+                 return "RETR " + remote;
              };
-             if (!offset)
-                 return go(0);
-             send("REST " + QString::number(offset),
-                  [=](int code, const QString &)
-                  {
-                      if (code >= 200)
-                          go(code == 350 ? offset : 0); // REST not supported: full download
-                  });
+             if (!offset && progress)
+                 progress(0, total);
+             transfer(
+                 "RETR " + remote, nullptr, [file](const QByteArray &bytes) { return file->write(bytes) == bytes.size(); },
+                 progress ? Progress([=](qint64 n, qint64) { progress(*from + n, total); }) : Progress(), total, finish, offset,
+                 resumed);
          });
 }
 
-// Single file: with resume, continues from the remote size (REST+STOR, APPE if REST is rejected).
-void FtpClient::store(const QString &local, const QString &remote, bool resume, Progress progress, std::function<void()> then)
+// Single file. Continued (REST+STOR, APPE if REST is rejected) only if this transfer started that STOR and the local
+// file is still the same; a file it already completed is skipped; anything else is sent from the start.
+void FtpClient::store(const QString &local, const QString &remote, std::shared_ptr<Trace> trace, Progress progress,
+                      std::function<void()> then)
 {
     auto file = std::make_shared<QFile>(local);
     if (!file->open(QIODevice::ReadOnly))
         return fail(file->errorString());
     const qint64 size = file->size();
-    auto go = [=](qint64 from, const QString &verb)
+    const auto stamp = QString::number(size) + ' ' + QString::number(QFileInfo(local).lastModified().toMSecsSinceEpoch());
+    auto finished = [=]
+    {
+        trace->partial.clear();
+        trace->done.insert(remote, stamp);
+        then();
+    };
+    if (trace->done.value(remote) == stamp)
+    {
+        if (progress)
+            progress(size, size);
+        return then(); // sent by an earlier attempt
+    }
+    auto go = [=](qint64 from)
     {
         if (!file->seek(from))
             return fail(file->errorString());
         if (progress)
             progress(from, size);
-        transfer(verb + ' ' + remote, file, {},
-                 progress ? Progress([=](qint64 n, qint64) { progress(from + n, size); }) : Progress(), size, then);
+        transfer(
+            "STOR " + remote, file, {}, progress ? Progress([=](qint64 n, qint64) { progress(from + n, size); }) : Progress(),
+            size, finished, from, [remote](bool accepted) { return (accepted ? "STOR " : "APPE ") + remote; }, // REST rejected
+            [=]
+            {
+                trace->partial = remote;
+                trace->stamp = stamp;
+            });
     };
-    if (!resume)
-        return go(0, "STOR");
+    if (trace->partial != remote || trace->stamp != stamp)
+        return go(0);
     send("SIZE " + remote,
          [=](int code, const QString &text)
          {
@@ -872,45 +1144,41 @@ void FtpClient::store(const QString &local, const QString &remote, bool resume, 
              {
                  if (progress)
                      progress(size, size);
-                 return then(); // already complete
+                 return finished(); // already complete
              }
-             if (have <= 0 || have > size)
-                 return go(0, "STOR");
-             send("REST " + QString::number(have),
-                  [=](int code, const QString &)
-                  {
-                      if (code >= 200)
-                          code == 350 ? go(have, "STOR") : go(have, "APPE");
-                  });
+             go(have <= 0 || have > size ? 0 : have);
          });
 }
 
-// Breadth-first walk of remote folders: todo = (remote folder, local folder).
-void FtpClient::scanRemote(std::shared_ptr<Plan> plan, QList<std::pair<QString, QString>> todo, std::function<void()> then)
+// Breadth-first walk of the remote folders in plan->todo.
+void FtpClient::scanRemote(std::shared_ptr<Plan> plan, std::function<void()> then)
 {
-    if (todo.isEmpty())
+    if (plan->todo.isEmpty())
         return then();
-    const auto next = todo.takeFirst();
-    const QString remote = next.first, local = next.second;
-    plan->dirs << local;
-    listing(remote,
-            [=](const QList<RemoteEntry> &entries) mutable
+    const auto next = plan->todo.takeFirst();
+    if (next.depth > maxDepth)
+        return fail(ui("Invalid path.")); // deeper than any real tree: a loop
+    plan->dirs << next.local;
+    listing(
+        next.remote,
+        [=](const QList<RemoteEntry> &entries)
+        {
+            for (const auto &e : entries)
             {
-                for (const auto &e : entries)
+                if (!safeName(e.name))
+                    return fail(ui("Unsafe file name from the server: %1").arg(e.name));
+                const auto from = child(next.remote, e.name), to = QDir(next.local).filePath(e.name);
+                if (e.dir && !e.link)
+                    plan->todo.append({from, to, next.depth + 1});
+                else
                 {
-                    if (!safeName(e.name))
-                        return fail(ui("Unsafe file name from the server: %1").arg(e.name));
-                    const auto from = child(remote, e.name), to = QDir(local).filePath(e.name);
-                    if (e.dir && !e.link)
-                        todo.append({from, to});
-                    else
-                    {
-                        plan->files.append({from, to, e.size});
-                        plan->total += e.size;
-                    }
+                    plan->files.append({from, to, e.size});
+                    plan->total += e.size;
                 }
-                scanRemote(plan, todo, then);
-            });
+            }
+            scanRemote(plan, then);
+        },
+        true);
 }
 
 void FtpClient::makeDirs(std::shared_ptr<Plan> plan, int index, std::function<void()> then)
@@ -926,7 +1194,8 @@ void FtpClient::makeDirs(std::shared_ptr<Plan> plan, int index, std::function<vo
          });
 }
 
-void FtpClient::runPlan(std::shared_ptr<Plan> plan, int index, qint64 base, bool upload, bool resume, Progress progress)
+void FtpClient::runPlan(std::shared_ptr<Plan> plan, int index, qint64 base, bool upload, std::shared_ptr<Trace> trace,
+                        Progress progress)
 {
     if (index == plan->files.size())
     {
@@ -936,64 +1205,89 @@ void FtpClient::runPlan(std::shared_ptr<Plan> plan, int index, qint64 base, bool
     }
     const auto file = plan->files[index];
     auto step = progress ? Progress([=](qint64 n, qint64) { progress(base + n, plan->total); }) : Progress();
-    auto next = [=] { runPlan(plan, index + 1, base + file.size, upload, resume, progress); };
-    upload ? store(file.source, file.target, resume, step, next) : fetch(file.source, file.target, resume, step, next);
+    auto next = [=] { runPlan(plan, index + 1, base + file.size, upload, trace, progress); };
+    upload ? store(file.source, file.target, trace, step, next) : fetch(file.source, file.target, trace, step, next);
+}
+
+// The trace of an interrupted transfer; a new one when there is none or the transfer starts over.
+std::shared_ptr<FtpClient::Trace> FtpClient::traced(const QString &key, bool resume)
+{
+    auto &trace = traces[key];
+    if (!trace || !resume)
+        trace = std::make_shared<Trace>();
+    return trace;
 }
 
 void FtpClient::download(const QString &remote, const QString &localFile, Progress progress, Done done, int flags)
 {
-    enqueue(std::move(done),
-            [=]
-            {
-                const bool resume = flags & Resume;
-                if (!(flags & Recursive))
-                    return fetch(remote, localFile, resume, progress, [this] { complete(true); });
-                auto plan = std::make_shared<Plan>();
-                scanRemote(plan, {{remote, localFile}},
-                           [=]
+    const auto key = "D\n" + localFile + '\n' + remote;
+    enqueue(
+        [=](bool ok, const QString &error)
+        {
+            if (ok)
+                traces.remove(key);
+            if (done)
+                done(ok, error);
+        },
+        [=]
+        {
+            const auto trace = traced(key, flags & Resume);
+            if (!(flags & Recursive))
+                return fetch(remote, localFile, trace, progress, [this] { complete(true); });
+            auto plan = std::make_shared<Plan>();
+            plan->todo.append({remote, localFile, 0});
+            scanRemote(plan,
+                       [=]
+                       {
+                           for (const auto &dir : plan->dirs)
                            {
-                               for (const auto &dir : plan->dirs)
-                               {
-                                   if (!QDir().mkpath(dir))
-                                       return fail(ui("Cannot create the local folder %1.").arg(QDir::toNativeSeparators(dir)));
-                               }
-                               runPlan(plan, 0, 0, false, resume, progress);
-                           });
-            });
+                               if (!QDir().mkpath(dir))
+                                   return fail(ui("Cannot create the local folder %1.").arg(QDir::toNativeSeparators(dir)));
+                           }
+                           runPlan(plan, 0, 0, false, trace, progress);
+                       });
+        });
 }
 
 void FtpClient::upload(const QString &localFile, const QString &remote, Progress progress, Done done, int flags)
 {
-    enqueue(std::move(done),
-            [=]
+    const auto key = "U\n" + localFile + '\n' + remote;
+    enqueue(
+        [=](bool ok, const QString &error)
+        {
+            if (ok)
+                traces.remove(key);
+            if (done)
+                done(ok, error);
+        },
+        [=]
+        {
+            const auto trace = traced(key, flags & Resume);
+            if (!(flags & Recursive))
+                return store(localFile, remote, trace, progress, [this] { complete(true); });
+            if (!QFileInfo(localFile).isDir())
+                return fail(ui("Not a folder: %1").arg(QDir::toNativeSeparators(localFile)));
+            auto plan = std::make_shared<Plan>();
+            const QDir base(localFile);
+            // Local links are skipped: no cycles, and nothing outside the chosen folder is sent.
+            QDirIterator it(localFile, QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System | QDir::NoSymLinks,
+                            QDirIterator::Subdirectories);
+            while (it.hasNext())
             {
-                const bool resume = flags & Resume;
-                if (!(flags & Recursive))
-                    return store(localFile, remote, resume, progress, [this] { complete(true); });
-                if (!QFileInfo(localFile).isDir())
-                    return fail(ui("Not a folder: %1").arg(QDir::toNativeSeparators(localFile)));
-                auto plan = std::make_shared<Plan>();
-                const QDir base(localFile);
-                // ponytail: local links are skipped (no cycles); follow them only if requested.
-                QDirIterator it(localFile,
-                                QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System | QDir::NoSymLinks,
-                                QDirIterator::Subdirectories);
-                while (it.hasNext())
+                const auto info = it.nextFileInfo();
+                const auto target = child(remote, base.relativeFilePath(info.filePath()));
+                if (info.isDir())
+                    plan->dirs << target;
+                else
                 {
-                    const auto info = it.nextFileInfo();
-                    const auto target = child(remote, base.relativeFilePath(info.filePath()));
-                    if (info.isDir())
-                        plan->dirs << target;
-                    else
-                    {
-                        plan->files.append({info.filePath(), target, info.size()});
-                        plan->total += info.size();
-                    }
+                    plan->files.append({info.filePath(), target, info.size()});
+                    plan->total += info.size();
                 }
-                plan->dirs.sort(); // the parent is a prefix: it sorts before its children
-                plan->dirs.prepend(remote);
-                makeDirs(plan, 0, [=] { runPlan(plan, 0, 0, true, resume, progress); });
-            });
+            }
+            plan->dirs.sort(); // the parent is a prefix: it sorts before its children
+            plan->dirs.prepend(remote);
+            makeDirs(plan, 0, [=] { runPlan(plan, 0, 0, true, trace, progress); });
+        });
 }
 
 void FtpClient::mkdir(const QString &path, Done done)
@@ -1012,26 +1306,42 @@ void FtpClient::removeDirectory(const QString &path, bool recursive, Done done)
             [=]
             {
                 if (recursive)
-                    removeTree(path, [this] { complete(true); });
+                    removeTree(path, 0, [this] { complete(true); });
                 else
                     simple("RMD " + path, [this] { complete(true); });
             });
 }
 
-void FtpClient::removeTree(const QString &path, std::function<void()> then)
+// DELE first: a link that the listing reports as a folder is removed as a link, its target is never emptied.
+// Only what DELE refuses (a real folder) is listed and emptied.
+void FtpClient::removeTree(const QString &path, int depth, std::function<void()> then)
 {
-    listing(path, [=](const QList<RemoteEntry> &entries) { removeEntries(path, entries, then); });
+    if (depth > maxDepth)
+        return fail(ui("Invalid path.")); // deeper than any real tree: a loop
+    send("DELE " + path,
+         [=](int code, const QString &)
+         {
+             if (code < 200)
+                 return;
+             if (code < 300)
+                 return then();
+             listing(
+                 path, [=](const QList<RemoteEntry> &entries)
+                 { removeEntries(path, std::make_shared<const QList<RemoteEntry>>(entries), 0, depth, then); }, true);
+         });
 }
 
-void FtpClient::removeEntries(const QString &dir, QList<RemoteEntry> rest, std::function<void()> then)
+// Shared list and index: no copy of the remaining entries at each step.
+void FtpClient::removeEntries(const QString &dir, std::shared_ptr<const QList<RemoteEntry>> entries, int index, int depth,
+                              std::function<void()> then)
 {
-    if (rest.isEmpty())
+    if (index >= entries->size())
         return simple("RMD " + dir, then);
-    const auto entry = rest.takeFirst();
+    const auto &entry = entries->at(index);
     const auto path = child(dir, entry.name);
-    auto next = [=] { removeEntries(dir, rest, then); };
+    auto next = [=] { removeEntries(dir, entries, index + 1, depth, then); };
     // Links are deleted, not followed.
-    entry.dir && !entry.link ? removeTree(path, next) : simple("DELE " + path, next);
+    entry.dir && !entry.link ? removeTree(path, depth + 1, next) : simple("DELE " + path, next);
 }
 
 void FtpClient::rename(const QString &from, const QString &to, Done done)
@@ -1076,6 +1386,15 @@ struct FtpPanel::Transfer
     bool upload = false, folder = false;
     QTreeWidgetItem *item = nullptr;
     QProgressBar *bar = nullptr;
+    TransferRate rate; // speed and time left, shown as the status while running
+};
+
+// A listed entry (or a local file to upload) with its absolute remote path.
+struct FtpPanel::Item
+{
+    QString name, local, remote;
+    bool folder = false;
+    qint64 size = -1;
 };
 
 FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> passwordProvider, QWidget *parent)
@@ -1136,47 +1455,68 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
     action("download", "Download selected files and folders",
            [this]
            {
-               const auto names = selectedNames();
-               if (names.isEmpty())
+               // Absolute paths before any dialog: a navigation may complete while it is open, and the selection
+               // must not be applied to the new folder.
+               const auto items = picked(selectedNames());
+               if (items.isEmpty())
                    return;
                const auto folder = QFileDialog::getExistingDirectory(
                    this, ui("Download to folder"), QStandardPaths::writableLocation(QStandardPaths::DownloadLocation));
                if (!folder.isEmpty())
-                   download(names, folder);
+                   fetchItems(items, folder);
            });
-    action("upload", "Upload to current folder", [this] { upload(QFileDialog::getOpenFileNames(this, ui("Upload files"))); });
+    action("upload", "Upload to current folder",
+           [this]
+           {
+               const auto folder = listed;
+               const auto chosen = QFileDialog::getOpenFileNames(this, ui("Upload files"));
+               if (chosen.isEmpty())
+                   return;
+               if (folder != listed) // another folder is shown now: not the one the user was uploading to
+                   return status->setText(ui("Aborted."));
+               upload(chosen);
+           });
     action("refresh", "Refresh current folder", [this] { refresh(); }, QKeySequence(Qt::Key_F5));
     action("newfolder", "Create new directory",
            [this]
            {
+               const auto folder = listed;
                const auto name = QInputDialog::getText(this, ui("New directory"), ui("Directory name:")).trimmed();
-               if (!name.isEmpty())
-                   makeDirectory(name);
+               if (!name.isEmpty() && !folder.isEmpty())
+                   operate([=](FtpClient::Done done) { ftp->mkdir(child(folder, name), done); });
            });
     action(
         "delete", "Delete selected files",
         [this]
         {
-            const auto names = selectedNames();
-            if (!names.isEmpty() &&
+            const auto items = picked(selectedNames());
+            QStringList names;
+            for (const auto &item : items)
+                names << item.name;
+            if (!items.isEmpty() &&
                 QMessageBox::question(this, ui("Delete"),
                                       ui("Delete %1 selected item(s)? Folders are deleted with all their contents.")
                                           .append("\n%2")
                                           .arg(names.size())
                                           .arg(names.mid(0, 10).join('\n'))) == QMessageBox::Yes)
-                removeEntries(names);
+                removeItems(items);
         },
         QKeySequence(Qt::Key_Delete));
     action(
         "rename", "Rename",
         [this]
         {
-            const auto names = selectedNames();
-            if (names.size() != 1)
+            const auto items = picked(selectedNames());
+            if (items.size() != 1)
                 return;
-            const auto next = QInputDialog::getText(this, ui("Rename"), ui("New name:"), QLineEdit::Normal, names[0]).trimmed();
-            if (!next.isEmpty() && next != names[0])
-                renameEntry(names[0], next);
+            const auto folder = listed;
+            QStringList siblings;
+            for (const auto &e : shown)
+                siblings << e.name;
+            const auto name = items[0].name;
+            const auto next = QInputDialog::getText(this, ui("Rename"), ui("New name:"), QLineEdit::Normal, name).trimmed();
+            if (!next.isEmpty() && next != name)
+                renameItem(items[0].remote, folder, next, siblings);
         },
         QKeySequence(Qt::Key_F2));
 
@@ -1207,9 +1547,16 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
                     return browse(join(name));
                 if (!entry)
                     return;
-                // Open with the default application from a temporary copy (no reload).
-                const auto local = QDir(QDir::temp().filePath("CrossTerm-ftp")).filePath(name);
-                QDir().mkpath(QFileInfo(local).path());
+                if (!safeName(name)) // from the server: it would escape the temporary folder
+                    return status->setText(ui("Unsafe file name from the server: %1").arg(name));
+                // Open with the default application from a temporary copy (no reload): a private folder of this panel
+                // (owner only, removed with it) and a new subfolder for each open, never a fixed shared path.
+                if (!scratch)
+                    scratch = std::make_unique<QTemporaryDir>();
+                const auto folder = scratch->filePath(QString::number(++opened));
+                if (!scratch->isValid() || !QDir().mkpath(folder))
+                    return status->setText(ui("Cannot create the local folder %1.").arg(QDir::toNativeSeparators(folder)));
+                const auto local = QDir(folder).filePath(name);
                 ftp->download(join(name), local, {},
                               [this, local](bool ok, const QString &error)
                               {
@@ -1252,7 +1599,8 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
     }
     row->addStretch();
     box->addLayout(row);
-    connect(cancel, &QPushButton::clicked, this, [this] { ftp->abort(); }); // ponytail: cancels the whole FTP queue
+    // One session runs one operation at a time: Cancel stops the current one and the queued ones (Resume restarts them).
+    connect(cancel, &QPushButton::clicked, this, [this] { ftp->abort(); });
     connect(resume, &QPushButton::clicked, this,
             [this]
             {
@@ -1324,8 +1672,14 @@ void FtpPanel::ensure(std::function<void()> then, std::function<void(const QStri
                        [this](bool ok, const QString &error)
                        {
                            connecting = false;
-                           if (!ok && error.startsWith("530"))
-                               password.clear(); // the password is asked again on the next attempt
+                           const bool rejected = !ok && ftp->loginRejected();
+                           if (rejected || (!ok && error.startsWith("530")))
+                               password.clear(); // the provider is asked again on the next attempt
+                           // Before the waiting requests go on or fail: the window forgets or keeps what it gave.
+                           if (rejected && onLoginRejected)
+                               onLoginRejected();
+                           else if (ok && onLoggedIn)
+                               onLoggedIn();
                            const auto jobs = std::exchange(waiting, {});
                            for (const auto &[then, failed] : jobs)
                                ok ? then() : failed(error);
@@ -1346,28 +1700,20 @@ void FtpPanel::browse(const QString &dir)
     ensure(
         [=]
         {
-            auto show = [=]
-            {
-                ftp->pwd(
-                    [=](bool ok, const QString &error, const QString &where)
-                    {
-                        if (!ok)
-                            return finish(error);
-                        ftp->list({},
-                                  [=](bool ok, const QString &error, const QList<RemoteEntry> &entries)
-                                  {
-                                      if (ok)
-                                      {
-                                          listed = where;
-                                          fill(entries);
-                                      }
-                                      finish(ok ? QString() : error);
-                                  });
-                    });
-            };
-            if (dir.isEmpty())
-                return show();
-            ftp->cwd(dir, [=](bool ok, const QString &error) { ok ? show() : finish(error); });
+            // One job for CWD, PWD and the listing: the path and the entries always belong to the same folder.
+            ftp->enter(dir,
+                       [=](bool ok, const QString &error, const QString &where, const QList<RemoteEntry> &entries)
+                       {
+                           if (ok)
+                           {
+                               listed = where;
+                               shownTargets = ftp->linkTargets();
+                               fill(entries);
+                           }
+                           else
+                               path->setText(listed); // the folder still shown
+                           finish(ok ? QString() : error);
+                       });
         },
         finish);
 }
@@ -1384,14 +1730,18 @@ void FtpPanel::fill(const QList<RemoteEntry> &entries)
               { return a.dir != b.dir ? a.dir : a.name.compare(b.name, Qt::CaseInsensitive) < 0; });
     path->setText(listed);
     files->clear();
-    auto *up = new QTreeWidgetItem(files, {".."});
+    auto *up = new RemoteFileItem(files, {".."});
     up->setIcon(0, icon("parent"));
+    up->setData(1, Qt::UserRole, qint64(-2)); // first when sorted by size
+    const auto folderIcon = icon("folder"), fileIcon = icon("file");
     for (const auto &e : shown)
     {
-        auto *item =
-            new QTreeWidgetItem(files, {e.name, e.dir ? QString() : QLocale().formattedDataSize(e.size), e.modified, e.access});
-        item->setIcon(0, icon(e.dir ? "folder" : "file"));
+        auto *item = new RemoteFileItem(files, {e.name, e.dir ? QString() : fileSizeText(e.size), e.modified, e.access});
+        item->setData(1, Qt::UserRole, e.dir ? qint64(-1) : e.size);
+        item->setIcon(0, !e.link ? (e.dir ? folderIcon : fileIcon) : linkIcon(e.dir ? folderIcon : fileIcon, e.dir));
         item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+        if (const auto target = e.link ? shownTargets.value(e.name) : QString(); !target.isEmpty())
+            item->setToolTip(0, e.name + " → " + target);
     }
 }
 
@@ -1447,33 +1797,59 @@ void FtpPanel::operate(std::function<void(FtpClient::Done)> op)
 
 void FtpPanel::makeDirectory(const QString &name)
 {
+    if (listed.isEmpty())
+        return;
     const auto target = join(name);
     operate([=](FtpClient::Done done) { ftp->mkdir(target, done); });
 }
 
+QList<FtpPanel::Item> FtpPanel::picked(const QStringList &names) const
+{
+    QList<Item> items;
+    for (const auto &name : names)
+    {
+        if (listed.isEmpty())
+            break; // nothing listed yet: there is no folder to act on
+        const auto *entry = find(name);
+        const bool dir = entry && entry->dir;
+        items.append({name, {}, join(name), dir && !entry->link, entry && !dir ? entry->size : -1});
+    }
+    return items;
+}
+
 void FtpPanel::renameEntry(const QString &from, const QString &to)
 {
-    const auto source = join(from), target = to.startsWith('/') ? to : join(to);
+    QStringList siblings;
+    for (const auto &e : shown)
+        siblings << e.name;
+    if (!listed.isEmpty())
+        renameItem(join(from), listed, to, siblings);
+}
+
+void FtpPanel::renameItem(const QString &source, const QString &folder, const QString &to, const QStringList &siblings)
+{
+    if (siblings.contains(to)) // RNTO replaces an existing file on most servers
+        return status->setText(ui("Already exists") + ": " + to);
+    const auto target = to.startsWith('/') ? to : child(folder, to);
     operate([=](FtpClient::Done done) { ftp->rename(source, target, done); });
 }
 
 void FtpPanel::removeEntries(const QStringList &names)
 {
-    QList<std::pair<QString, bool>> targets; // path, folder
-    for (const auto &name : names)
-    {
-        const auto *entry = find(name);
-        targets.append({join(name), entry && entry->dir && !entry->link});
-    }
-    if (targets.isEmpty())
+    removeItems(picked(names));
+}
+
+void FtpPanel::removeItems(const QList<Item> &items)
+{
+    if (items.isEmpty())
         return;
     status->setText(ui("Deleting…"));
     operate(
         [=](FtpClient::Done done)
         {
-            auto left = std::make_shared<int>(int(targets.size()));
+            auto left = std::make_shared<int>(int(items.size()));
             auto firstError = std::make_shared<QString>();
-            for (const auto &[target, folder] : targets)
+            for (const auto &item : items)
             {
                 auto one = [=](bool ok, const QString &error)
                 {
@@ -1482,29 +1858,72 @@ void FtpPanel::removeEntries(const QStringList &names)
                     if (--*left == 0)
                         done(firstError->isEmpty(), *firstError);
                 };
-                folder ? ftp->removeDirectory(target, true, one) : ftp->removeFile(target, one);
+                item.folder ? ftp->removeDirectory(item.remote, true, one) : ftp->removeFile(item.remote, one);
             }
         });
+}
+
+// One question for the whole operation; No keeps the existing files (the others are still transferred).
+bool FtpPanel::replaceConfirmed(const QStringList &existing, const char *title)
+{
+    const auto text = existing.size() == 1 ? ui("%1 already exists. Replace it?").arg(existing[0])
+                                           : ui("%1 files already exist. Replace them?").arg(existing.size());
+    return QMessageBox::question(this, ui(title), text, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
 }
 
 void FtpPanel::upload(const QStringList &localFiles)
 {
     if (listed.isEmpty())
         return;
+    QList<Item> items;
+    QStringList existing;
     for (const auto &local : localFiles)
     {
-        const QFileInfo info(local);
-        enqueue(info.fileName(), local, join(info.fileName()), true, info.isDir() ? -1 : info.size(), info.isDir());
+        // Folders dropped from Finder end with '/': uncleaned, the name is empty and the folder's contents would be
+        // merged into the current remote folder, over the files with the same names.
+        const QFileInfo info(QDir::cleanPath(local));
+        const auto name = info.fileName();
+        if (name.isEmpty())
+            continue;
+        items.append({name, info.filePath(), join(name), info.isDir(), info.isDir() ? -1 : info.size()});
+        if (find(name))
+            existing << name;
+    }
+    // Remote targets are absolute by now: the question may stay open while another folder gets listed.
+    const bool replace = existing.isEmpty() || replaceConfirmed(existing, "Upload files");
+    for (const auto &item : items)
+    {
+        if (replace || !existing.contains(item.name))
+            enqueue(item.name, item.local, item.remote, true, item.size, item.folder);
     }
 }
 
 void FtpPanel::download(const QStringList &names, const QString &folder)
 {
-    for (const auto &name : names)
+    fetchItems(picked(names), folder);
+}
+
+void FtpPanel::fetchItems(const QList<Item> &items, const QString &folder)
+{
+    QList<Item> safe;
+    QStringList existing;
+    for (auto item : items)
     {
-        const auto *entry = find(name);
-        const bool dir = entry && entry->dir;
-        enqueue(name, QDir(folder).filePath(name), join(name), false, entry && !dir ? entry->size : -1, dir);
+        if (!safeName(item.name)) // from the server: it would escape the chosen folder
+        {
+            status->setText(ui("Unsafe file name from the server: %1").arg(item.name));
+            continue;
+        }
+        item.local = QDir(folder).filePath(item.name);
+        if (QFileInfo::exists(item.local) || QFileInfo(item.local).isSymLink())
+            existing << item.name;
+        safe << item;
+    }
+    const bool replace = existing.isEmpty() || replaceConfirmed(existing, "Download");
+    for (const auto &item : safe)
+    {
+        if (replace || !existing.contains(item.name))
+            enqueue(item.name, item.local, item.remote, false, item.size, item.folder);
     }
 }
 
@@ -1523,7 +1942,10 @@ void FtpPanel::setState(Transfer &t, const QString &state, const QString &error)
                        : state == "done"      ? ui("Completed")
                        : state == "cancelled" ? ui("Cancelled")
                                               : ui("Failed");
-    t.item->setText(3, state == "failed" && !error.isEmpty() ? label + ": " + error : label);
+    // While running: the speed and the time left, once known.
+    t.item->setText(3, state == "failed" && !error.isEmpty()            ? label + ": " + error
+                       : state == "running" && !t.rate.text().isEmpty() ? t.rate.text()
+                                                                        : label);
     t.item->setToolTip(3, error);
 }
 
@@ -1534,7 +1956,7 @@ void FtpPanel::enqueue(const QString &name, const QString &local, const QString 
     t->remote = remote;
     t->upload = upload;
     t->folder = folder;
-    t->item = new QTreeWidgetItem(queueView, {name, size >= 0 ? QLocale().formattedDataSize(size) : QString()});
+    t->item = new QTreeWidgetItem(queueView, {name, fileSizeText(size)});
     t->item->setToolTip(0, QDir::toNativeSeparators(local));
     t->item->setIcon(0, folder ? icon("folder", 16) : icon(upload ? "upload" : "download", 16));
     t->bar = new QProgressBar;
@@ -1556,13 +1978,18 @@ void FtpPanel::start(const std::shared_ptr<Transfer> &t, bool resume)
     auto progress = [this, t](qint64 done, qint64 total)
     {
         if (t->state == "queued")
+        {
+            t->rate.reset();
             setState(*t, "running");
+        }
         if (total > 0)
         {
             t->bar->setValue(int(done * 100 / total));
             if (t->folder)
-                t->item->setText(1, QLocale().formattedDataSize(total));
+                t->item->setText(1, fileSizeText(total));
         }
+        if (t->state == "running" && t->rate.add(done, total))
+            t->item->setText(3, t->rate.text());
     };
     auto finished = [this, t, directory](bool ok, const QString &error)
     {
@@ -1617,7 +2044,14 @@ bool FtpPanel::eventFilter(QObject *watched, QEvent *event)
             if (url.isLocalFile())
                 locals << url.toLocalFile();
         }
-        upload(locals);
+        // After the drop returns (the source application waits for it; upload may ask a question), and only if the
+        // folder the files were dropped on is still the one shown.
+        QTimer::singleShot(0, this,
+                           [this, locals, folder = listed]
+                           {
+                               if (folder == listed)
+                                   upload(locals);
+                           });
         return true;
     }
     return QWidget::eventFilter(watched, event);
@@ -1643,7 +2077,9 @@ private:
     qint64 restart = 0;                                        // REST for the next RETR/STOR
     bool loggedIn = false, anonymous = false, protect = false; // protect: PROT P, data over TLS
     bool dataReady = false;                                    // data connection open (and encrypted if protect)
+    bool transferring = false;                                 // a transfer is using the data connection
     int failures = 0;
+    QTimer *idle; // no command and no transfer data for 5 minutes: the session is closed (like vsftpd)
 
     void reply(int code, const QString &text) { control->write(QString("%1 %2\r\n").arg(code).arg(text).toUtf8()); }
     void note(const QString &text) const
@@ -1666,8 +2102,27 @@ private:
     void withData(std::function<void()> action);
     void finish(QSslSocket *socket, bool ok, int failCode = 426);
     void sendFrom(std::shared_ptr<QIODevice> source);
-    void storeTo(std::shared_ptr<QFile> file);
+    void storeTo(std::shared_ptr<QFile> file, qint64 truncateAt);
 };
+
+#ifdef Q_OS_WIN
+// Final path of an open handle, all links and junctions resolved.
+static QString finalPath(HANDLE h)
+{
+    if (h == INVALID_HANDLE_VALUE)
+        return {};
+    std::wstring buffer(32768, L' ');
+    const DWORD n = GetFinalPathNameByHandleW(h, buffer.data(), DWORD(buffer.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!n || n >= buffer.size())
+        return {};
+    auto result = QString::fromWCharArray(buffer.data(), int(n));
+    if (result.startsWith(R"(\\?\UNC\)"))
+        result = R"(\\)" + result.mid(8);
+    else if (result.startsWith(R"(\\?\)"))
+        result = result.mid(4);
+    return QDir::fromNativeSeparators(result);
+}
+#endif
 
 // Real path with all links resolved. On Windows QFileInfo::canonicalFilePath does not follow
 // junctions: ask the system for the final path of the open handle.
@@ -1679,19 +2134,32 @@ static QString realPath(const QString &path)
                            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (h == INVALID_HANDLE_VALUE)
         return {};
-    std::wstring buffer(32768, L' ');
-    const DWORD n = GetFinalPathNameByHandleW(h, buffer.data(), DWORD(buffer.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    const auto result = finalPath(h);
     CloseHandle(h);
-    if (!n || n >= buffer.size())
-        return {};
-    auto result = QString::fromWCharArray(buffer.data(), int(n));
-    if (result.startsWith(R"(\\?\UNC\)"))
-        result = R"(\\)" + result.mid(8);
-    else if (result.startsWith(R"(\\?\)"))
-        result = result.mid(4);
-    return QDir::fromNativeSeparators(result);
+    return result;
 #else
     return QFileInfo(path).canonicalFilePath();
+#endif
+}
+
+static bool within(const QString &real, const QString &root)
+{
+    return !real.isEmpty() && (real == root || real.startsWith(root.endsWith('/') ? root : root + '/'));
+}
+
+// The open file is still inside the root: the path check and the open are not atomic, a folder or the file
+// may have been replaced with a link in between (by another local process).
+static bool openedWithin(QFile &file, const QString &root)
+{
+#ifdef Q_OS_WIN
+    const int fd = file.handle();
+    return within(fd >= 0 ? finalPath(HANDLE(_get_osfhandle(fd))) : realPath(file.fileName()), root);
+#else
+    // Same file (device and inode) as the real path resolved now, and that path inside the root.
+    const auto real = realPath(file.fileName());
+    struct stat opened, named;
+    return within(real, root) && fstat(file.handle(), &opened) == 0 && stat(QFile::encodeName(real).constData(), &named) == 0 &&
+           opened.st_dev == named.st_dev && opened.st_ino == named.st_ino;
 #endif
 }
 
@@ -1711,16 +2179,19 @@ static QString facts(const QFileInfo &info)
         .arg(QString::number(unixMode(info), 8).rightJustified(4, '0'));
 }
 
-static QByteArray listing(const QString &local, const QString &kind)
+// hidden: false for anonymous clients, which neither see nor reach hidden names.
+static QByteArray listing(const QString &local, const QString &kind, bool hidden)
 {
     const QFileInfo info(local);
-    const auto items = info.isDir()
-                           ? QDir(local).entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
-                                                       QDir::DirsFirst | QDir::Name | QDir::IgnoreCase)
-                           : QFileInfoList{info};
+    const auto items = info.isDir() ? QDir(local).entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::System |
+                                                                    (hidden ? QDir::Hidden : QDir::Filter(0)),
+                                                                QDir::DirsFirst | QDir::Name | QDir::IgnoreCase)
+                                    : QFileInfoList{info};
     QByteArray out;
     for (const auto &fi : items)
     {
+        if (!hidden && fi.fileName().startsWith('.'))
+            continue;
         QString line = fi.fileName();
         if (kind == "MLSD")
             line = facts(fi) + ' ' + fi.fileName();
@@ -1741,7 +2212,8 @@ static QByteArray listing(const QString &local, const QString &kind)
     return out;
 }
 
-FtpSession::FtpSession(FtpServer *server, QSslSocket *socket) : QObject(server->sessions), server(server), control(socket)
+FtpSession::FtpSession(FtpServer *server, QSslSocket *socket)
+    : QObject(server->sessions), server(server), control(socket), idle(new QTimer(this))
 {
     socket->setParent(this);
     connect(socket, &QTcpSocket::disconnected, this,
@@ -1750,6 +2222,21 @@ FtpSession::FtpSession(FtpServer *server, QSslSocket *socket) : QObject(server->
                 note("disconnected");
                 deleteLater();
             });
+    idle->setSingleShot(true);
+    idle->setInterval(300000);
+    connect(idle, &QTimer::timeout, this,
+            [this]
+            {
+                // Still closing after the notice, or TLS handshake never completed: dropped.
+                if (control->state() != QAbstractSocket::ConnectedState ||
+                    (control->mode() != QSslSocket::UnencryptedMode && !control->isEncrypted()))
+                    return control->abort();
+                note("idle timeout");
+                reply(421, "Timeout.");
+                control->disconnectFromHost();
+                idle->start(10000);
+            });
+    idle->start();
     connect(socket, &QTcpSocket::readyRead, this,
             [this]
             {
@@ -1760,6 +2247,7 @@ FtpSession::FtpSession(FtpServer *server, QSslSocket *socket) : QObject(server->
                     input.remove(0, nl + 1);
                     if (line.endsWith('\r'))
                         line.chop(1);
+                    idle->start();
                     handle(line);
                 }
                 if (input.size() > 8192) // abnormally long command line
@@ -1808,7 +2296,8 @@ QString FtpSession::virtualPath(const QString &arg) const
             continue;
         }
         // ":" = drive or NTFS stream; Windows device names and names made only of dots/spaces.
-        if (part.contains(':') || forbidden.match(part).hasMatch())
+        // Hidden names (".ssh", ".env") are not listed to anonymous clients, so they are not served to them either.
+        if (part.contains(':') || forbidden.match(part).hasMatch() || (anonymous && part.startsWith('.')))
             return {};
         parts << part;
     }
@@ -1816,7 +2305,7 @@ QString FtpSession::virtualPath(const QString &arg) const
 }
 
 // Local path, empty if the deepest existing ancestor (links resolved) is outside the real root.
-// ponytail: check and use are not atomic (TOCTOU) if other processes create links inside the root.
+// Check and use are not atomic: opened files are checked again (openedWithin).
 QString FtpSession::localPath(const QString &virt) const
 {
     const auto local = QDir::cleanPath(server->canonicalRoot + virt);
@@ -1829,8 +2318,10 @@ QString FtpSession::localPath(const QString &virt) const
         probe = up;
     }
     const auto real = realPath(probe.absoluteFilePath());
-    const auto &root = server->canonicalRoot;
-    if (real.isEmpty() || (real != root && !real.startsWith(root.endsWith('/') ? root : root + '/')))
+    if (!within(real, server->canonicalRoot))
+        return {};
+    // A link inside the root must not lead an anonymous client to a hidden name of the root either.
+    if (anonymous && ('/' + real.mid(server->canonicalRoot.size())).contains("/."))
         return {};
     return local;
 }
@@ -1838,7 +2329,7 @@ QString FtpSession::localPath(const QString &virt) const
 void FtpSession::closeData()
 {
     waiting = nullptr;
-    dataReady = false;
+    dataReady = transferring = false;
     activePort = 0;
     if (data)
     {
@@ -1990,6 +2481,7 @@ void FtpSession::withData(std::function<void()> action)
 {
     auto start = [this, action]
     {
+        transferring = true;
         reply(150, "Opening data connection.");
         action();
     };
@@ -2014,7 +2506,7 @@ void FtpSession::finish(QSslSocket *socket, bool ok, int failCode)
         return;
     QObject::disconnect(socket, nullptr, this, nullptr);
     data = nullptr;
-    dataReady = false;
+    dataReady = transferring = false;
     socket->deleteLater();
     if (ok)
         reply(226, "Transfer complete.");
@@ -2031,6 +2523,7 @@ void FtpSession::sendFrom(std::shared_ptr<QIODevice> source)
             auto eof = std::make_shared<bool>(false), broken = std::make_shared<bool>(false);
             auto pump = [=]
             {
+                idle->start(); // data moving: the session is not idle
                 while (!*eof && socket->state() == QAbstractSocket::ConnectedState && socket->bytesToWrite() < (1 << 20))
                 {
                     const auto chunk = source->read(256 * 1024);
@@ -2058,16 +2551,22 @@ void FtpSession::sendFrom(std::shared_ptr<QIODevice> source)
         });
 }
 
-void FtpSession::storeTo(std::shared_ptr<QFile> file)
+// truncateAt >= 0 (STOR): the file is shortened only here, once the data connection is open. A STOR that never
+// gets its data connection leaves the existing file as it was.
+void FtpSession::storeTo(std::shared_ptr<QFile> file, qint64 truncateAt)
 {
     withData(
-        [this, file]
+        [this, file, truncateAt]
         {
             auto *socket = data;
             auto writeError = std::make_shared<bool>(false), reset = std::make_shared<bool>(false);
+            if (truncateAt >= 0 && !file->resize(truncateAt))
+                *writeError = true;
             auto drain = [=]
             {
                 const auto bytes = socket->readAll();
+                if (!bytes.isEmpty())
+                    idle->start(); // data moving: the session is not idle
                 if (!bytes.isEmpty() && file->write(bytes) != bytes.size())
                     *writeError = true;
             };
@@ -2096,6 +2595,11 @@ void FtpSession::handle(const QString &line)
     const auto arg = space < 0 ? QString() : line.mid(space + 1);
     note(command == "PASS" ? QString("PASS ****") : line);
     static const QStringList writes{"STOR", "APPE", "DELE", "MKD", "XMKD", "RMD", "XRMD", "RNFR", "RNTO"};
+    static const QStringList transfers{"LIST", "NLST", "MLSD", "RETR", "STOR", "APPE"};
+    // REST and RNFR apply to the very next command only: no other command may come in between.
+    const qint64 offset = command == "REST" ? 0 : std::exchange(restart, 0);
+    if (command != "RNFR" && command != "RNTO")
+        renameFrom.clear();
 
     if (command == "USER")
     {
@@ -2103,6 +2607,12 @@ void FtpSession::handle(const QString &line)
         loggedIn = false;
         anonymous = server->anonymous &&
                     (arg.compare("anonymous", Qt::CaseInsensitive) == 0 || arg.compare("ftp", Qt::CaseInsensitive) == 0);
+        // With a certificate configured, a password is accepted only over TLS: refused before it is sent in clear.
+        if (server->tls && !anonymous && !control->isEncrypted())
+        {
+            user.clear();
+            return reply(530, "Use AUTH TLS first.");
+        }
         reply(331, anonymous ? "Anonymous login ok, send your e-mail address as password." : "Password required.");
     }
     else if (command == "PASS")
@@ -2146,6 +2656,7 @@ void FtpSession::handle(const QString &line)
         reply(234, "Proceed with negotiation.");
         user.clear(); // RFC 4217: AUTH resets the login
         loggedIn = false;
+        input.clear(); // commands pipelined in clear after AUTH are dropped (injection before TLS)
         control->setSslConfiguration(*server->tls);
         control->startServerEncryption(); // the plaintext reply goes out before the handshake
     }
@@ -2163,6 +2674,10 @@ void FtpSession::handle(const QString &line)
     }
     else if (!loggedIn)
         reply(530, "Please log in with USER and PASS.");
+    else if (transfers.contains(command) && (waiting || transferring))
+        reply(503, "A transfer is already in progress."); // it would share the data connection
+    else if (transfers.contains(command) && server->tls && !anonymous && !protect)
+        reply(522, "Use PROT P first."); // logged in with a password: no data in clear either
     else if (command == "PWD" || command == "XPWD")
         reply(257, '"' + QString(cwd).replace('"', "\"\"") + "\" is the current directory.");
     else if (command == "CWD" || command == "CDUP" || command == "XCUP")
@@ -2174,7 +2689,7 @@ void FtpSession::handle(const QString &line)
         cwd = virt;
         reply(250, "Directory changed to " + virt);
     }
-    else if (command == "TYPE") // ponytail: ASCII treated as binary (no line ending conversion)
+    else if (command == "TYPE") // A is accepted but transfers stay binary, like vsftpd by default (SIZE and REST stay exact)
         !arg.isEmpty() && QString("AIL").contains(arg.left(1).toUpper()) ? reply(200, "Type set.")
                                                                          : reply(504, "Type not supported.");
     else if (command == "MODE" || command == "STRU")
@@ -2203,18 +2718,18 @@ void FtpSession::handle(const QString &line)
         if (local.isEmpty() || !QFileInfo::exists(local) || (command == "MLSD" && !QFileInfo(local).isDir()))
             return reply(550, "No such file or directory.");
         auto buffer = std::make_shared<QBuffer>();
-        buffer->setData(listing(local, command));
+        buffer->setData(listing(local, command, !anonymous));
         buffer->open(QIODevice::ReadOnly);
         sendFrom(buffer);
     }
     else if (command == "RETR")
     {
-        const qint64 from = std::exchange(restart, 0);
         const auto local = resolve(arg);
         auto file = std::make_shared<QFile>(local);
-        if (local.isEmpty() || !QFileInfo(local).isFile() || !file->open(QIODevice::ReadOnly))
+        if (local.isEmpty() || !QFileInfo(local).isFile() || !file->open(QIODevice::ReadOnly) ||
+            !openedWithin(*file, server->canonicalRoot))
             return reply(550, "No such file or not readable.");
-        if (from > file->size() || !file->seek(from))
+        if (offset > file->size() || !file->seek(offset))
             return reply(554, "Invalid restart position.");
         sendFrom(file);
     }
@@ -2234,21 +2749,20 @@ void FtpSession::handle(const QString &line)
         reply(550, "Permission denied: anonymous access is read-only.");
     else if (command == "STOR" || command == "APPE")
     {
-        // REST+STOR writes from the given offset (the rest is truncated); APPE appends.
-        const qint64 from = std::exchange(restart, 0);
+        // REST+STOR writes from the given offset (the rest is truncated); APPE appends. Opened without truncating:
+        // STOR shortens the file only once it is known to be inside the root and the data connection is open.
+        if (!data && !passive && !activePort)
+            return reply(425, "Use PORT, EPRT, PASV or EPSV first."); // before the file is created
         const auto local = arg.isEmpty() ? QString() : resolve(arg);
         const QFileInfo info(local);
         auto file = std::make_shared<QFile>(local);
-        QIODevice::OpenMode mode = QIODevice::WriteOnly | QIODevice::Truncate;
-        if (command == "APPE")
-            mode = QIODevice::Append;
-        else if (from)
-            mode = QIODevice::ReadWrite;
-        if (local.isEmpty() || info.isDir() || !QFileInfo(info.absolutePath()).isDir() || !file->open(mode))
+        // Only regular files: opening a FIFO or a device would block the server.
+        if (local.isEmpty() || (info.exists() && !info.isFile()) || !QFileInfo(info.absolutePath()).isDir() ||
+            !file->open(QIODevice::WriteOnly | QIODevice::Append) || !openedWithin(*file, server->canonicalRoot))
             return reply(550, "Cannot create the file.");
-        if (command == "STOR" && from && (from > file->size() || !file->resize(from) || !file->seek(from)))
+        if (command == "STOR" && offset > file->size())
             return reply(554, "Invalid restart position.");
-        storeTo(file);
+        storeTo(file, command == "STOR" ? offset : -1);
     }
     else if (command == "DELE")
     {
@@ -2312,7 +2826,19 @@ FtpServer::FtpServer() : listener(new SslListener), sessions(new QObject)
                      [this]
                      {
                          while (listener->hasPendingConnections())
-                             new FtpSession(this, static_cast<QSslSocket *>(listener->nextPendingConnection()));
+                         {
+                             auto *socket = static_cast<QSslSocket *>(listener->nextPendingConnection());
+                             if (sessions->children().size() < 64)
+                             {
+                                 new FtpSession(this, socket);
+                                 continue;
+                             }
+                             // Too many clients (open connections would exhaust descriptors): refused.
+                             if (!implicitTls)
+                                 socket->write("421 Too many connections.\r\n");
+                             QObject::connect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater);
+                             socket->disconnectFromHost();
+                         }
                      });
 }
 

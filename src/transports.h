@@ -138,11 +138,14 @@ protected:
 
 private:
     void poll();
+    bool send();
     void fail(const QString &message);
+    void release(); // closes the port
     Settings settings;
     QTimer *timer;
-    QByteArray input;
-    qintptr handle = -1; // HANDLE on Windows, file descriptor on POSIX
+    QByteArray input, output; // output: written data the port has not accepted yet
+    qintptr handle = -1;      // HANDLE on Windows, file descriptor on POSIX
+    int held = 0;             // Windows: polls to skip after the port accepted nothing
 };
 
 // Available serial ports (Windows: HKLM\HARDWARE\DEVICEMAP\SERIALCOMM; POSIX: /dev/ttyS*, ttyUSB*, ttyACM*, cu.*).

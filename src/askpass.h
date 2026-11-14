@@ -7,9 +7,12 @@
 #include "profiles.h"
 #include <memory>
 #include <QtWidgets>
+#include <QJsonArray>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QProcess>
 #include <QRandomGenerator>
+#include <QScopeGuard>
 #include <QUuid>
 #ifdef Q_OS_WIN
 #define NOMINMAX
@@ -22,19 +25,164 @@
 #include <objc/runtime.h>
 #endif
 
+// Attempt counters of one ssh/sftp process (see runAskpass).
+inline QString askpassAttemptsFile(const QString &token)
+{
+    return QDir::temp().filePath("crossterm-askpass-" + token);
+}
+
+// Host as OpenSSH prints it in its prompts: lower case, no IPv6 brackets.
+inline QString askpassHost(const QString &host)
+{
+    const auto name = host.trimmed().toLower();
+    return name.startsWith('[') && name.endsWith(']') ? name.mid(1, name.size() - 2) : name;
+}
+
+// Who an OpenSSH prompt asks for: "user@host's password:" or, keyboard-interactive, "(user@host) Password:".
+struct PromptIdentity
+{
+    QString user, host;    // host empty: the prompt names nobody (passphrase, PIN, old keyboard-interactive)
+    bool keyboard = false; // "(user@host) text": the text after the prefix is chosen by the server
+};
+
+inline PromptIdentity promptIdentity(const QString &prompt)
+{
+    // Anchored and not greedy: text of the server after the prefix cannot name another host.
+    static const QRegularExpression keyboard("^\\(([^()\\s]*?)@([^@()\\s]+)\\) ");
+    static const QRegularExpression password("^(\\S*)@([^@\\s']+)'s password:\\s*$");
+    if (const auto match = keyboard.match(prompt); match.hasMatch())
+        return {match.captured(1), askpassHost(match.captured(2)), true};
+    if (const auto match = password.match(prompt); match.hasMatch())
+        return {match.captured(1), askpassHost(match.captured(2)), false};
+    return {};
+}
+
+// "user@host" or "host" against a prompt identity; without a user it stands for any user of that host.
+inline bool askpassSameHost(const QString &spec, const PromptIdentity &who)
+{
+    const auto at = spec.lastIndexOf('@');
+    return !who.host.isEmpty() && askpassHost(spec.mid(at + 1)) == who.host && (at <= 0 || spec.left(at) == who.user);
+}
+
+// Jump hosts of a profile ("jumps") as "user@host" or "host", the form of CROSSTERM_CREDENTIAL_HOPS.
+inline QStringList askpassHops(const QJsonArray &jumps)
+{
+    QStringList hops;
+    for (const auto &item : jumps)
+    {
+        const auto hop = item.toObject();
+        const auto host = askpassHost(hop["host"].toString()), user = hop["user"].toString();
+        if (!host.isEmpty() && !host.contains(',') && !user.contains(','))
+            hops << (user.isEmpty() ? host : user + "@" + host);
+    }
+    return hops;
+}
+
+// "user@host" as OpenSSH names the destination of an ssh command line in its password prompts: after ssh_config
+// (Host alias, HostName, User) and the options of the command, read from "ssh -G". Empty when ssh cannot tell
+// (too old, a configuration error, no answer in 3 s).
+inline QString sshPromptIdentity(const QString &program, const QStringList &arguments)
+{
+    QProcess ssh;
+    hideConsoleWindow(&ssh);
+    ssh.setStandardInputFile(QProcess::nullDevice());
+    ssh.start(program, QStringList{"-G"} + arguments);
+    if (!ssh.waitForFinished(3000))
+    {
+        ssh.kill();
+        ssh.waitForFinished(1000);
+        return {};
+    }
+    if (ssh.exitStatus() != QProcess::NormalExit || ssh.exitCode() != 0)
+        return {};
+    QString user, host;
+    for (const auto &line : ssh.readAllStandardOutput().split('\n'))
+    {
+        const auto text = QString::fromUtf8(line).trimmed();
+        if (text.startsWith("user "))
+            user = text.mid(5);
+        else if (text.startsWith("hostname "))
+            host = text.mid(9);
+    }
+    return host.isEmpty() ? QString() : user + "@" + askpassHost(host);
+}
+
+// A prompt of another host than the session's own: a jump host ("ssh -J" and ProxyJump run "ssh -W" for each hop
+// with this same environment) or whatever a ProxyCommand logs in to. target: "<app>:<user>@<host>:<port>".
+// identity: the session as ssh_config resolves it (sshPromptIdentity); with it, a prompt that names anyone else is
+// foreign, also a jump host that only ssh_config knows. Without it only the listed hops are, and a name that is
+// neither counts as the session (it may be a Host alias).
+inline bool askpassForeign(const PromptIdentity &who, const QString &target, const QStringList &hops,
+                           const QString &identity = {})
+{
+    if (who.host.isEmpty())
+        return false; // the prompt names nobody
+    const auto session = target.section(':', 1);
+    if (askpassSameHost(session.left(session.lastIndexOf(':')), who))
+        return false;
+    if (!identity.isEmpty())
+        return !askpassSameHost(identity, who);
+    return std::any_of(hops.begin(), hops.end(), [&](const QString &hop) { return askpassSameHost(hop, who); });
+}
+
 // Session passwords: typed once (in the askpass dialog) and reused by the terminal, SFTP browser,
 // Remote monitoring, tunnels and mosh of the same session. They live only in CrossTerm's memory and are
-// reachable by the askpass process through a user-private local socket, with a random token.
+// reachable by the askpass process through a user-private local socket, with the key of its own launch.
 class SessionSecrets
 {
+    // One per ssh/sftp launch (askpassEnvironment): all that the askpass helpers holding its key may ask for.
+    struct Grant
+    {
+        QString target, terminal;
+        QStringList hops;
+        QString identity; // the session in OpenSSH's prompts (sshPromptIdentity), when known
+        bool interactive = true;
+        qint64 used = 0;
+    };
+    static constexpr qint64 GrantLifetime = 30 * 24 * 3600; // seconds without a request
+    static constexpr qint64 RequestLimit = 256 * 1024;      // bytes of one request: a few lines, base64 of a prompt
+
     QLocalServer server;
     QHash<QString, QString> secrets;
+    QHash<QString, Grant> grants;
+    QHash<QString, QStringList> routes; // jump hosts per target, for the launches that do not pass them
+    QHash<QString, QString> names;      // prompt identity per target, likewise
 
     static QByteArray encode(const QString &text) { return text.toUtf8().toBase64(); }
     static QString decode(const QByteArray &line) { return QString::fromUtf8(QByteArray::fromBase64(line.trimmed())); }
 
+    Grant *granted(const QByteArray &key)
+    {
+        const auto it = grants.find(QString::fromUtf8(key.trimmed()));
+        if (it == grants.end())
+            return nullptr;
+        const auto now = QDateTime::currentSecsSinceEpoch();
+        if (now - it->used > GrantLifetime)
+        {
+            grants.erase(it);
+            return nullptr;
+        }
+        it->used = now;
+        return &*it;
+    }
+    // Cache entries of a launch: its own password, those of its jump hosts ("hop:user@host") and key passphrases.
+    static bool allowed(const Grant &grant, const QString &entry)
+    {
+        if (entry.startsWith("passphrase:"))
+            return true;
+        if (!entry.startsWith("hop:"))
+            return !entry.isEmpty() && entry == grant.target;
+        const auto name = entry.mid(4);
+        const auto at = name.lastIndexOf('@');
+        const PromptIdentity who{name.left(qMax(at, 0)), askpassHost(name.mid(at + 1))};
+        // A launch that knows its own name treats every other host as a hop (askpassForeign).
+        if (!grant.identity.isEmpty())
+            return !who.host.isEmpty() && !askpassSameHost(grant.identity, who);
+        return std::any_of(grant.hops.begin(), grant.hops.end(), [&](const QString &hop) { return askpassSameHost(hop, who); });
+    }
+
 public:
-    QString name, key;
+    QString name;
 
     static SessionSecrets &instance()
     {
@@ -47,17 +195,23 @@ public:
     {
         if (server.isListening())
             return true;
-        key = QString::number(QRandomGenerator::system()->generate64(), 16) +
-              QString::number(QRandomGenerator::system()->generate64(), 16);
         name = "crossterm-secrets-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
         server.setSocketOptions(QLocalServer::UserAccessOption);
         if (!server.listen(name))
             return false;
+        // Attempt counters of terminals and tunnels (or of a crash) left over from earlier runs.
+        const auto stale = QDateTime::currentDateTime().addDays(-1);
+        for (const auto &file : QDir::temp().entryInfoList({"crossterm-askpass-*"}, QDir::Files | QDir::Hidden))
+        {
+            if (file.lastModified() < stale)
+                QFile::remove(file.filePath());
+        }
         QObject::connect(&server, &QLocalServer::newConnection, &server,
                          [this]
                          {
                              while (auto *socket = server.nextPendingConnection())
                              {
+                                 socket->setReadBufferSize(RequestLimit); // see serve()
                                  QObject::connect(socket, &QLocalSocket::disconnected, socket, &QObject::deleteLater);
                                  QObject::connect(socket, &QLocalSocket::readyRead, socket, [this, socket] { serve(socket); });
                              }
@@ -65,27 +219,78 @@ public:
         return true;
     }
 
-    // Request: token, command (GET/PUT/DEL), name, [secret]; name and secret in base64, one line each.
+    // Key of a new launch, limited to its target, its jump hosts ("user@host" or "host") and its terminal tab.
+    QString issue(const QString &target, bool interactive, const QString &terminal, const QStringList &hops,
+                  const QString &identity = {})
+    {
+        const auto now = QDateTime::currentSecsSinceEpoch();
+        for (auto it = grants.begin(); it != grants.end();)
+            it = now - it->used > GrantLifetime ? grants.erase(it) : std::next(it);
+        const auto key = QString::number(QRandomGenerator::system()->generate64(), 16) +
+                         QString::number(QRandomGenerator::system()->generate64(), 16);
+        grants.insert(key, {target, terminal, hops, identity, interactive, now});
+        return key;
+    }
+    void revoke(const QString &key) { grants.remove(key); }
+    // Jump hosts of a target, remembered from the launches that passed them (the terminal) for those that do not.
+    QStringList route(const QString &target, const QStringList &hops)
+    {
+        if (target.isEmpty())
+            return hops;
+        auto &known = routes[target];
+        for (const auto &hop : hops)
+        {
+            if (!known.contains(hop))
+                known << hop;
+        }
+        return known;
+    }
+    // Prompt identity of a target, remembered from the launches that resolved it for those that do not.
+    QString identity(const QString &target, const QString &resolved)
+    {
+        if (target.isEmpty() || resolved.isEmpty())
+            return target.isEmpty() ? resolved : names.value(target);
+        names.insert(target, resolved);
+        return resolved;
+    }
+
+    // Request: key of the launch, command (GET/PUT/DEL, VGET/VPUT/VDEL, ASK), name, [value]; name and value in
+    // base64, one line each. A launch reaches only its own entries and its own terminal tab.
     void serve(QLocalSocket *socket)
     {
+        // The read buffer is full and the request still incomplete: it never will be, the client is dropped.
+        const bool full = socket->bytesAvailable() >= RequestLimit;
         if (!socket->canReadLine())
-            return;
-        const auto all = socket->peek(64 * 1024);
-        const auto lines = all.split('\n');
+            return full ? socket->abort() : void();
+        auto all = socket->peek(RequestLimit);
+        auto lines = all.split('\n');
+        // The request and the reply may carry a secret (base64): wiped once handled.
+        auto wipe = qScopeGuard(
+            [&]
+            {
+                all.fill('\0');
+                for (auto &line : lines)
+                    line.fill('\0');
+            });
         const bool withValue = lines.size() > 1 && (lines[1].trimmed() == "PUT" || lines[1].trimmed() == "ASK" ||
                                                     lines[1].trimmed() == "VPUT");
         if (lines.size() < 4 || (withValue && lines.size() < 5))
-            return; // incomplete request: wait for more data
-        socket->readAll();
+            return full ? socket->abort() : void(); // incomplete request: wait for more data
+        socket->readAll().fill('\0');
         QByteArray reply = "\n";
-        if (lines[0].trimmed() == key.toUtf8())
+        if (const auto *grant = granted(lines[0]))
         {
             const auto command = lines[1].trimmed();
             const auto entry = decode(lines[2]);
+            const auto target = grant->target;
             if (command == "ASK")
             {
                 // entry = terminal id; value = echo flag ('0'/'1') + prompt. Reply "+answer", "-" (cancelled)
                 // or "!" (no such terminal: the askpass process falls back to a dialog).
+                // Only the tab of this launch; a duplicated tab has a new id that no launch has registered.
+                const bool own = grant->interactive && !grant->terminal.isEmpty() &&
+                                 (entry == grant->terminal || std::none_of(grants.cbegin(), grants.cend(), [&](const Grant &other)
+                                                                           { return other.terminal == entry; }));
                 const auto text = decode(lines[3]);
                 QPointer<QLocalSocket> peer(socket);
                 auto answer = [peer](std::optional<QString> value)
@@ -98,31 +303,40 @@ public:
                     peer->flush();
                     peer->disconnectFromServer();
                 };
-                if (ask && ask(entry, text.mid(1), text.startsWith('1'), answer))
+                if (own && ask && ask(entry, text.mid(1), text.startsWith('1'), answer))
                     return; // answered when the user presses Enter in the terminal
                 reply = "!\n";
             }
+            else if ((command == "GET" || command == "PUT" || command == "DEL") && !allowed(*grant, entry))
+                reply = "\n"; // not an entry of this launch
             else if (command == "GET" && secrets.contains(entry))
                 reply = encode(secrets.value(entry)) + "\n";
             else if (command == "PUT")
                 put(entry, decode(lines[3]));
             else if (command == "DEL")
                 forget(entry);
+            else if (command.startsWith('V') && (target.isEmpty() || entry != target))
+                reply = "-\n"; // the vault entry of this launch only
             // System vault, read and written by this process for the askpass helpers: macOS then asks for
             // Keychain access once, in the foreground app, instead of once per background helper.
             else if (command == "VGET")
             {
-                auto value = readSecret(entry);
+                auto value = readSecret(target);
                 reply = value ? "+" + encode(*value) + "\n" : QByteArray("-\n");
                 if (value)
                     value->fill(QChar(0));
             }
             else if (command == "VPUT")
-                reply = storeSecret(entry, entry.section(':', 1).section('@', 0, 0), decode(lines[3])) ? "+\n" : "-\n";
+            {
+                auto secret = decode(lines[3]);
+                reply = storeSecret(target, target.section(':', 1).section('@', 0, 0), secret) ? "+\n" : "-\n";
+                secret.fill(QChar(0));
+            }
             else if (command == "VDEL")
-                reply = removeSecret(entry) ? "+\n" : "-\n";
+                reply = removeSecret(target) ? "+\n" : "-\n";
         }
         socket->write(reply);
+        reply.fill('\0');
         socket->flush();
         socket->disconnectFromServer();
     }
@@ -136,6 +350,8 @@ public:
 
     void put(const QString &entry, const QString &secret)
     {
+        if (auto it = secrets.find(entry); it != secrets.end() && *it != secret)
+            it->fill(QChar(0)); // replaced: the old password does not stay in memory
         secrets.insert(entry, secret);
         QTimer::singleShot(0, &server,
                            [this, entry]
@@ -163,6 +379,30 @@ public:
         secrets.clear();
     }
 };
+
+// Called by the launcher once the process has exited: SFTP starts a new one (new token and key) per operation.
+inline void forgetAskpassAttempts(const QProcess *process)
+{
+    const auto environment = process->processEnvironment();
+    const auto token = environment.value("CROSSTERM_ASKPASS_TOKEN");
+    if (!token.isEmpty())
+        QFile::remove(askpassAttemptsFile(token));
+    SessionSecrets::instance().revoke(environment.value("CROSSTERM_ASKPASS_KEY"));
+}
+
+// A launch that is over for good (its tab closed, its tunnel or monitor ended), given its environment: the key of
+// the launch is revoked and its attempt counter removed.
+inline void releaseAskpass(const QStringList &environment)
+{
+    for (const auto &entry : environment)
+    {
+        const auto variable = entry.section('=', 0, 0), value = entry.section('=', 1);
+        if (variable == "CROSSTERM_ASKPASS_KEY")
+            SessionSecrets::instance().revoke(value);
+        else if (variable == "CROSSTERM_ASKPASS_TOKEN" && !value.isEmpty())
+            QFile::remove(askpassAttemptsFile(value));
+    }
+}
 
 // Askpass side: one request to the CrossTerm window that launched ssh; nullopt when it cannot be reached.
 inline std::optional<QByteArray> requestSessionSecrets(const QByteArray &command, const QString &entry,
@@ -198,28 +438,29 @@ inline QString askSessionSecrets(const QByteArray &command, const QString &entry
     return value;
 }
 
-// Askpass side: the system vault through the CrossTerm window (which may wait for a Keychain prompt), or directly
-// when there is no window to ask.
+// Askpass side: the system vault, only through the CrossTerm window that launched ssh (which checks the key of the
+// launch and may wait for a Keychain prompt). Started by anything else, this program gives out no saved password.
 inline std::optional<QString> vaultRead(const QString &target)
 {
     auto reply = requestSessionSecrets("VGET", target, {}, 300000);
     if (!reply)
-        return readSecret(target);
+        return std::nullopt;
     std::optional<QString> value;
     if (reply->startsWith('+'))
         value = QString::fromUtf8(QByteArray::fromBase64(reply->mid(1)));
     reply->fill('\0');
     return value;
 }
-inline void vaultStore(const QString &target, const QString &secret)
+// Writes go through that window too: if it does not answer they fail.
+inline bool vaultStore(const QString &target, const QString &secret)
 {
-    if (!requestSessionSecrets("VPUT", target, secret, 300000))
-        storeSecret(target, target.section(':', 1).section('@', 0, 0), secret);
+    const auto reply = requestSessionSecrets("VPUT", target, secret, 300000);
+    return reply && reply->startsWith('+');
 }
-inline void vaultRemove(const QString &target)
+inline bool vaultRemove(const QString &target)
 {
-    if (!requestSessionSecrets("VDEL", target, {}, 300000))
-        removeSecret(target);
+    const auto reply = requestSessionSecrets("VDEL", target, {}, 300000);
+    return reply && reply->startsWith('+');
 }
 
 // Askpass side: asks the CrossTerm window to read the answer inside the session's terminal.
@@ -257,9 +498,9 @@ inline TerminalAnswer askInTerminal(const QString &prompt, bool echo)
     return result;
 }
 
-// Variables for the ssh/sftp process: entry name, attempt token and CrossTerm path.
-// terminal: id of the terminal tab that shows the prompts inline instead of a dialog.
-inline QStringList askpassEnvironment(const QString &target, bool interactive, const QString &terminal = {})
+// Variables for one ssh/sftp launch: entry name, attempt token, CrossTerm path and the key of this launch.
+inline QStringList askpassVariables(const QString &target, bool interactive, const QString &terminal, const QStringList &hops,
+                                    const QString &identity = {})
 {
     QStringList environment{"SSH_ASKPASS=" + QDir::toNativeSeparators(QCoreApplication::applicationFilePath()),
                             "SSH_ASKPASS_REQUIRE=force", "CROSSTERM_CREDENTIAL=" + target,
@@ -268,10 +509,62 @@ inline QStringList askpassEnvironment(const QString &target, bool interactive, c
         environment << "CROSSTERM_ASKPASS_NONINTERACTIVE=1";
     if (!terminal.isEmpty())
         environment << "CROSSTERM_ASKPASS_TERMINAL=" + terminal;
+    if (!hops.isEmpty())
+        environment << "CROSSTERM_CREDENTIAL_HOPS=" + hops.join(',');
+    if (!identity.isEmpty())
+        environment << "CROSSTERM_CREDENTIAL_IDENTITY=" + identity;
     auto &secrets = SessionSecrets::instance();
     if (!secrets.name.isEmpty())
-        environment << "CROSSTERM_ASKPASS_SERVER=" + secrets.name << "CROSSTERM_ASKPASS_KEY=" + secrets.key;
+        environment << "CROSSTERM_ASKPASS_SERVER=" + secrets.name
+                    << "CROSSTERM_ASKPASS_KEY=" + secrets.issue(target, interactive, terminal, hops, identity);
     return environment;
+}
+
+// terminal: id of the terminal tab that shows the prompts inline instead of a dialog.
+// jumps: the profile's "jumps"; their password prompts are kept apart from the session's own password.
+// identity: sshPromptIdentity() of the launch, when the caller resolved it.
+inline QStringList askpassEnvironment(const QString &target, bool interactive, const QString &terminal = {},
+                                      const QJsonArray &jumps = {}, const QString &identity = {})
+{
+    auto &secrets = SessionSecrets::instance();
+    return askpassVariables(target, interactive, terminal, secrets.route(target, askpassHops(jumps)),
+                            secrets.identity(target, identity));
+}
+
+// Restart or copy ("Duplicate tab") of a stored ssh command: a fresh attempt token and key, and for a copy its own
+// terminal id. The key of a restarted command is revoked; the original of a copy keeps its own.
+inline void renewAskpass(QStringList &environment, bool copy = false)
+{
+    QString target, terminal, key, identity;
+    QStringList hops, others;
+    bool interactive = true, found = false;
+    for (const auto &entry : environment)
+    {
+        const auto variable = entry.section('=', 0, 0), value = entry.section('=', 1);
+        if (variable == "CROSSTERM_ASKPASS_TOKEN")
+            found = true;
+        else if (variable == "CROSSTERM_CREDENTIAL")
+            target = value;
+        else if (variable == "CROSSTERM_CREDENTIAL_HOPS")
+            hops = value.split(',', Qt::SkipEmptyParts);
+        else if (variable == "CROSSTERM_ASKPASS_TERMINAL")
+            terminal = value;
+        else if (variable == "CROSSTERM_ASKPASS_KEY")
+            key = value;
+        else if (variable == "CROSSTERM_CREDENTIAL_IDENTITY")
+            identity = value;
+        else if (variable == "CROSSTERM_ASKPASS_NONINTERACTIVE")
+            interactive = false;
+        else if (variable != "SSH_ASKPASS" && variable != "SSH_ASKPASS_REQUIRE" && variable != "CROSSTERM_ASKPASS_SERVER")
+            others << entry;
+    }
+    if (!found)
+        return; // no askpass: local shell, telnet, serial
+    if (!copy)
+        SessionSecrets::instance().revoke(key);
+    else if (!terminal.isEmpty())
+        terminal = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    environment = others + askpassVariables(target, interactive, terminal, hops, identity);
 }
 
 inline bool isAskpassInvocation(int argc)
@@ -343,36 +636,71 @@ inline int runAskpass(int &argc, char **argv)
             return 0;
         }
         gui();
-        const auto answer = QMessageBox::question(nullptr, "CrossTerm", prompt.trimmed());
-        writeAnswer(answer == QMessageBox::Yes ? "yes" : "no");
+        QMessageBox question(QMessageBox::Question, "CrossTerm", prompt.trimmed(), QMessageBox::Yes | QMessageBox::No);
+        question.setTextFormat(Qt::PlainText); // the text comes from ssh and, in part, from the server
+        writeAnswer(question.exec() == QMessageBox::Yes ? "yes" : "no");
         return 0;
     }
-    // Attempt counter for this ssh process (the file holds just a number). Only secret prompts count:
-    // a host key question answered first must not turn the first password prompt into a "retry".
-    const auto counter = QDir::temp().filePath("crossterm-askpass-" + qEnvironmentVariable("CROSSTERM_ASKPASS_TOKEN"));
+    // A jump host asks for its own password: never the session's saved or typed one, and what is typed for it is
+    // cached under its own name (asked once per run) and never saved as the session's password.
+    const auto who = promptIdentity(prompt);
+    const bool foreign =
+        askpassForeign(who, target, qEnvironmentVariable("CROSSTERM_CREDENTIAL_HOPS").split(',', Qt::SkipEmptyParts),
+                       qEnvironmentVariable("CROSSTERM_CREDENTIAL_IDENTITY"));
+    // Cache entry: the session password, the passphrase of the key named in the prompt (a prompt relayed from the
+    // server, "(user@host) ...", is never one) or the jump host's password.
+    const bool passphrase = !who.keyboard && prompt.contains("passphrase", Qt::CaseInsensitive);
+    const char kind = passphrase ? 'p' : 'c';
+    const auto entry = passphrase ? "passphrase:" + prompt.trimmed() : foreign ? "hop:" + who.user + "@" + who.host : target;
+    // Attempt counter for this ssh process. Only secret prompts count: a host key question answered first must
+    // not turn the first password prompt into a "retry". The first line of the file holds the number, then 'c'
+    // (session password) and/or 'p' (key passphrase) once that cached or typed value has been answered to this
+    // process; each jump host that asked has its own line, "<name in base64> <number>[c]".
+    const auto counter = askpassAttemptsFile(qEnvironmentVariable("CROSSTERM_ASKPASS_TOKEN"));
     QFile file(counter);
-    int attempt = file.open(QIODevice::ReadOnly) ? file.readAll().toInt() + 1 : 1;
+    auto states = file.open(QIODevice::ReadOnly) ? file.readAll().split('\n') : QByteArrayList{QByteArray()};
     file.close();
-    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        file.write(QByteArray::number(attempt));
-    file.close();
-    // Cache entry: the session password, or the passphrase of the key named in the prompt.
-    const bool passphrase = prompt.contains("passphrase", Qt::CaseInsensitive);
-    const auto entry = passphrase ? "passphrase:" + prompt.trimmed() : target;
-    const auto saved = target.isEmpty() || passphrase ? std::nullopt : vaultRead(target);
+    const auto tag = foreign ? entry.toUtf8().toBase64() + ' ' : QByteArray();
+    qsizetype line = 0;
+    if (foreign)
+    {
+        line = 1;
+        while (line < states.size() && !states[line].startsWith(tag))
+            ++line;
+        if (line == states.size())
+            states << tag;
+    }
+    const auto state = states[line].mid(tag.size()).trimmed();
+    const int attempt = QByteArray(state).replace('c', "").replace('p', "").toInt() + 1;
+    QByteArray answered = state.contains('c') ? "c" : "";
+    if (state.contains('p'))
+        answered += 'p';
+    auto record = [&]
+    {
+        states[line] = tag + QByteArray::number(attempt) + answered;
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            file.write(states.join('\n'));
+        file.close();
+    };
+    record();
+    const auto saved = target.isEmpty() || passphrase || foreign ? std::nullopt : vaultRead(target);
     if (attempt == 1 && saved)
     {
         writeAnswer(*saved);
         return 0;
     }
     auto cached = entry.isEmpty() ? QString() : askSessionSecrets("GET", entry);
-    if (attempt <= 2 && !cached.isEmpty() && !(attempt == 2 && !saved))
+    // Not answered to this process yet, also when it was typed in the terminal while this process was already
+    // asking (SFTP and monitoring start without a password): judging by the attempt number alone discarded it.
+    if (!cached.isEmpty() && !answered.contains(kind))
     {
+        answered += kind;
+        record();
         writeAnswer(cached); // password already typed in this CrossTerm session
         return 0;
     }
-    if (attempt > 1 && !cached.isEmpty())
-        askSessionSecrets("DEL", entry); // rejected by the server: do not offer it again
+    if (!cached.isEmpty())
+        askSessionSecrets("DEL", entry); // answered and asked again: rejected by the server, do not offer it again
     cached.fill(QChar(0));
     if (!interactive || attempt > 3)
         return 1;
@@ -385,7 +713,11 @@ inline int runAskpass(int &argc, char **argv)
         if (saved && !passphrase)
             vaultStore(target, *typed.value);
         if (!entry.isEmpty())
+        {
             askSessionSecrets("PUT", entry, *typed.value);
+            answered += kind;
+            record();
+        }
         writeAnswer(*typed.value);
         typed.value->fill(QChar(0));
         return 0;
@@ -408,7 +740,9 @@ inline int runAskpass(int &argc, char **argv)
     secret->setEchoMode(QLineEdit::Password);
     layout->addWidget(secret);
     auto *remember = new QCheckBox(L("Save password in the system vault"));
-    remember->setVisible(vaultAvailable() && !target.isEmpty() && !prompt.contains("passphrase", Qt::CaseInsensitive));
+    // The vault belongs to the window that launched ssh: nothing to save into without it.
+    remember->setVisible(vaultAvailable() && !target.isEmpty() && !passphrase && !foreign &&
+                         qEnvironmentVariableIsSet("CROSSTERM_ASKPASS_SERVER"));
     remember->setChecked(saved.has_value());
     layout->addWidget(remember);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
@@ -428,7 +762,11 @@ inline int runAskpass(int &argc, char **argv)
             vaultRemove(target);
     }
     if (!entry.isEmpty())
+    {
         askSessionSecrets("PUT", entry, value); // reused by the session's SFTP, monitoring and tunnels
+        answered += kind;
+        record();
+    }
     writeAnswer(value);
     value.fill(QChar(0));
     secret->clear();

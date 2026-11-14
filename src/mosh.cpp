@@ -1,5 +1,6 @@
 #include "mosh.h"
 #include "terminal.h"
+#include "vnc.h" // VncInflater: inflate with an output limit
 #include <QElapsedTimer>
 #include <QHostAddress>
 #include <QHostInfo>
@@ -501,10 +502,21 @@ QByteArray zlibCompress(const QByteArray &data)
 
 QByteArray zlibUncompress(const QByteArray &data)
 {
-    // qUncompress expects the length up front: it is only a hint, Qt grows the buffer if needed.
-    QByteArray framed(4, '\0');
-    qToBigEndian(quint32(qMin<qsizetype>(data.size() * 8 + 64, 1 << 20)), framed.data());
-    return qUncompress(framed + data);
+    // Inflated with a hard limit (qUncompress has none: a few kilobytes of zeros expand to gigabytes). mosh never
+    // sends more than 4 MiB; a larger, corrupt or cut stream gives nothing, which is dropped like any bad packet.
+    VncInflater inflater;
+    QByteArray plain;
+    if (!inflater.feed(data, plain, 4 << 20) || !inflater.atEnd() || inflater.unread() < 4)
+        return {};
+    quint32 a = 1, b = 0; // Adler-32 of the content, which follows the stream
+    for (const char ch : plain)
+    {
+        a = (a + uchar(ch)) % 65521;
+        b = (b + a) % 65521;
+    }
+    if (qFromBigEndian<quint32>(data.constData() + data.size() - inflater.unread()) != (b << 16 | a))
+        return {};
+    return plain;
 }
 
 QByteArray seal(const Ocb &ocb, const Packet &packet)
@@ -553,10 +565,16 @@ bool Assembler::add(const QByteArray &fragment, Instruction &inst)
     const quint16 n = qFromBigEndian<quint16>(fragment.constData() + 8);
     const int num = n & 0x7fff;
     if (fid != id)
-        id = fid, total = -1, parts.clear();
+        id = fid, total = -1, bytes = 0, parts.clear();
     if (parts.size() <= num)
         parts.resize(num + 1);
+    bytes += fragment.size() - 10 - parts[num].size();
     parts[num] = fragment.mid(10);
+    if (bytes > (8 << 20)) // mosh never sends more than 4 MB: drop it instead of buffering without limit
+    {
+        total = -1, bytes = 0, parts.clear();
+        return false;
+    }
     if (n & 0x8000)
         total = num + 1;
     if (total < 0 || parts.size() != total)
@@ -570,7 +588,9 @@ bool Assembler::add(const QByteArray &fragment, Instruction &inst)
     }
     parts.clear();
     total = -1;
-    return decodeInstruction(zlibUncompress(whole), inst);
+    bytes = 0;
+    const QByteArray plain = zlibUncompress(whole);
+    return !plain.isEmpty() && decodeInstruction(plain, inst); // empty: corrupt or oversized
 }
 } // namespace mosh
 
@@ -579,6 +599,8 @@ namespace
 {
 constexpr int AckInterval = 3000, AckDelay = 100;    // heartbeat and maximum ack delay (same values as mosh)
 constexpr int FirstContact = 15000, Silence = 60000; // with no reply from the server the session ends
+constexpr int ActiveRetry = 10000;                   // longer silence: no more retransmissions, only heartbeats (as mosh)
+constexpr int Quiet = 4000;                          // silence reported to onSilence (the server heartbeat is 3 s)
 constexpr quint64 Shutdown = ~0ULL;
 } // namespace
 
@@ -611,6 +633,7 @@ struct MoshDevice::State
     qint64 savedAt = 0, lastHeard = -1;
     double srtt = 1000, rttvar = 500;
     bool rttHit = false;
+    bool quiet = false; // silent for Quiet ms: onSilence called
     QByteArray readBuffer;
 
     int rto() const { return qBound(50, int(std::ceil(srtt + 4 * rttvar)), 1000); }
@@ -657,8 +680,7 @@ MoshDevice::MoshDevice(const QString &host, quint16 udpPort, const QByteArray &k
     d->socket.bind(QHostAddress(QHostAddress::Any), 0);
     QObject::connect(&d->socket, &QUdpSocket::readyRead, this, [this] { receive(); });
     QObject::connect(&d->timer, &QTimer::timeout, this, [this] { tick(); });
-    // ponytail: fixed 20 ms timer instead of computing the next deadline as mosh does; costs ~50 wakeups/s.
-    d->timer.start(20);
+    d->timer.setSingleShot(true); // re-armed by tick() to the next deadline
     open(QIODevice::ReadWrite | QIODevice::Unbuffered);
     d->events << mosh::Action{{}, d->lastCols, d->lastRows}; // the server learns the client from the first packet
     if (!d->address.setAddress(host))
@@ -752,25 +774,50 @@ void MoshDevice::tick()
     if (s.lastHeard < 0 ? now > FirstContact : now - s.lastHeard > Silence)
         return finish(s.lastHeard < 0 ? tr("No response from mosh-server (is the UDP port reachable?)")
                                       : tr("mosh-server stopped responding"));
+    if (!s.quiet && s.lastHeard >= 0 && now - s.lastHeard >= Quiet)
+    {
+        s.quiet = true;
+        if (onSilence)
+            onSilence();
+    }
     // State the server has probably received: those sent less than an RTO ago count as received.
-    int assumed = 0;
-    for (int i = 1; i < s.sent.size() && now - s.sent[i].time < s.rto() + AckDelay; ++i)
-        assumed = i;
+    const auto assumedState = [&s, now]
+    {
+        int i = 0;
+        while (i + 1 < s.sent.size() && now - s.sent[i + 1].time < s.rto() + AckDelay)
+            ++i;
+        return i;
+    };
+    int assumed = assumedState();
     const qint64 cur = s.current();
-    const bool pending = cur != s.sent[assumed].count;
-    const bool sendDue = pending && now - s.sent.last().time >= s.sendInterval();
+    bool pending = cur != s.sent[assumed].count;
+    // New states always go out; retransmissions only while the server answers (heartbeats carry the diff).
+    const bool retrying = now - qMax<qint64>(s.lastHeard, 0) < ActiveRetry;
+    const bool sendDue = pending && (retrying || cur != s.sent.last().count) && now - s.sent.last().time >= s.sendInterval();
     const bool ackDue = now >= s.nextAck || s.remoteNum == Shutdown;
-    if (!(sendDue || ackDue))
-        return;
-    const quint64 oldNum = s.sent[assumed].num;
-    const QByteArray diff = pending ? s.diffFrom(s.sent[assumed].count) : QByteArray();
-    if (pending && cur == s.sent.last().count)
-        s.sent.last().time = now; // retransmission of the same state
-    else
-        s.sent << State::Sent{s.sent.last().num + 1, now, cur};
-    if (s.sent.size() > 32)
-        s.sent.removeAt(s.sent.size() - 16);
-    s.sendInstruction(oldNum, s.sent.last().num, diff);
+    if (sendDue || ackDue)
+    {
+        const quint64 oldNum = s.sent[assumed].num;
+        const QByteArray diff = pending ? s.diffFrom(s.sent[assumed].count) : QByteArray();
+        if (pending && cur == s.sent.last().count)
+            s.sent.last().time = now; // retransmission of the same state
+        else
+            s.sent << State::Sent{s.sent.last().num + 1, now, cur};
+        if (s.sent.size() > 32)
+            s.sent.removeAt(s.sent.size() - 16);
+        s.sendInstruction(oldNum, s.sent.last().num, diff);
+        assumed = assumedState();
+        pending = cur != s.sent[assumed].count;
+    }
+    // Next wakeup, as mosh's wait_time(): ack/heartbeat, (re)send, silence timeout. Every deadline is after now.
+    qint64 next = qMin(s.nextAck, s.lastHeard < 0 ? FirstContact + 1 : s.lastHeard + Silence + 1);
+    if (!s.quiet && s.lastHeard >= 0) // never reached while the server heartbeats arrive: no extra wakeup
+        next = qMin(next, s.lastHeard + Quiet);
+    if (pending && (retrying || cur != s.sent.last().count))
+        next = qMin(next, s.sent.last().time + s.sendInterval());
+    else if (retrying && cur != s.sent.first().count) // unacked: retransmit when the oldest stops counting as received
+        next = qMin(next, s.sent[1].time + s.rto() + AckDelay);
+    s.timer.start(int(qBound(qint64(1), next - now, qint64(Silence))));
 }
 
 void MoshDevice::receive()
@@ -803,8 +850,14 @@ void MoshDevice::receive()
                     }
                 }
             }
+            s.lastHeard = now; // as mosh: replayed or duplicated packets do not keep a dead session alive
+            if (s.quiet)
+            {
+                s.quiet = false;
+                if (onSilence)
+                    onSilence();
+            }
         }
-        s.lastHeard = now;
         if (!s.assembler.add(p.payload, inst))
             continue;
         if (inst.protocolVersion != 2)
@@ -834,14 +887,21 @@ void MoshDevice::receive()
         if (s.remoteNum == Shutdown)
         {
             tick(); // ack the server's close immediately
+            normalEnd = true;
             return finish(tr("Mosh session ended"));
         }
     }
+    tick(); // acks, RTT and acked states changed: re-arm the timer
 }
 
 double MoshDevice::srtt() const
 {
     return d->srtt;
+}
+
+qint64 MoshDevice::silence() const
+{
+    return d->lastHeard < 0 ? -1 : d->clock.elapsed() - d->lastHeard;
 }
 
 // --- local echo ---
@@ -888,7 +948,7 @@ void MoshPredictor::input(const QByteArray &keys)
         const QPoint at = erase ? cursor - QPoint(1, 0) : cursor;
         const char32_t original = terminal.cellChar(at.y(), at.x());
         // Control keys, sequences, wide characters and the screen edge: no prediction, new epoch.
-        // ponytail: no predicted line wrap or insert-with-shift, a reduced version of mosh's predictor.
+        // Overwrite only: unlike mosh, no predicted line wrap or insert-with-shift.
         if ((c < 0x20 && !erase) || c >= 0x1100 || !original)
         {
             cursor = {-1, -1};

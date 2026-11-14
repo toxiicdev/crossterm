@@ -13,7 +13,7 @@ class WindowButtons : public QWidget
 {
     static constexpr int D = 12, Gap = 8, Margin = 10;
     int hover = -1;
-    bool pressed = false;
+    int pressed = -1; // index of the button held down, -1 when none
 
     int at(QPoint p) const
     {
@@ -57,13 +57,14 @@ protected:
         for (int i = 0; i < 3; ++i)
         {
             const QRectF r = QRectF(circle(i)).adjusted(0.5, 0.5, -0.5, -0.5);
+            const bool down = pressed == i;
             p.setPen(QPen(active ? edge[i] : (dark ? QColor("#3a3a3a") : QColor("#c8c8c8")), 1));
-            p.setBrush(active ? fill[i] : (dark ? QColor("#4a4a4a") : QColor("#dcdcdc")));
+            p.setBrush(!active ? (dark ? QColor("#4a4a4a") : QColor("#dcdcdc")) : down ? fill[i].darker(115) : fill[i]);
             p.drawEllipse(r);
             if (hover < 0)
                 continue;
             // Glyphs appear while the pointer is over the group, as on macOS.
-            p.setPen(QPen(QColor(0, 0, 0, pressed ? 170 : 130), 1.3, Qt::SolidLine, Qt::RoundCap));
+            p.setPen(QPen(QColor(0, 0, 0, down ? 170 : 130), 1.3, Qt::SolidLine, Qt::RoundCap));
             const QPointF c = r.center();
             const qreal k = 2.6;
             if (i == 0)
@@ -76,7 +77,7 @@ protected:
             else
             {
                 p.setPen(Qt::NoPen);
-                p.setBrush(QColor(0, 0, 0, pressed ? 170 : 130));
+                p.setBrush(QColor(0, 0, 0, down ? 170 : 130));
                 const qreal s = 3.4;
                 p.drawPolygon(QPolygonF{c + QPointF(-s, -s), c + QPointF(s * 0.55, -s), c + QPointF(-s, s * 0.55)});
                 p.drawPolygon(QPolygonF{c + QPointF(s, s), c + QPointF(-s * 0.55, s), c + QPointF(s, -s * 0.55)});
@@ -95,21 +96,22 @@ protected:
     void leaveEvent(QEvent *) override
     {
         hover = -1;
-        pressed = false;
+        pressed = -1;
         update();
     }
     void mousePressEvent(QMouseEvent *e) override
     {
-        pressed = e->button() == Qt::LeftButton && at(e->position().toPoint()) >= 0;
+        pressed = e->button() == Qt::LeftButton ? at(e->position().toPoint()) : -1;
         update();
     }
     void mouseReleaseEvent(QMouseEvent *e) override
     {
-        const bool was = pressed;
-        pressed = false;
+        const int was = pressed;
+        pressed = -1;
         update();
-        if (was && e->button() == Qt::LeftButton)
-            trigger(at(e->position().toPoint()));
+        // Only the button that was pressed fires, and only when released over it.
+        if (was >= 0 && e->button() == Qt::LeftButton && at(e->position().toPoint()) == was)
+            trigger(was);
     }
     void changeEvent(QEvent *e) override
     {
@@ -124,6 +126,9 @@ class TitleBarFilter : public QObject
 {
     QMainWindow *main;
     static constexpr int Border = 5;
+#ifdef Q_OS_LINUX
+    Qt::Edges cursorEdges; // edges the resize cursor is currently shown for
+#endif
 
     Qt::Edges edgesAt(QPoint p) const
     {
@@ -162,18 +167,22 @@ public:
             if (type == QEvent::MouseMove || type == QEvent::HoverMove)
             {
                 const auto e = edgesAt(main->mapFromGlobal(QCursor::pos()));
-                const bool diag = (e & Qt::LeftEdge && e & Qt::TopEdge) || (e & Qt::RightEdge && e & Qt::BottomEdge);
-                const bool anti = (e & Qt::RightEdge && e & Qt::TopEdge) || (e & Qt::LeftEdge && e & Qt::BottomEdge);
-                if (diag)
-                    main->setCursor(Qt::SizeFDiagCursor);
-                else if (anti)
-                    main->setCursor(Qt::SizeBDiagCursor);
-                else if (e & (Qt::LeftEdge | Qt::RightEdge))
-                    main->setCursor(Qt::SizeHorCursor);
-                else if (e)
-                    main->setCursor(Qt::SizeVerCursor);
-                else
-                    main->unsetCursor();
+                if (e != cursorEdges) // the cursor changes only when the pointer reaches or leaves an edge
+                {
+                    cursorEdges = e;
+                    const bool diag = (e & Qt::LeftEdge && e & Qt::TopEdge) || (e & Qt::RightEdge && e & Qt::BottomEdge);
+                    const bool anti = (e & Qt::RightEdge && e & Qt::TopEdge) || (e & Qt::LeftEdge && e & Qt::BottomEdge);
+                    if (diag)
+                        main->setCursor(Qt::SizeFDiagCursor);
+                    else if (anti)
+                        main->setCursor(Qt::SizeBDiagCursor);
+                    else if (e & (Qt::LeftEdge | Qt::RightEdge))
+                        main->setCursor(Qt::SizeHorCursor);
+                    else if (e)
+                        main->setCursor(Qt::SizeVerCursor);
+                    else
+                        main->unsetCursor();
+                }
             }
             if (type == QEvent::MouseButtonPress && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton)
             {
