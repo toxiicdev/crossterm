@@ -60,19 +60,24 @@ else
 fi
 # macdeployqt rewrites the binaries and invalidates their signatures: re-sign the whole bundle, otherwise macOS
 # refuses out-of-process services (file panels, Keychain) to the app.
-# 1) Apple Developer ID (CROSSTERM_SIGN_IDENTITY, or the first "Developer ID Application" certificate found):
-#    hardened runtime + secure timestamp, required for notarization; other Macs open the app without warnings.
-#    Notarization when CROSSTERM_NOTARY_PROFILE names a profile saved once with
+# 1) Apple certificate (CROSSTERM_SIGN_IDENTITY, or the first "Developer ID Application" found, else the first
+#    "Apple Development"): hardened runtime + secure timestamp.
+#    Developer ID: other Macs open the app without warnings; notarization when CROSSTERM_NOTARY_PROFILE names a
+#    profile saved once with
 #    `xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <team> --password <app-specific password>`.
+#    Apple Development: runs on this Mac only (other Macs block it, Apple does not notarize it).
 # 2) Otherwise a local self-signed certificate (created once in the login keychain).
 # Both keep the same signature across builds, so Keychain "Always Allow" stays valid; an ad hoc signature changes
 # at every build and the password is asked again.
-DEVELOPER_ID="${CROSSTERM_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null |
+IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+DEVELOPER_ID="${CROSSTERM_SIGN_IDENTITY:-$(printf '%s\n' "$IDENTITIES" |
     sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)}"
+DEVELOPER_ID="${DEVELOPER_ID:-$(printf '%s\n' "$IDENTITIES" | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -n 1)}"
 if [ -n "$DEVELOPER_ID" ]; then
     codesign --force --deep --options runtime --timestamp --sign "$DEVELOPER_ID" "$BUILD/CrossTerm.app"
     codesign --verify --deep --strict "$BUILD/CrossTerm.app" && echo "Signed with \"$DEVELOPER_ID\""
-    if [ -n "${CROSSTERM_NOTARY_PROFILE:-}" ]; then
+    case "$DEVELOPER_ID" in "Developer ID Application:"*) NOTARY="${CROSSTERM_NOTARY_PROFILE:-}" ;; *) NOTARY= ;; esac
+    if [ -n "$NOTARY" ]; then
         ditto -c -k --keepParent "$BUILD/CrossTerm.app" "$BUILD/CrossTerm-notarize.zip"
         xcrun notarytool submit "$BUILD/CrossTerm-notarize.zip" --keychain-profile "$CROSSTERM_NOTARY_PROFILE" --wait
         xcrun stapler staple "$BUILD/CrossTerm.app"
