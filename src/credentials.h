@@ -15,4 +15,6 @@ bool removeSecret(const QString &target);
 #ifdef Q_OS_MACOS
 // Touch ID (or the Mac password) before the first saved password is read; "vault/touchId" setting, on by default.
 bool confirmOwner(const QString &reason);
+// Reads all saved passwords (one Keychain item) once; called when CrossTerm opens. False if access was refused.
+bool unlockVault();
 #endif

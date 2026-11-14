@@ -637,8 +637,10 @@ Command sessionCommand(const QJsonObject &profile, const QString &platform, bool
         args << "-C";
     args << "-o" << "ServerAliveInterval=30"; // Keepalive for SSH sessions and the SFTP browser
     // X11: on Windows ssh has no xauth for "untrusted" cookies, so use -Y (trusted) with the local X server.
+    // On macOS -X makes ssh generate a cookie by connecting to the display, which starts XQuartz at every login;
+    // -Y only reads the existing cookie, so XQuartz starts when a remote X program actually opens a window.
     if (ssh && display && profile["x11"].toBool())
-        args << (platform == "windows" ? "-Y" : "-X");
+        args << (platform == "linux" ? "-X" : "-Y");
     // HTTP/SOCKS proxy: CrossTerm itself acts as the ProxyCommand (ssh ignores it when jump hosts are set).
     const auto proxyType = profile["proxyType"].toString();
     if (!proxyType.isEmpty() && proxyType != "none")

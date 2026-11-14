@@ -4077,6 +4077,24 @@ public:
                       "first login: SFTP lists on its own after the host key and password: " + first->sftp->message());
                 SessionSecrets::instance().forget(target);
                 closePage(first);
+
+                // Same with a saved password: after "yes" the vault password logs in without being asked.
+                QProcess::execute(keygen, {"-R", "[127.0.0.1]:2222"});
+                storeSecret(target, "test", "test-password-123");
+                open(pw);
+                auto *saved = current();
+                wait(20000,
+                     [&]
+                     {
+                         return saved->terminal->prompting() &&
+                                saved->terminal->contents().contains("fingerprint", Qt::CaseInsensitive);
+                     });
+                type(saved->terminal, "yes\r");
+                check(wait(20000, [&] { return saved->terminal->contents().contains("test@localhost:~$"); }),
+                      "first login with a saved password: logged in after the host key without typing it");
+                removeSecret(target);
+                SessionSecrets::instance().forget(target);
+                closePage(saved);
             }
         }
 
@@ -5147,6 +5165,11 @@ int main(int argc, char **argv)
         window.move(-20000, -20000);
     }
     window.show();
+#ifdef Q_OS_MACOS
+    // Saved passwords unlocked once, as soon as the window is up (one Keychain / Touch ID prompt per launch).
+    if (e2e <= 0 && !smoke)
+        QTimer::singleShot(0, &window, [] { unlockVault(); });
+#endif
     if (e2e > 0 && e2e + 1 < app.arguments().size())
         return window.e2e(app.arguments()[e2e + 1]);
     if (smoke)

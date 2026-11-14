@@ -328,14 +328,6 @@ inline int runAskpass(int &argc, char **argv)
     const auto prompt = app->arguments().value(1);
     const auto target = qEnvironmentVariable("CROSSTERM_CREDENTIAL");
     const bool interactive = !qEnvironmentVariableIsSet("CROSSTERM_ASKPASS_NONINTERACTIVE");
-    // Attempt counter for this ssh process (the file holds just a number).
-    const auto counter = QDir::temp().filePath("crossterm-askpass-" + qEnvironmentVariable("CROSSTERM_ASKPASS_TOKEN"));
-    QFile file(counter);
-    int attempt = file.open(QIODevice::ReadOnly) ? file.readAll().toInt() + 1 : 1;
-    file.close();
-    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        file.write(QByteArray::number(attempt));
-    file.close();
     applyLanguage(currentLanguage());
     const bool secretPrompt = prompt.contains("password", Qt::CaseInsensitive) ||
                               prompt.contains("passphrase", Qt::CaseInsensitive) || prompt.contains("PIN", Qt::CaseSensitive);
@@ -355,6 +347,15 @@ inline int runAskpass(int &argc, char **argv)
         writeAnswer(answer == QMessageBox::Yes ? "yes" : "no");
         return 0;
     }
+    // Attempt counter for this ssh process (the file holds just a number). Only secret prompts count:
+    // a host key question answered first must not turn the first password prompt into a "retry".
+    const auto counter = QDir::temp().filePath("crossterm-askpass-" + qEnvironmentVariable("CROSSTERM_ASKPASS_TOKEN"));
+    QFile file(counter);
+    int attempt = file.open(QIODevice::ReadOnly) ? file.readAll().toInt() + 1 : 1;
+    file.close();
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(QByteArray::number(attempt));
+    file.close();
     // Cache entry: the session password, or the passphrase of the key named in the prompt.
     const bool passphrase = prompt.contains("passphrase", Qt::CaseInsensitive);
     const auto entry = passphrase ? "passphrase:" + prompt.trimmed() : target;

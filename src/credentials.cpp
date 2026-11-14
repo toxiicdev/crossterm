@@ -5,8 +5,9 @@
 #include <windows.h>
 #include <wincred.h>
 #elif defined(Q_OS_MACOS)
-#include <QHash>
+#include <QJsonDocument>
 #include <QSettings>
+#include <QStringList>
 #include <Security/Security.h>
 #else
 #include <QLibrary>
@@ -74,41 +75,58 @@ void wipe(QByteArray &bytes)
 #if defined(Q_OS_MACOS)
 namespace
 {
-// Base Keychain query: generic password, service "CrossTerm", account = entry name.
-CFMutableDictionaryRef keychainQuery(const QString &target)
+// All passwords live in one Keychain item, read once per launch: macOS asks for Keychain access (and Touch ID)
+// once when CrossTerm opens, not at every SSH, SFTP or monitoring connection.
+const QString Bundle = QStringLiteral("CrossTerm vault");
+
+// Base Keychain query: generic password, service "CrossTerm", account = item name.
+CFMutableDictionaryRef keychainQuery(const QString &account)
 {
     CFMutableDictionaryRef query =
         CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFStringRef service = QStringLiteral("CrossTerm").toCFString(), account = target.toCFString();
+    CFStringRef service = QStringLiteral("CrossTerm").toCFString();
     CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
     CFDictionarySetValue(query, kSecAttrService, service);
-    CFDictionarySetValue(query, kSecAttrAccount, account);
     CFRelease(service);
-    CFRelease(account);
+    if (!account.isEmpty())
+    {
+        CFStringRef name = account.toCFString();
+        CFDictionarySetValue(query, kSecAttrAccount, name);
+        CFRelease(name);
+    }
     return query;
 }
 
-// Entries already read in this run: macOS asks for Keychain access (and Touch ID) once per entry per launch, not at
-// every SSH, SFTP or monitoring connection.
-QHash<QString, QString> &readCache()
+bool itemExists(const QString &account)
 {
-    static QHash<QString, QString> cache;
-    return cache;
-}
-} // namespace
-
-bool vaultAvailable()
-{
-    return true;
+    CFMutableDictionaryRef query = keychainQuery(account);
+    const bool found = SecItemCopyMatching(query, nullptr) == errSecSuccess; // attributes only: no prompt
+    CFRelease(query);
+    return found;
 }
 
-bool storeSecret(const QString &target, const QString &, const QString &secret)
+std::optional<QByteArray> itemRead(const QString &account)
 {
-    QByteArray bytes = secret.toUtf8();
-    // NoCopy: the only copy of the secret stays in "bytes", which is zeroed at the end.
+    CFMutableDictionaryRef query = keychainQuery(account);
+    CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
+    CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
+    CFTypeRef result = nullptr;
+    const OSStatus status = SecItemCopyMatching(query, &result);
+    CFRelease(query);
+    if (status != errSecSuccess || !result)
+        return std::nullopt;
+    const auto data = static_cast<CFDataRef>(result);
+    QByteArray bytes(reinterpret_cast<const char *>(CFDataGetBytePtr(data)), qsizetype(CFDataGetLength(data)));
+    CFRelease(result);
+    return bytes;
+}
+
+bool itemWrite(const QString &account, const QByteArray &bytes)
+{
+    // NoCopy: the only copy of the secret stays in "bytes", which the caller zeroes.
     CFDataRef data = CFDataCreateWithBytesNoCopy(nullptr, reinterpret_cast<const UInt8 *>(bytes.constData()),
                                                  CFIndex(bytes.size()), kCFAllocatorNull);
-    CFMutableDictionaryRef query = keychainQuery(target);
+    CFMutableDictionaryRef query = keychainQuery(account);
     CFMutableDictionaryRef changes =
         CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFDictionarySetValue(changes, kSecValueData, data);
@@ -121,59 +139,124 @@ bool storeSecret(const QString &target, const QString &, const QString &secret)
     CFRelease(changes);
     CFRelease(query);
     CFRelease(data);
-    wipe(bytes);
-    if (status == errSecSuccess)
-        readCache().insert(target, secret);
     return status == errSecSuccess;
+}
+
+bool itemDelete(const QString &account)
+{
+    CFMutableDictionaryRef query = keychainQuery(account);
+    const OSStatus status = SecItemDelete(query);
+    CFRelease(query);
+    return status == errSecSuccess || status == errSecItemNotFound;
+}
+
+// One item per password, as written by earlier versions: names only, no prompt.
+QStringList legacyAccounts()
+{
+    CFMutableDictionaryRef query = keychainQuery({});
+    CFDictionarySetValue(query, kSecReturnAttributes, kCFBooleanTrue);
+    CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitAll);
+    CFTypeRef result = nullptr;
+    const OSStatus status = SecItemCopyMatching(query, &result);
+    CFRelease(query);
+    QStringList names;
+    if (status != errSecSuccess || !result)
+        return names;
+    const auto items = static_cast<CFArrayRef>(result);
+    for (CFIndex i = 0; i < CFArrayGetCount(items); ++i)
+    {
+        const auto item = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(items, i));
+        if (const auto account = static_cast<CFStringRef>(CFDictionaryGetValue(item, kSecAttrAccount)))
+            if (const auto name = QString::fromCFString(account); name != Bundle)
+                names << name;
+    }
+    CFRelease(result);
+    return names;
+}
+
+QJsonObject &entries()
+{
+    static QJsonObject vault;
+    return vault;
+}
+
+bool saveVault()
+{
+    QByteArray bytes = QJsonDocument(entries()).toJson(QJsonDocument::Compact);
+    const bool ok = itemWrite(Bundle, bytes);
+    wipe(bytes);
+    return ok;
+}
+} // namespace
+
+bool unlockVault()
+{
+    static bool unlocked = false;
+    if (unlocked)
+        return true;
+    const QStringList legacy = legacyAccounts();
+    const bool bundle = itemExists(Bundle);
+    if (bundle || !legacy.isEmpty())
+    {
+        // Touch ID (or the Mac password) once; not in offscreen runs (tests), where nobody can answer.
+        if (QSettings().value("vault/touchId", true).toBool() && qEnvironmentVariable("QT_QPA_PLATFORM") != "offscreen" &&
+            !confirmOwner(QStringLiteral("use saved passwords")))
+            return false;
+        if (bundle)
+        {
+            auto bytes = itemRead(Bundle);
+            if (!bytes)
+                return false; // Keychain access denied: asked again at the next use
+            entries() = QJsonDocument::fromJson(*bytes).object();
+            wipe(*bytes);
+        }
+        // Earlier versions: move the separate items into the single one (one last prompt each, then never again).
+        QStringList moved;
+        for (const auto &name : legacy)
+            if (!entries().contains(name))
+                if (auto bytes = itemRead(name))
+                {
+                    entries()[name] = QString::fromUtf8(*bytes);
+                    wipe(*bytes);
+                    moved << name;
+                }
+        if (!moved.isEmpty() && saveVault())
+            for (const auto &name : moved)
+                itemDelete(name);
+    }
+    unlocked = true;
+    return true;
+}
+
+bool vaultAvailable()
+{
+    return true;
+}
+
+bool storeSecret(const QString &target, const QString &, const QString &secret)
+{
+    if (!unlockVault())
+        return false;
+    entries()[target] = secret;
+    return saveVault();
 }
 
 std::optional<QString> readSecret(const QString &target)
 {
-    if (const auto cached = readCache().constFind(target); cached != readCache().cend())
-        return *cached;
-    CFMutableDictionaryRef query = keychainQuery(target);
-    // Touch ID once per run, only when there is a saved password to read (the existence check reads no data).
-    static bool confirmed = false;
-    if (!confirmed && QSettings().value("vault/touchId", true).toBool())
-    {
-        if (SecItemCopyMatching(query, nullptr) != errSecSuccess)
-        {
-            CFRelease(query);
-            return std::nullopt;
-        }
-        if (!confirmOwner(QStringLiteral("use saved passwords")))
-        {
-            CFRelease(query);
-            return std::nullopt;
-        }
-        confirmed = true;
-    }
-    CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
-    CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
-    CFTypeRef result = nullptr;
-    const OSStatus status = SecItemCopyMatching(query, &result);
-    CFRelease(query);
-    if (status != errSecSuccess || !result)
+    if (!unlockVault() || !entries().contains(target))
         return std::nullopt;
-    const auto data = static_cast<CFDataRef>(result);
-    const QString secret =
-        QString::fromUtf8(reinterpret_cast<const char *>(CFDataGetBytePtr(data)), qsizetype(CFDataGetLength(data)));
-    CFRelease(result);
-    readCache().insert(target, secret);
-    return secret;
+    return entries().value(target).toString();
 }
 
 bool removeSecret(const QString &target)
 {
-    if (auto cached = readCache().find(target); cached != readCache().end())
-    {
-        cached->fill(QChar(0));
-        readCache().erase(cached);
-    }
-    CFMutableDictionaryRef query = keychainQuery(target);
-    const OSStatus status = SecItemDelete(query);
-    CFRelease(query);
-    return status == errSecSuccess || status == errSecItemNotFound;
+    if (!unlockVault())
+        return false;
+    itemDelete(target); // separate item from an earlier version, if any
+    if (!entries().contains(target))
+        return true;
+    entries().remove(target);
+    return saveVault();
 }
 #else
 namespace

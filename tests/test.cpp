@@ -47,6 +47,7 @@ int main(int argc, char **argv)
         proxied["proxyHost"] = "-bad";
         CHECK(!sessionCommand(proxied, "windows", false).error.isEmpty())
         CHECK(sessionCommand(ssh, "windows", true).arguments.contains("-Y"))
+        CHECK(sessionCommand(ssh, "macos", true).arguments.contains("-Y"))
     }
     auto invalid = ssh;
     invalid["host"] = "-oProxyCommand";
