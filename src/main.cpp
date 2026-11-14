@@ -527,6 +527,8 @@ private:
             delete p->monitor;
             delete p;
             layoutPages();
+            if (bar->count() == 1)
+                showSide(0); // back to the home page: show the session list
             return;
         }
     }
