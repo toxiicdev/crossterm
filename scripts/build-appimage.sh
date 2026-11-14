@@ -4,8 +4,9 @@
 # The AppImage runs on distributions whose glibc is at least as new as the build machine's: for the widest reach
 # build on an older one (e.g. Ubuntu 22.04) with Qt 6.5+ from the Qt online installer or aqtinstall, passed as
 # CMAKE_PREFIX_PATH=/path/to/Qt/6.x/gcc_64.
-# Not bundled, expected on the target (present on desktop installs): libOpenGL/libEGL (libopengl0, libegl1), X11 or
-# XWayland (only the xcb platform plugin is bundled) and an ssh client.
+# Not bundled, expected on the target (present on desktop installs): libOpenGL/libEGL (libopengl0, libegl1), the
+# Wayland or X11 client libraries of the desktop, and an ssh client. Both platform plugins are bundled: native on
+# Wayland, xcb on X11 (and on Wayland with QT_QPA_PLATFORM=xcb).
 #
 # Usage: scripts/build-appimage.sh [build-dir]    (QMAKE=/path/to/qmake when it is not found automatically)
 set -eu
@@ -32,8 +33,9 @@ for tool in linuxdeploy/linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt/linuxd
     fi
 done
 
-# No FUSE needed (containers, CI); Qt SVG for the icon engine; version in the file name.
-export APPIMAGE_EXTRACT_AND_RUN=1 EXTRA_QT_MODULES=svg
+# No FUSE needed (containers, CI); Qt SVG for the icon engine, the Wayland client and platform plugin; version in
+# the file name.
+export APPIMAGE_EXTRACT_AND_RUN=1 EXTRA_QT_MODULES="svg;waylandclient" EXTRA_PLATFORM_PLUGINS=libqwayland-generic.so
 LINUXDEPLOY_OUTPUT_VERSION="$(sed -n 's/^CMAKE_PROJECT_VERSION:STATIC=//p' "$BUILD/CMakeCache.txt")"
 export LINUXDEPLOY_OUTPUT_VERSION
 rm -rf "$BUILD/AppDir"

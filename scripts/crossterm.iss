@@ -30,26 +30,37 @@ WizardStyle=modern
 CloseApplications=yes
 ShowLanguageDialog=auto
 
-; Every language of the program that Inno Setup has a translation for; the system language is picked automatically.
-; Unofficial translations (inno-languages\) come from jrsoftware/issrc at tag is-6_7_3. No Inno Setup translation
-; exists for am, fil, gu, ha, jv, kn, pa, sw, te: those systems get English.
+; Every language of the program; the system language is picked automatically. In inno-languages\: the unofficial
+; translations of jrsoftware/issrc at tag is-6_7_3 (Bengali, ChineseSimplified, Farsi, Hindi, Indonesian, Marathi,
+; Urdu, Vietnamese) and, where Inno Setup has none, translations of Default.isl 6.7.3 made for CrossTerm (Amharic,
+; Filipino, Gujarati, Hausa, Javanese, Kannada, Punjabi, Swahili, Telugu). Windows has no language id for Javanese:
+; it is chosen in the language dialog, never detected.
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"
+Name: "am"; MessagesFile: "inno-languages\Amharic.isl"
 Name: "ar"; MessagesFile: "compiler:Languages\Arabic.isl"
 Name: "bn"; MessagesFile: "inno-languages\Bengali.islu"
 Name: "de"; MessagesFile: "compiler:Languages\German.isl"
 Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "fa"; MessagesFile: "inno-languages\Farsi.isl"
+Name: "fil"; MessagesFile: "inno-languages\Filipino.isl"
 Name: "fr"; MessagesFile: "compiler:Languages\French.isl"
+Name: "gu"; MessagesFile: "inno-languages\Gujarati.isl"
+Name: "ha"; MessagesFile: "inno-languages\Hausa.isl"
 Name: "hi"; MessagesFile: "inno-languages\Hindi.islu"
 Name: "id"; MessagesFile: "inno-languages\Indonesian.isl"
 Name: "it"; MessagesFile: "compiler:Languages\Italian.isl"
 Name: "ja"; MessagesFile: "compiler:Languages\Japanese.isl"
+Name: "jv"; MessagesFile: "inno-languages\Javanese.isl"
+Name: "kn"; MessagesFile: "inno-languages\Kannada.isl"
 Name: "ko"; MessagesFile: "compiler:Languages\Korean.isl"
 Name: "mr"; MessagesFile: "inno-languages\Marathi.islu"
+Name: "pa"; MessagesFile: "inno-languages\Punjabi.isl"
 Name: "pt_BR"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
+Name: "sw"; MessagesFile: "inno-languages\Swahili.isl"
 Name: "ta"; MessagesFile: "compiler:Languages\Tamil.isl"
+Name: "te"; MessagesFile: "inno-languages\Telugu.isl"
 Name: "th"; MessagesFile: "compiler:Languages\Thai.isl"
 Name: "tr"; MessagesFile: "compiler:Languages\Turkish.isl"
 Name: "ur"; MessagesFile: "inno-languages\Urdu.isl"

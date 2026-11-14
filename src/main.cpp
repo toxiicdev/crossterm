@@ -140,44 +140,58 @@ static QString themed(const QString &dark)
     return style;
 }
 
-// Sessions open in tabs (count in Qt::UserRole + 4 and green row background, set by Window::markOpenSessions): from
-// two tabs up, a green badge with the count. White on #2e8b47 reads in every appearance (contrast 4.6:1).
+// Badges at the end of a session row, right to left: the number of tabs a session is open in (Qt::UserRole + 4, from
+// two up; green row background set by Window::markOpenSessions) and "conflict" on a copy kept by synchronization
+// (Qt::UserRole + 5). White text on #2e8b47 / #a35f00 reads in every appearance (contrast 4.6:1 / 5:1).
 class OpenSessionDelegate : public QStyledItemDelegate
 {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
     void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
     {
-        const int open = index.data(Qt::UserRole + 4).toInt();
-        if (open < 2)
+        QList<std::pair<QString, QColor>> badges;
+        if (const int open = index.data(Qt::UserRole + 4).toInt(); open >= 2)
+            badges.append({QString::number(open), QColor("#2e8b47")});
+        if (index.data(Qt::UserRole + 5).toBool())
+            badges.append({L("conflict"), QColor("#a35f00")});
+        if (badges.isEmpty())
             return QStyledItemDelegate::paint(painter, option, index);
-        const QString count = QString::number(open);
         QFont font = option.font;
         font.setPointSizeF(font.pointSizeF() * 0.85);
         font.setBold(true);
         const QFontMetrics metrics(font);
-        const int height = metrics.height(), width = std::max(height, metrics.horizontalAdvance(count) + 8);
-        const QRect badge(option.rect.right() - 8 - width, option.rect.center().y() - height / 2 + 1, width, height);
-        // Hover/selection background over the whole row, then the name elided before the badge.
+        const int height = metrics.height();
+        QList<QRect> boxes;
+        int right = option.rect.right() - 8;
+        for (const auto &[text, color] : badges)
+        {
+            const int width = std::max(height, metrics.horizontalAdvance(text) + 8);
+            boxes.append(QRect(right - width, option.rect.center().y() - height / 2 + 1, width, height));
+            right -= width + 4;
+        }
+        // Hover/selection background over the whole row, then the name elided before the badges.
         QStyleOptionViewItem panel(option);
         initStyleOption(&panel, index);
         const auto *view = option.widget;
         (view ? view->style() : QApplication::style())->drawPrimitive(QStyle::PE_PanelItemViewItem, &panel, painter, view);
-        QStyleOptionViewItem text(option);
-        text.rect.setRight(badge.left() - 4);
-        QStyledItemDelegate::paint(painter, text, index);
+        QStyleOptionViewItem name(option);
+        name.rect.setRight(right);
+        QStyledItemDelegate::paint(painter, name, index);
         painter->save();
         painter->setRenderHint(QPainter::Antialiasing);
-        painter->setPen(Qt::NoPen);
-        painter->setBrush(QColor("#2e8b47"));
-        painter->drawRoundedRect(badge, 4, 4); // square with softly rounded corners
         painter->setFont(font);
-        painter->setPen(Qt::white);
-        // Centered on the digits' own outline: AlignCenter centers the font's line box and leaves them low.
-        const QRectF ink = metrics.tightBoundingRect(count);
-        painter->drawText(QPointF(badge.left() + (badge.width() - ink.width()) / 2.0 - ink.left(),
-                                  badge.top() + (badge.height() - ink.height()) / 2.0 - ink.top()),
-                          count);
+        for (int i = 0; i < badges.size(); ++i)
+        {
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(badges[i].second);
+            painter->drawRoundedRect(boxes[i], 4, 4); // square with softly rounded corners
+            painter->setPen(Qt::white);
+            // Centered on the text's own outline: AlignCenter centers the font's line box and leaves digits low.
+            const QRectF ink = metrics.tightBoundingRect(badges[i].first);
+            painter->drawText(QPointF(boxes[i].left() + (boxes[i].width() - ink.width()) / 2.0 - ink.left(),
+                                      boxes[i].top() + (boxes[i].height() - ink.height()) / 2.0 - ink.top()),
+                              badges[i].first);
+        }
         painter->restore();
     }
 };
@@ -1010,6 +1024,16 @@ private:
             {
                 row->setData(0, Qt::UserRole + 3, true); // recolored when the appearance changes
                 row->setForeground(0, QColor(themed("#e8b04a")));
+            }
+            // Copy kept by synchronization when the session was edited on two devices (SyncMerge::merge).
+            if (const auto original = p["conflictOf"].toString(); !original.isEmpty())
+            {
+                row->setData(0, Qt::UserRole + 5, true);
+                row->setToolTip(0, row->toolTip(0) +
+                                       Qt::convertFromPlainText(
+                                           L("Copy of %1: edited on two devices before they synchronized. Keep the right "
+                                             "version and delete the other.")
+                                               .arg(profileById(original)["name"].toString(name))));
             }
         }
         // Favorites: copies of the starred sessions, at the top of the tree.
@@ -2516,6 +2540,12 @@ private:
             return;
         }
         const int i = item && item->data(0, Qt::UserRole + 1).toBool() ? item->data(0, Qt::UserRole).toInt() : -1;
+        if (i >= 0 && !profiles[i].toObject()["conflictOf"].toString().isEmpty())
+        {
+            menu.addAction(L("Keep this version"), [&] { resolveConflict(i, true); });
+            menu.addAction(icon("delete", 16), L("Delete this copy"), [&] { resolveConflict(i, false); });
+            menu.addSeparator();
+        }
         if (i >= 0)
         {
             menu.addAction(icon("session", 16), L("Execute"), [&] { open(i); });
@@ -2537,6 +2567,40 @@ private:
         menu.addAction(L("Import sessions from file"), [&] { importFile(); });
         menu.addAction(L("Export sessions to file"), [&] { exportFile(); });
         menu.exec(tree->viewport()->mapToGlobal(at));
+    }
+
+    // A conflict copy (profiles[i], "conflictOf"): keep = its content replaces the original (same id, so tabs, recents
+    // and tunnels that point at the original stay valid); otherwise the copy goes. Either way one session remains.
+    void resolveConflict(int i, bool keep)
+    {
+        auto copy = profiles[i].toObject();
+        const auto original = copy["conflictOf"].toString();
+        copy.remove("conflictOf");
+        QJsonArray next;
+        bool replaced = false;
+        for (int j = 0; j < profiles.size(); ++j)
+        {
+            auto p = profiles[j].toObject();
+            if (j == i)
+                continue;
+            if (keep && p["id"].toString() == original)
+            {
+                p = copy;
+                p["id"] = original;
+                replaced = true;
+            }
+            next.append(p);
+        }
+        if (keep && !replaced) // the original was deleted meanwhile: the copy becomes the session
+            next.append(copy);
+        save(next);
+    }
+
+    // Name of a tunnel or macro, marked when it is a copy kept by synchronization (edited on two devices).
+    static QString conflictName(const QJsonObject &o)
+    {
+        const auto name = o["name"].toString();
+        return o["conflictOf"].toString().isEmpty() ? name : name + " (" + L("conflict") + ")";
     }
 
     QLabel *emptyPage()
@@ -2767,7 +2831,7 @@ private:
                 const auto id = t["id"].toString();
                 const bool dynamic = t["type"].toString() == "dynamic";
                 auto *item = new QTreeWidgetItem(
-                    list, {t["name"].toString(), kinds.value(t["type"].toString()), QString::number(t["listenPort"].toInt()),
+                    list, {conflictName(t), kinds.value(t["type"].toString()), QString::number(t["listenPort"].toInt()),
                            dynamic ? QString("-") : QString("%1:%2").arg(t["destHost"].toString()).arg(t["destPort"].toInt()),
                            profileById(t["session"].toString())["name"].toString(),
                            tunnelStatus.value(id, running.contains(id) ? L("Running") : L("Stopped"))});
@@ -2957,7 +3021,7 @@ private:
     {
         macroList->clear();
         for (const auto &v : macros)
-            new QListWidgetItem(icon("macros", 16), v.toObject()["name"].toString(), macroList);
+            new QListWidgetItem(icon("macros", 16), conflictName(v.toObject()), macroList);
         macroHint->setVisible(macros.isEmpty());
     }
 
@@ -2972,7 +3036,7 @@ private:
         if (macros.isEmpty())
             menu->addAction(L("No macro recorded"))->setEnabled(false);
         for (int i = 0; i < macros.size(); ++i)
-            menu->addAction(macros[i].toObject()["name"].toString(), this, [this, i] { playMacro(i, activeTerminal()); });
+            menu->addAction(conflictName(macros[i].toObject()), this, [this, i] { playMacro(i, activeTerminal()); });
     }
 
     void stopRecordingDialog()
@@ -3899,6 +3963,7 @@ public:
 
     // In-process end-to-end test (no global input): opens the first profile, which must point to a test
     // SSH/SFTP server, checks the SFTP browser, Split and dialogs, and saves screenshots via grab().
+
 
 
 

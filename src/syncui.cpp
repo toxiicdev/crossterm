@@ -329,8 +329,43 @@ QJsonObject SyncController::collect(const SyncVault::Keys &k)
             stamps[target] = stamp;
             passwords[target] = QJsonObject{{"user", profile["user"].toString()}, {"secret", *value}, {"modified", stamp["modified"]}};
         }
+        // Passwords synchronized before: still in the vault (their session may be gone) they keep travelling; gone
+        // from the vault they were deleted here, and the deletion goes to the other devices.
+        auto deleted = payload["deleted"].toObject();
+        const auto now = SyncMerge::nowMs();
+        for (const auto &target : stamps.keys())
+        {
+            if (passwords.contains(target))
+                continue;
+            auto stamp = stamps[target].toObject();
+            if (const auto value = readSecret(target); value && !value->isEmpty())
+            {
+                if (stamp.contains("deleted")) // saved again after its deletion: a new change
+                {
+                    stamp = QJsonObject{{"mac", QString::fromLatin1(QMessageAuthenticationCode::hash(
+                                                                         (target + '\n' + *value).toUtf8(), k.dataKey,
+                                                                         QCryptographicHash::Sha256)
+                                                                         .toBase64())},
+                                        {"modified", double(now)}};
+                    stamps[target] = stamp;
+                }
+                passwords[target] = QJsonObject{
+                    {"user", target.section(':', 1).section('@', 0, 0)}, {"secret", *value}, {"modified", stamp["modified"]}};
+                continue;
+            }
+            if (!stamp.contains("deleted"))
+                stamp = QJsonObject{{"deleted", double(now)}};
+            if (now - qint64(stamp["deleted"].toDouble()) > SyncMerge::TombstoneLifetimeMs)
+            {
+                stamps.remove(target);
+                continue;
+            }
+            stamps[target] = stamp;
+            deleted["passwords/" + target] = stamp["deleted"];
+        }
         settings.setValue("sync/stamps", QJsonDocument(stamps).toJson(QJsonDocument::Compact));
         payload["passwords"] = passwords;
+        payload["deleted"] = deleted;
     }
     if (chosen.contains("keys"))
     {
@@ -372,6 +407,19 @@ void SyncController::apply(const QJsonObject &merged, const SyncVault::Keys &k)
                                                                               QCryptographicHash::Sha256)
                                                 .toBase64())},
                 {"modified", p["modified"]}};
+        }
+        // Deleted on another device after its last change (the merge keeps a later change instead): removed here.
+        const auto deleted = merged["deleted"].toObject();
+        for (auto it = deleted.begin(); it != deleted.end(); ++it)
+        {
+            if (!it.key().startsWith("passwords/"))
+                continue;
+            const auto target = it.key().mid(10);
+            if (passwords.contains(target))
+                continue;
+            if (readSecret(target))
+                removeSecret(target);
+            stamps[target] = QJsonObject{{"deleted", it.value()}};
         }
         settings.setValue("sync/stamps", QJsonDocument(stamps).toJson(QJsonDocument::Compact));
         data.remove("passwords");
