@@ -22,7 +22,8 @@ static QString runDialog(const QString &start, const std::function<void(QDialog 
                            act(dialog);
                            accept ? dialog->accept() : dialog->reject();
                        });
-    return sftpPermissionsDialog(nullptr, "/srv/www/index.php", start);
+    const auto chosen = sftpPermissionsDialog(nullptr, "/srv/www/index.php", start);
+    return chosen ? chosen->mode : QString();
 }
 
 static void press(QWidget *widget, int key)
@@ -85,6 +86,56 @@ int main(int argc, char **argv)
               .isEmpty(),
           "incomplete mode not returned");
     check(runDialog("644", [](QDialog *) {}, false).isEmpty(), "Cancel returns nothing");
+    // With a shell: owner and group, and the folder's content.
+    {
+        QTimer::singleShot(0,
+                           [&]
+                           {
+                               auto *d = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                               if (!d)
+                                   return;
+                               const auto edits = d->findChildren<QLineEdit *>();
+                               check(edits.size() == 3 && edits[1]->text() == "root" && edits[2]->text() == "www",
+                                     "owner and group shown");
+                               edits[1]->setText("deploy");
+                               auto *recurse = d->findChildren<QCheckBox *>().value(9);
+                               auto *scope = d->findChild<QComboBox *>();
+                               check(recurse && scope && !scope->isEnabled(), "content scope enabled with its checkbox only");
+                               if (recurse && scope)
+                               {
+                                   recurse->setChecked(true);
+                                   scope->setCurrentIndex(1); // files only
+                               }
+                               if (argc > 3)
+                                   d->grab().save(argv[3]);
+                               d->accept();
+                           });
+        const auto chosen = sftpPermissionsDialog(nullptr, "/srv/www", "755", "root", "www", true, true);
+        check(chosen && chosen->mode == "755" && chosen->owner == "deploy" && chosen->group == "www" && chosen->recurse == 2,
+              "owner, group and scope returned");
+        QTimer::singleShot(0,
+                           []
+                           {
+                               if (auto *d = qobject_cast<QDialog *>(QApplication::activeModalWidget()))
+                               {
+                                   d->findChildren<QLineEdit *>()[1]->setText("bad name!");
+                                   d->accept();
+                               }
+                           });
+        const auto unchanged = sftpPermissionsDialog(nullptr, "/srv/www/a.txt", "644", "root", "www", true, false);
+        check(unchanged && unchanged->owner == "root" && unchanged->recurse == 0 &&
+                  !QString("bad name!").contains(QRegularExpression("^[A-Za-z0-9._-]+$")),
+              "an invalid owner keeps the current one");
+    }
+    // The panel as it opens (not connected): toolbar and filter row, for a visual check.
+    if (argc > 4)
+    {
+        SftpPanel panel(QJsonObject{{"protocol", "sftp"}, {"host", "127.0.0.1"}, {"port", 1}, {"user", "test"}}, "macos");
+        panel.resize(300, 420);
+        panel.show();
+        QCoreApplication::processEvents();
+        panel.grab().save(argv[4]);
+    }
     // Rename in place: the editor opens on the row with the name before the extension selected; Enter reports the
     // new name and leaves the row as it was (the listing that follows shows the change).
     {

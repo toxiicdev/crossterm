@@ -35,7 +35,8 @@ static bool fluentIcon(const QString &name, int size, QPainter &p)
         {"shell", {0xE756, "#4fc3a1"}},    {"telnet", {0xE756, "#5fa8ff"}},    {"rlogin", {0xE756, "#9a7cf0"}},
         {"rsh", {0xE756, "#9a7cf0"}},      {"mosh", {0xE756, "#36c08f"}},      {"wsl", {0xE756, "#f39a1e"}},
         {"rdp", {0xE8AF, "#3b8eea"}},      {"vnc", {0xE7F4, "#36c08f"}},       {"ftp", {0xE8B7, "#f5c518"}},
-        {"serial", {0xE88E, "#b8c0cc"}}};
+        {"serial", {0xE88E, "#b8c0cc"}},   {"back", {0xE72B, "#5c9ded"}},      {"forward", {0xE72A, "#5c9ded"}},
+        {"eye", {0xE7B3, "#4fc3a1"}}};
     static const QString family = []
     {
         for (const char *f : {"Segoe Fluent Icons", "Segoe MDL2 Assets"})
@@ -275,6 +276,30 @@ static void paintIcon(QPainter &p, const QString &name)
     else if (name == "folder")
     {
         folder(QColor("#f2c12e"));
+    }
+    else if (name == "back" || name == "forward")
+    {
+        p.setPen(Qt::NoPen);
+        p.setBrush(blue);
+        QPolygonF shape{{4, 16}, {15, 5}, {15, 12}, {28, 12}, {28, 20}, {15, 20}, {15, 27}};
+        if (name == "forward")
+            for (auto &point : shape)
+                point.setX(32 - point.x());
+        p.drawPolygon(shape);
+    }
+    else if (name == "eye")
+    {
+        QPainterPath lid;
+        lid.moveTo(2, 16);
+        lid.quadTo(16, 2, 30, 16);
+        lid.quadTo(16, 30, 2, 16);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor("#4fc3a1"));
+        p.drawPath(lid);
+        p.setBrush(white);
+        p.drawEllipse(QPointF(16, 16), 6, 6);
+        p.setBrush(QColor("#1d4d2b"));
+        p.drawEllipse(QPointF(16, 16), 3.2, 3.2);
     }
     else if (name == "parent")
     {
