@@ -138,6 +138,60 @@ static QString themed(const QString &dark)
     return style;
 }
 
+// Sessions open in tabs (count in Qt::UserRole + 4 and green row background, set by Window::markOpenSessions): from
+// two tabs up, a green badge with the count. White on #2e8b47 reads in every appearance (contrast 4.6:1).
+class OpenSessionDelegate : public QStyledItemDelegate
+{
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        const int open = index.data(Qt::UserRole + 4).toInt();
+        if (open < 2)
+            return QStyledItemDelegate::paint(painter, option, index);
+        const QString count = QString::number(open);
+        QFont font = option.font;
+        font.setPointSizeF(font.pointSizeF() * 0.85);
+        font.setBold(true);
+        const QFontMetrics metrics(font);
+        const int height = metrics.height(), width = std::max(height, metrics.horizontalAdvance(count) + 8);
+        const QRect badge(option.rect.right() - 8 - width, option.rect.center().y() - height / 2 + 1, width, height);
+        // Hover/selection background over the whole row, then the name elided before the badge.
+        QStyleOptionViewItem panel(option);
+        initStyleOption(&panel, index);
+        const auto *view = option.widget;
+        (view ? view->style() : QApplication::style())->drawPrimitive(QStyle::PE_PanelItemViewItem, &panel, painter, view);
+        QStyleOptionViewItem text(option);
+        text.rect.setRight(badge.left() - 4);
+        QStyledItemDelegate::paint(painter, text, index);
+        painter->save();
+        painter->setRenderHint(QPainter::Antialiasing);
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(QColor("#2e8b47"));
+        painter->drawRoundedRect(badge, 4, 4); // square with softly rounded corners
+        painter->setFont(font);
+        painter->setPen(Qt::white);
+        // Centered on the digits' own outline: AlignCenter centers the font's line box and leaves them low.
+        const QRectF ink = metrics.tightBoundingRect(count);
+        painter->drawText(QPointF(badge.left() + (badge.width() - ink.width()) / 2.0 - ink.left(),
+                                  badge.top() + (badge.height() - ink.height()) / 2.0 - ink.top()),
+                          count);
+        painter->restore();
+    }
+};
+
+// Session tree: the green of an open session also fills the indentation, as the selection does.
+class SessionTree : public QTreeWidget
+{
+protected:
+    void drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const override
+    {
+        if (const auto tint = index.data(Qt::BackgroundRole); tint.isValid() && !selectionModel()->isSelected(index))
+            painter->fillRect(rect, tint.value<QBrush>());
+        QTreeWidget::drawBranches(painter, rect, index);
+    }
+};
+
 // UI font per appearance (not in the stylesheet, which would also force it on the terminal).
 static void applyAppearanceFont(Appearance look)
 {
@@ -317,7 +371,7 @@ class Window : public QMainWindow
     QJsonArray profiles;
     bool writable = true;
     QLineEdit *quick = new QLineEdit;
-    QTreeWidget *tree = new QTreeWidget;
+    QTreeWidget *tree = new SessionTree;
     QStackedWidget *side = new QStackedWidget;
     QStackedWidget *sftpStack = new QStackedWidget;
     QList<QToolButton *> strip;
@@ -418,6 +472,7 @@ private:
         }
         bar->setCurrentIndex(index);
         layoutPages();
+        markOpenSessions();
     }
 
     // Tab icon and tooltip of a session: red dot and "Disconnected" once it ended with an error, greyed icon after
@@ -756,6 +811,7 @@ private:
             delete p->monitor;
             delete p;
             layoutPages();
+            markOpenSessions();
             if (bar->count() == 1)
                 showSide(0); // back to the home page: show the session list
             return;
@@ -997,6 +1053,27 @@ private:
                                                       : expanded.contains((*it)->data(0, Qt::UserRole + 2).toString()));
         }
         refreshRecent();
+        markOpenSessions();
+    }
+
+    // Tabs open per saved session: green row (background role, which the tree also paints under the indentation)
+    // and the count for OpenSessionDelegate's badge. Called again when the appearance changes.
+    void markOpenSessions()
+    {
+        QHash<QString, int> open;
+        for (int i = 0; i < bar->count(); ++i)
+            if (const auto *p = page(i); p && p != home)
+                if (const auto id = p->profile["id"].toString(); !id.isEmpty())
+                    ++open[id];
+        const QBrush tint(QColor(appearanceIsDark(appearance) ? "#16261c" : "#e3f4e7"));
+        for (QTreeWidgetItemIterator it(tree); *it; ++it)
+            if ((*it)->data(0, Qt::UserRole + 1).toBool())
+            {
+                const int i = (*it)->data(0, Qt::UserRole).toInt();
+                const int count = i >= 0 && i < profiles.size() ? open.value(profiles[i].toObject()["id"].toString()) : 0;
+                (*it)->setData(0, Qt::UserRole + 4, count);
+                (*it)->setData(0, Qt::BackgroundRole, count > 0 ? QVariant(tint) : QVariant());
+            }
     }
 
     void refreshRecent()
@@ -2940,6 +3017,7 @@ private:
             if ((*it)->data(0, Qt::UserRole + 3).toBool())
                 (*it)->setForeground(0, QColor(themed("#e8b04a"))); // "needs review" amber
         }
+        markOpenSessions(); // green of the open sessions, darker or lighter with the appearance
         bar->update();
     }
 
@@ -3753,6 +3831,8 @@ public:
 
     // In-process end-to-end test (no global input): opens the first profile, which must point to a test
     // SSH/SFTP server, checks the SFTP browser, Split and dialogs, and saves screenshots via grab().
+
+
     int e2e(const QString &out)
     {
         QStringList log;
@@ -5502,6 +5582,7 @@ public:
 
         tree->setIconSize(QSize(20, 20));
         tree->setObjectName("sessions");
+        tree->setItemDelegate(new OpenSessionDelegate(tree));
         tree->setIndentation(16);
         tree->setContextMenuPolicy(Qt::CustomContextMenu);
         texts.bind(tree, &QWidget::setAccessibleName, N("User sessions"));
