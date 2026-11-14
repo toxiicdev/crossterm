@@ -12,6 +12,12 @@ on:
 env:
   QT_VERSION: "6.8.3"
   VCXSRV_VERSION: "21.1.16.1"
+  # Cloud drive sign-in app ids (public, see src/syncoauth.h): repository variables, Settings > Secrets and
+  # variables > Actions > Variables. A missing one leaves that service out of the build.
+  CROSSTERM_DROPBOX_APP_KEY: ${{ vars.CROSSTERM_DROPBOX_APP_KEY }}
+  CROSSTERM_MICROSOFT_CLIENT_ID: ${{ vars.CROSSTERM_MICROSOFT_CLIENT_ID }}
+  CROSSTERM_GOOGLE_CLIENT_ID: ${{ vars.CROSSTERM_GOOGLE_CLIENT_ID }}
+  CROSSTERM_GOOGLE_CLIENT_SECRET: ${{ vars.CROSSTERM_GOOGLE_CLIENT_SECRET }}
 
 jobs:
   windows:

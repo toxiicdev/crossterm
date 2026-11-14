@@ -3,7 +3,10 @@
 #include "credentials.h"
 #include "ftp.h"
 #include "profiles.h"
+#include "syncoauth.h"
 #include <QCoreApplication>
+#include <QDateTime>
+#include <QUrlQuery>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -555,6 +558,300 @@ protected:
             });
     }
 };
+
+// ---------------------------------------------------------------- Dropbox, OneDrive, Google Drive
+// Requests with an access token obtained from the saved refresh token: refreshed when it expires and once more
+// after a 401. A refresh token that no longer works means signing in again (Result::signIn).
+class Cloud : public Http
+{
+protected:
+    SyncOAuth::Provider provider;
+    QString base; // local test server, or empty
+    QString refreshToken, access;
+    qint64 expiresAt = 0;
+    QJsonObject updates; // rotated refresh token, reported with the next result
+
+    QString url(const QString &address) const { return SyncOAuth::redirected(address, base); }
+
+    // Sends request with the token; answer(reply) or answer(nullptr, failure) when no token could be had.
+    void call(QNetworkRequest request, const QByteArray &verb, const QByteArray &body,
+              std::function<void(QNetworkReply *, const Result &failure)> answer, bool retried = false)
+    {
+        withToken(
+            [this, request, verb, body, answer, retried](const Result &failure) mutable
+            {
+                if (failure.status == Result::Failed)
+                    return answer(nullptr, failure);
+                request.setRawHeader("Authorization", "Bearer " + access.toUtf8());
+                send(request, verb, body,
+                     [this, request, verb, body, answer, retried](QNetworkReply *reply)
+                     {
+                         if (status(reply) == 401 && !retried)
+                         {
+                             access.clear(); // revoked or expired early: one more try with a fresh one
+                             return call(request, verb, body, answer, true);
+                         }
+                         answer(reply, {});
+                     });
+            });
+    }
+    void withToken(std::function<void(const Result &)> ready)
+    {
+        if (!access.isEmpty() && QDateTime::currentMSecsSinceEpoch() < expiresAt - 60000)
+            return ready(withStatus(Result::Ok));
+        SyncOAuth::refresh(network, provider, refreshToken,
+                           [this, ready](const SyncOAuth::Tokens &t)
+                           {
+                               if (!t.error.isEmpty())
+                               {
+                                   Result r = failed(ui("Sign in again: %1").arg(t.error));
+                                   r.signIn = true;
+                                   return ready(r);
+                               }
+                               access = t.access;
+                               expiresAt = t.expiresAt ? t.expiresAt : QDateTime::currentMSecsSinceEpoch() + 3600000;
+                               if (t.refresh != refreshToken)
+                               {
+                                   refreshToken = t.refresh;
+                                   updates["refresh"] = refreshToken;
+                               }
+                               ready(withStatus(Result::Ok));
+                           });
+    }
+    // Delivers r with any settings to save (rotated refresh token).
+    void finish(Result r, const Done &done)
+    {
+        for (auto it = updates.begin(); it != updates.end(); ++it)
+            r.updated[it.key()] = it.value();
+        updates = {};
+        done(r);
+    }
+
+public:
+    Cloud(const QString &name, const QString &refresh, const QString &testBase)
+        : provider(SyncOAuth::provider(name, testBase)), base(testBase), refreshToken(refresh)
+    {
+    }
+};
+
+class Dropbox : public Cloud
+{
+    // Path inside the app folder (Apps/CrossTerm): the app sees nothing else of the account.
+    static QByteArray argument(const QJsonObject &o) { return QJsonDocument(o).toJson(QJsonDocument::Compact); }
+    QNetworkRequest request(const QString &endpoint, const QJsonObject &arg) const
+    {
+        QNetworkRequest r{QUrl(url("https://content.dropboxapi.com/2/files/" + endpoint))};
+        r.setRawHeader("Dropbox-API-Arg", argument(arg));
+        return r;
+    }
+    static bool conflict(QNetworkReply *reply, const QByteArray &body, const char *kind)
+    {
+        return status(reply) == 409 && body.contains(kind);
+    }
+
+public:
+    using Cloud::Cloud;
+    void read(Done done) override
+    {
+        call(request("download", {{"path", QString("/") + FileName}}), "POST", {},
+             [this, done](QNetworkReply *reply, const Result &failure)
+             {
+                 if (!reply)
+                     return finish(failure, done);
+                 const auto body = reply->readAll();
+                 if (conflict(reply, body, "not_found"))
+                     return finish(withStatus(Result::NotFound), done);
+                 if (reply->error() != QNetworkReply::NoError)
+                     return finish(failed(httpError(reply)), done);
+                 Result r = withStatus(Result::Ok);
+                 r.data = body;
+                 r.revision = "rev:" + QJsonDocument::fromJson(reply->rawHeader("Dropbox-API-Result")).object()["rev"].toString();
+                 finish(r, done);
+             });
+    }
+    void write(const QByteArray &data, const QString &revision, Done done) override
+    {
+        // "add" fails if the file exists; "update" fails unless it is still at that revision.
+        const QJsonValue mode = revision.isEmpty() ? QJsonValue("add")
+                                                   : QJsonValue(QJsonObject{{".tag", "update"}, {"update", revision.mid(4)}});
+        auto r = request("upload", {{"path", QString("/") + FileName},
+                                    {"mode", mode},
+                                    {"autorename", false},
+                                    {"mute", true},
+                                    {"strict_conflict", true}});
+        r.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+        call(r, "POST", data,
+             [this, done](QNetworkReply *reply, const Result &failure)
+             {
+                 if (!reply)
+                     return finish(failure, done);
+                 const auto body = reply->readAll();
+                 if (conflict(reply, body, "conflict"))
+                     return finish(withStatus(Result::Conflict), done);
+                 if (reply->error() != QNetworkReply::NoError)
+                     return finish(failed(httpError(reply)), done);
+                 Result ok = withStatus(Result::Ok);
+                 ok.revision = "rev:" + QJsonDocument::fromJson(body).object()["rev"].toString();
+                 finish(ok, done);
+             });
+    }
+};
+
+class OneDrive : public Cloud
+{
+    // The app folder (Apps/CrossTerm) of the signed-in account.
+    QString item() const { return url(QString("https://graph.microsoft.com/v1.0/me/drive/special/approot:/") + FileName); }
+
+public:
+    using Cloud::Cloud;
+    void read(Done done) override
+    {
+        call(QNetworkRequest(QUrl(item())), "GET", {},
+             [this, done](QNetworkReply *reply, const Result &failure)
+             {
+                 if (!reply)
+                     return finish(failure, done);
+                 if (status(reply) == 404)
+                     return finish(withStatus(Result::NotFound), done);
+                 if (reply->error() != QNetworkReply::NoError)
+                     return finish(failed(httpError(reply)), done);
+                 const auto meta = QJsonDocument::fromJson(reply->readAll()).object();
+                 const auto revision = "etag:" + meta["eTag"].toString();
+                 // Short-lived pre-authorized address: no token goes with it.
+                 send(QNetworkRequest(QUrl(meta["@microsoft.graph.downloadUrl"].toString())), "GET", {},
+                      [this, revision, done](QNetworkReply *content)
+                      {
+                          if (content->error() != QNetworkReply::NoError)
+                              return finish(failed(httpError(content)), done);
+                          Result r = withStatus(Result::Ok);
+                          r.data = content->readAll();
+                          r.revision = revision;
+                          finish(r, done);
+                      });
+             });
+    }
+    void write(const QByteArray &data, const QString &revision, Done done) override
+    {
+        QUrl target(item() + ":/content");
+        QNetworkRequest r;
+        if (revision.isEmpty())
+            target.setQuery("@microsoft.graph.conflictBehavior=fail"); // 409 if it exists
+        r.setUrl(target);
+        if (!revision.isEmpty())
+            r.setRawHeader("If-Match", revision.mid(5).toUtf8()); // 412 if it changed
+        r.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+        call(r, "PUT", data,
+             [this, done](QNetworkReply *reply, const Result &failure)
+             {
+                 if (!reply)
+                     return finish(failure, done);
+                 if (status(reply) == 409 || status(reply) == 412)
+                     return finish(withStatus(Result::Conflict), done);
+                 if (reply->error() != QNetworkReply::NoError)
+                     return finish(failed(httpError(reply)), done);
+                 Result ok = withStatus(Result::Ok);
+                 ok.revision = "etag:" + QJsonDocument::fromJson(reply->readAll()).object()["eTag"].toString();
+                 finish(ok, done);
+             });
+    }
+};
+
+class GoogleDrive : public Cloud
+{
+    QString files() const { return url("https://www.googleapis.com/drive/v3/files"); }
+    QString uploads() const { return url("https://www.googleapis.com/upload/drive/v3/files"); }
+
+    // The sync file in the hidden app data folder: {id, version}, or {} if there is none. If two devices created
+    // it at the same moment, every device uses the oldest one.
+    void find(std::function<void(const QJsonObject &file, const Result &failure)> done)
+    {
+        QUrl list(files());
+        QUrlQuery query;
+        query.addQueryItem("spaces", "appDataFolder");
+        query.addQueryItem("q", QString("name = '%1' and trashed = false").arg(FileName));
+        query.addQueryItem("orderBy", "createdTime");
+        query.addQueryItem("fields", "files(id,version)");
+        list.setQuery(query);
+        call(QNetworkRequest(list), "GET", {},
+             [done](QNetworkReply *reply, const Result &failure)
+             {
+                 if (!reply)
+                     return done({}, failure);
+                 if (reply->error() != QNetworkReply::NoError)
+                     return done({}, failed(httpError(reply)));
+                 const auto found = QJsonDocument::fromJson(reply->readAll()).object()["files"].toArray();
+                 done(found.isEmpty() ? QJsonObject{} : found[0].toObject(), withStatus(Result::Ok));
+             });
+    }
+    static QString revisionOf(const QJsonObject &file) { return "version:" + file["version"].toString(); }
+
+public:
+    using Cloud::Cloud;
+    void read(Done done) override
+    {
+        find(
+            [this, done](const QJsonObject &file, const Result &failure)
+            {
+                if (failure.status == Result::Failed)
+                    return finish(failure, done);
+                if (file.isEmpty())
+                    return finish(withStatus(Result::NotFound), done);
+                call(QNetworkRequest(QUrl(files() + "/" + file["id"].toString() + "?alt=media")), "GET", {},
+                     [this, file, done](QNetworkReply *reply, const Result &failure)
+                     {
+                         if (!reply)
+                             return finish(failure, done);
+                         if (reply->error() != QNetworkReply::NoError)
+                             return finish(failed(httpError(reply)), done);
+                         Result r = withStatus(Result::Ok);
+                         r.data = reply->readAll();
+                         r.revision = revisionOf(file);
+                         finish(r, done);
+                     });
+            });
+    }
+    // Drive has no conditional upload: the version is compared right before writing.
+    // ponytail: a write from another device in the instant between the check and the upload is overwritten;
+    // its next synchronization reads this version and merges again, so only that instant is at risk.
+    void write(const QByteArray &data, const QString &revision, Done done) override
+    {
+        find(
+            [this, data, revision, done](const QJsonObject &file, const Result &failure)
+            {
+                if (failure.status == Result::Failed)
+                    return finish(failure, done);
+                if ((file.isEmpty() ? QString() : revisionOf(file)) != revision)
+                    return finish(withStatus(Result::Conflict), done);
+                const auto answer = [this, done](QNetworkReply *reply, const Result &failure)
+                {
+                    if (!reply)
+                        return finish(failure, done);
+                    if (reply->error() != QNetworkReply::NoError)
+                        return finish(failed(httpError(reply)), done);
+                    Result ok = withStatus(Result::Ok);
+                    ok.revision = revisionOf(QJsonDocument::fromJson(reply->readAll()).object());
+                    finish(ok, done);
+                };
+                if (!file.isEmpty())
+                {
+                    QNetworkRequest r(QUrl(uploads() + "/" + file["id"].toString() + "?uploadType=media&fields=id,version"));
+                    r.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+                    return call(r, "PATCH", data, answer);
+                }
+                // New file: metadata (name, app data folder) and content in one multipart request.
+                const QByteArray boundary = "crossterm-" + QByteArray::number(QDateTime::currentMSecsSinceEpoch());
+                const auto metadata = QJsonDocument(QJsonObject{{"name", FileName}, {"parents", QJsonArray{"appDataFolder"}}})
+                                          .toJson(QJsonDocument::Compact);
+                const QByteArray body = "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" +
+                                        metadata + "\r\n--" + boundary +
+                                        "\r\nContent-Type: application/octet-stream\r\n\r\n" + data + "\r\n--" + boundary +
+                                        "--\r\n";
+                QNetworkRequest r(QUrl(uploads() + "?uploadType=multipart&fields=id,version"));
+                r.setHeader(QNetworkRequest::ContentTypeHeader, "multipart/related; boundary=" + boundary);
+                call(r, "POST", body, answer);
+            });
+    }
+};
 } // namespace
 
 QString contentRevision(const QByteArray &data)
@@ -608,6 +905,21 @@ std::unique_ptr<Storage> create(const QJsonObject &s, QString *error)
         if (s["host"].toString().isEmpty() || s["path"].toString().isEmpty())
             return fail(ui("Enter the server and the file path."));
         return std::make_unique<Ftps>(s);
+    }
+    if (type == "dropbox" || type == "onedrive" || type == "gdrive")
+    {
+        const QUrl api(s["api"].toString());
+        if (!s["api"].toString().isEmpty() && !localHost(api)) // tokens only go to the provider
+            return fail(ui("Enter an https:// address."));
+        if (!SyncOAuth::available(type) && s["api"].toString().isEmpty())
+            return fail(ui("This build of CrossTerm cannot sign in to this service."));
+        if (s["refresh"].toString().isEmpty())
+            return fail(ui("Sign in to the service first."));
+        if (type == "dropbox")
+            return std::make_unique<Dropbox>(type, s["refresh"].toString(), s["api"].toString());
+        if (type == "onedrive")
+            return std::make_unique<OneDrive>(type, s["refresh"].toString(), s["api"].toString());
+        return std::make_unique<GoogleDrive>(type, s["refresh"].toString(), s["api"].toString());
     }
     return fail(ui("Unknown storage type."));
 }

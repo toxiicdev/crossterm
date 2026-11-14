@@ -14,7 +14,11 @@
 //   {"type":"ftps","host":..,"port":..,"user":..,"password":..,"security":"explicit"|"implicit","path":..,
 //    "fingerprint":<SHA-256 of the trusted certificate>}
 //   {"type":"gist","token":<GitHub token, gist scope>,"gist":<id, empty: created on first write>}
-// "api" (gist) and plain "http" (webdav) are accepted for 127.0.0.1/localhost only: tests and local servers.
+//   {"type":"dropbox"|"onedrive"|"gdrive","refresh":<refresh token from SyncOAuth::Login>}
+//        the app's own folder: Dropbox "Apps/CrossTerm", OneDrive "Apps/CrossTerm", Google Drive's hidden
+//        app data folder; a rotated refresh token comes back in Result::updated["refresh"]
+// "api" (gist, cloud drives) and plain "http" (webdav) are accepted for 127.0.0.1/localhost only: tests and local
+// servers.
 #include <QJsonObject>
 #include <functional>
 #include <memory>
@@ -37,6 +41,7 @@ struct Result
     QString error;       // Failed: message for the user
     QJsonObject updated; // settings to save after this call (the id of a Gist created by the first write)
     QString fingerprint; // FTPS: SHA-256 of a certificate that is not the trusted one (ask the user)
+    bool signIn = false; // Dropbox, OneDrive, Google Drive: the account must be signed in again (token revoked)
 };
 using Done = std::function<void(const Result &)>;
 

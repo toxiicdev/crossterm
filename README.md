@@ -38,6 +38,8 @@ Requires Qt 6.5+, CMake 3.21+ and a C++17 compiler. Ready-made scripts in `scrip
 
 Release packages: pushing a tag `v<version>` (matching `project(VERSION)` in CMakeLists.txt) runs `.github/workflows/release.yml`, which builds the Windows installer (with VcXsrv) and the Linux AppImage and attaches them to a draft GitHub release; add the macOS `.dmg` built on a Mac, then publish the draft.
 
+Signing in to Dropbox, OneDrive and Google Drive for synchronization needs the app ids registered with each service, given at configure time as CMake variables or environment variables: `CROSSTERM_DROPBOX_APP_KEY` (redirect URIs `http://localhost:53682/`, `http://localhost:53683/`, `http://localhost:53684/`), `CROSSTERM_MICROSOFT_CLIENT_ID` (public client, redirect URI `http://localhost`), `CROSSTERM_GOOGLE_CLIENT_ID` and `CROSSTERM_GOOGLE_CLIENT_SECRET` (Desktop app client). The release workflow reads them from repository variables; a missing one leaves that service out.
+
 For the integrated X server on Windows, put the VcXsrv files in `dist\xserver` (GPL v3, see its license). Manual build:
 
 ```sh

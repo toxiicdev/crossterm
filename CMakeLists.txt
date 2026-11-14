@@ -19,9 +19,18 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99)
 set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(relaycore STATIC ${SRC}/profiles.cpp ${SRC}/foreign.cpp ${SRC}/credentials.cpp ${SRC}/proxy.cpp
             ${SRC}/monitor.cpp ${SRC}/xserver.cpp ${SRC}/mobaimport.cpp ${SRC}/ftp.cpp ${SRC}/servers.cpp ${SRC}/vnc.cpp ${SRC}/rdp.cpp
-            ${SRC}/keepalive.cpp ${SRC}/syncvault.cpp ${SRC}/syncmerge.cpp ${SRC}/syncstorage.cpp)
+            ${SRC}/keepalive.cpp ${SRC}/syncvault.cpp ${SRC}/syncmerge.cpp ${SRC}/syncstorage.cpp ${SRC}/syncoauth.cpp)
 target_include_directories(relaycore PUBLIC ${SRC})
 target_link_libraries(relaycore PUBLIC Qt6::Core Qt6::Widgets Qt6::Network PRIVATE monocypher)
+# App ids for signing in to the cloud drives (syncoauth.h): public, from -D or the environment at configure time.
+# Empty: that service is not offered.
+foreach(id CROSSTERM_DROPBOX_APP_KEY CROSSTERM_MICROSOFT_CLIENT_ID CROSSTERM_GOOGLE_CLIENT_ID CROSSTERM_GOOGLE_CLIENT_SECRET)
+    if(NOT DEFINED ${id})
+        set(${id} "$ENV{${id}}")
+    endif()
+    set(${id} "${${id}}" CACHE STRING "Cloud sign-in app id (public)")
+    target_compile_definitions(relaycore PRIVATE ${id}="${${id}}")
+endforeach()
 if(WIN32)
     target_link_libraries(relaycore PUBLIC advapi32 bcrypt ole32 oleaut32 uuid ws2_32)
 elseif(APPLE)
