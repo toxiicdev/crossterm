@@ -7,7 +7,9 @@ import os
 import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LITERAL = r'"((?:[^"\\]|\\.)*)"'
+# One string literal, or adjacent ones the compiler joins ("..." "..."): group 1 holds them all.
+LITERAL = r'((?:"(?:[^"\\]|\\.)*"\s*)+)'
+PIECE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 PATTERNS = [
     re.compile(r'\bL\(\s*' + LITERAL),
     re.compile(r'\bN\(\s*' + LITERAL),
@@ -22,13 +24,13 @@ def unescape(text):
 
 
 keys = []
-for name in ("main.cpp", "sftp-panel.h", "terminal.cpp", "profiles.cpp", "askpass.h", "transports.cpp", "monitor.cpp", "xserver.cpp", "proxy.cpp", "mosh.cpp", "foreign.cpp", "mobaimport.cpp", "ftp.cpp", "servers.cpp", "vnc.cpp", "appearance.h", "rdp.cpp", "syncstorage.cpp", "syncoauth.cpp", "syncengine.cpp"):
+for name in ("main.cpp", "sftp-panel.h", "terminal.cpp", "profiles.cpp", "askpass.h", "transports.cpp", "monitor.cpp", "xserver.cpp", "proxy.cpp", "mosh.cpp", "foreign.cpp", "mobaimport.cpp", "ftp.cpp", "servers.cpp", "vnc.cpp", "appearance.h", "rdp.cpp", "syncstorage.cpp", "syncoauth.cpp", "syncengine.cpp", "syncui.cpp"):
     source = open(os.path.join(ROOT, "src", name), encoding="utf-8").read()
     for pattern in PATTERNS:
         if pattern.pattern.startswith(r'\{') and name != "profiles.cpp":
             continue
         for match in pattern.finditer(source):
-            key = unescape(match.group(1))
+            key = unescape("".join(PIECE.findall(match.group(1))))
             if key not in keys:
                 keys.append(key)
 json.dump(sorted(keys), open(os.path.join(ROOT, "i18n", "keys.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)

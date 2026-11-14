@@ -19,6 +19,7 @@
 #include "mobaimport.h"
 #include "titlebar.h"
 #include "syncmerge.h"
+#include "syncui.h"
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QtWidgets>
@@ -371,6 +372,8 @@ class Window : public QMainWindow
     QString storage;
     QJsonArray profiles;
     QJsonObject savedData; // sessions, tunnels, macros and deletions as last written (SyncMerge::stamp)
+    SyncController *sync = nullptr; // encrypted synchronization with other devices (syncui.h)
+    bool applyingSync = false;      // a save that stores data received from another device
     bool writable = true;
     QLineEdit *quick = new QLineEdit;
     QTreeWidget *tree = new SessionTree;
@@ -1128,7 +1131,34 @@ private:
         macros = data["macros"].toArray();
         savedData = data;
         refresh();
+        if (sync && !applyingSync)
+            sync->schedule(); // changes made here go to the other devices
         return true;
+    }
+
+    // Data received from another device (only the kinds that are synchronized). It is saved as it is: stamping it
+    // again would make it look edited here and send it back to everyone.
+    void applySynced(const QJsonObject &merged)
+    {
+        if (merged.contains("tunnels"))
+            tunnels = merged["tunnels"].toArray();
+        if (merged.contains("macros"))
+            macros = merged["macros"].toArray();
+        const auto next = merged.contains("sessions") ? merged["sessions"].toArray() : profiles;
+        // Deletion records: the received ones for the synchronized kinds, this device's own for the others.
+        QJsonObject deleted;
+        const auto own = savedData["deleted"].toObject();
+        for (auto it = own.begin(); it != own.end(); ++it)
+            if (!merged.contains(it.key().section('/', 0, 0)))
+                deleted[it.key()] = it.value();
+        const auto received = merged["deleted"].toObject();
+        for (auto it = received.begin(); it != received.end(); ++it)
+            deleted[it.key()] = it.value();
+        savedData = QJsonObject{{"sessions", next}, {"tunnels", tunnels}, {"macros", macros}, {"deleted", deleted}};
+        applyingSync = true;
+        save(next);
+        applyingSync = false;
+        refreshMacros();
     }
 
     void importPasswords(QWidget *parent, const Import &source, const QJsonArray &selected)
@@ -2281,6 +2311,31 @@ private:
                 });
         form->addRow(logEnabled);
         form->addRow(L("Log folder"), logFolder);
+
+        if (sync)
+        {
+            form = section(L("Synchronization"));
+            auto *syncRow = new QHBoxLayout;
+            auto *syncState = new QLabel;
+            syncState->setWordWrap(true);
+            const auto showSync = [this, syncState]
+            {
+                syncState->setText(!sync->enabled()            ? L("Off")
+                                   : sync->status().isEmpty() ? L("On")
+                                                              : sync->status());
+            };
+            showSync();
+            auto *configure = new QPushButton(L("Configure..."));
+            syncRow->addWidget(syncState, 1);
+            syncRow->addWidget(configure);
+            form->addRow(L("Sessions on other devices"), syncRow);
+            connect(configure, &QPushButton::clicked, &dialog,
+                    [this, &dialog, showSync]
+                    {
+                        sync->dialog(&dialog);
+                        showSync();
+                    });
+        }
 
         // Same label column in every section, so the fields line up.
         QList<QWidget *> labels;
@@ -3844,6 +3899,7 @@ public:
 
     // In-process end-to-end test (no global input): opens the first profile, which must point to a test
     // SSH/SFTP server, checks the SFTP browser, Split and dialogs, and saves screenshots via grab().
+
 
 
     int e2e(const QString &out)
@@ -5872,6 +5928,14 @@ public:
                 QMessageBox::warning(this, L("Sessions"), L("The sessions file cannot be read; changes are disabled."));
         }
         connect(qApp, &QGuiApplication::screenRemoved, this, [this] { QTimer::singleShot(0, this, [this] { fitToScreen(); }); });
+        if (writable)
+            sync = new SyncController(
+                SyncController::Host{
+                    [this] {
+                        return QJsonObject{{"sessions", profiles}, {"tunnels", tunnels}, {"macros", macros}, {"deleted", savedData["deleted"]}};
+                    },
+                    [this](const QJsonObject &merged) { applySynced(merged); }, [this] { return profiles; }},
+                QFileInfo(storage).absolutePath() + "/sync-base.json", this);
         refresh();
         refreshMacros();
         tree->setFocus();
