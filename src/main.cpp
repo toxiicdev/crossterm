@@ -452,6 +452,12 @@ private:
             p->sftp = new SftpPanel(profile, platform(), sftpStack);
             p->sftp->folderSource = [p] { return p->terminal ? p->terminal->workingDirectory() : QString(); };
             p->sftp->onMonitoring = [this, p](bool on) { toggleMonitor(p, on); };
+            // The browser appears in the sidebar once the server answered over SFTP.
+            p->sftp->onConnected = [this, p]
+            {
+                if (current() == p)
+                    sftpStack->setCurrentWidget(p->sftp);
+            };
             p->sftp->pasteToTerminal = [p](const QString &text)
             {
                 if (p->terminal)
@@ -536,6 +542,16 @@ private:
     // Split: 1 terminal, 2 side by side, 2 stacked, 4 in a grid (current tab and the following ones).
     void layoutPages()
     {
+        // Sizes the user gave the split panes: kept when the same arrangement is rebuilt.
+        QList<QList<int>> oldSizes;
+        Qt::Orientation oldOrientation = Qt::Vertical;
+        if (splitRoot)
+        {
+            oldOrientation = splitRoot->orientation();
+            oldSizes << splitRoot->sizes();
+            for (auto *row : splitRoot->findChildren<QSplitter *>(Qt::FindDirectChildrenOnly))
+                oldSizes << row->sizes();
+        }
         // Pages are reparented to area before deleting the previous layout's splitters.
         for (int i = 0; i < bar->count(); ++i)
         {
@@ -575,6 +591,15 @@ private:
         }
         for (auto *v : visible)
             v->widget->show();
+        auto rows = splitRoot->findChildren<QSplitter *>(Qt::FindDirectChildrenOnly);
+        if (!oldSizes.isEmpty() && oldOrientation == splitRoot->orientation() && oldSizes[0].size() == splitRoot->count() &&
+            oldSizes.size() == rows.size() + 1)
+        {
+            splitRoot->setSizes(oldSizes[0]);
+            for (int r = 0; r < rows.size(); ++r)
+                if (oldSizes[r + 1].size() == rows[r]->count())
+                    rows[r]->setSizes(oldSizes[r + 1]);
+        }
         grid->addWidget(splitRoot);
         monitorBar->setVisible(now->monitor);
         if (now->monitor && !now->monitorError.isEmpty())
@@ -584,13 +609,21 @@ private:
         else if (now->monitor)
             monitorBar->showError(L("Loading…")); // until the first data arrives
         sftpStack->setCurrentIndex(0);
-        if (now->sftp)
+        if (now->sftp && now->sftp->connected())
             sftpStack->setCurrentWidget(now->sftp);
+        updateTitle();
+        if (now->terminal)
+            now->terminal->setFocus();
+    }
+
+    void updateTitle()
+    {
+        auto *now = current();
+        if (!now)
+            return;
         setWindowTitle(
             (now == home ? QString("CrossTerm") : bar->tabText(bar->currentIndex()).section(". ", 1) + " - CrossTerm") +
             (multiExec ? " [" + L("MultiExec") + "]" : QString()) + (recording ? " [" + L("Recording macro") + "]" : QString()));
-        if (now->terminal)
-            now->terminal->setFocus();
     }
 
     int selection() const
@@ -2203,13 +2236,13 @@ private:
     {
         recording = true;
         recordingSteps = {};
-        layoutPages();
+        updateTitle();
     }
 
     bool stopRecording(const QString &name)
     {
         recording = false;
-        layoutPages();
+        updateTitle();
         if (name.trimmed().isEmpty() || recordingSteps.isEmpty())
             return false;
         macros.append(QJsonObject{
@@ -3255,7 +3288,7 @@ public:
             type(local2->terminal, "\r");
         }
         bar->setCurrentIndex(1);
-        check(focusWidget() == p->terminal && sftpStack->currentWidget() == panel,
+        check(focusWidget() == p->terminal && panel->connected() && sftpStack->currentWidget() == panel,
               "switching back restores focus and SFTP panel");
         splitMode = 2;
         layoutPages();
@@ -3301,6 +3334,40 @@ public:
             "MultiExec mirrors input to every terminal");
         check(windowTitle().contains("["), "MultiExec shown in window title");
         multiExecEnabled(false);
+        {
+            // Split sizes set by the user survive MultiExec on/off.
+            splitMode = 2;
+            layoutPages();
+            QCoreApplication::processEvents();
+            const int total = splitRoot->sizes().value(0) + splitRoot->sizes().value(1);
+            splitRoot->setSizes({total / 4, total - total / 4});
+            const auto before = splitRoot->sizes();
+            multiExecEnabled(true);
+            multiExecEnabled(false);
+            QCoreApplication::processEvents();
+            check(splitRoot->sizes() == before, "split sizes kept when MultiExec is toggled");
+            splitMode = 1;
+            layoutPages();
+        }
+        {
+            // Ctrl++ / Ctrl+0 (Cmd on macOS) zoom the current terminal.
+            const int size = local3->terminal->font().pointSize();
+            QAction *in = nullptr, *reset = nullptr;
+            for (auto *a : shortcutActions)
+            {
+                if (a->shortcut() == QKeySequence("Ctrl++"))
+                    in = a;
+                if (a->shortcut() == QKeySequence("Ctrl+0"))
+                    reset = a;
+            }
+            if (in)
+                in->trigger();
+            const bool grew = local3->terminal->font().pointSize() == size + 1;
+            if (reset)
+                reset->trigger();
+            check(grew && local3->terminal->font().pointSize() == QSettings().value("terminal/size", 10).toInt(),
+                  "Ctrl++ zooms the terminal, Ctrl+0 resets it");
+        }
         closePage(local3);
 
         // SFTP: follow terminal folder, remote edit with reload, recursive delete.
@@ -4543,11 +4610,33 @@ public:
         auto *macrosMenu = menu(N("Macros"));
         auto *helpMenu = menu(N("Help"));
 
+        // Default shortcuts follow each system: macOS uses Command (written "Ctrl" in Qt key sequences, while "Meta"
+        // is the Control key); Windows and Linux add Shift where plain Ctrl+key belongs to the shell.
+        auto keys = [](const char *mac, const char *other)
+        {
+#ifdef Q_OS_MACOS
+            Q_UNUSED(other);
+            return QKeySequence(mac);
+#else
+            Q_UNUSED(mac);
+            return QKeySequence(other);
+#endif
+        };
+        // Extra keys for the same command, not shown in the shortcut settings.
+        auto alias = [this](const QKeySequence &sequence, std::function<void()> slot)
+        {
+            auto *a = new QAction(this);
+            a->setShortcut(sequence);
+            a->setShortcutContext(Qt::ApplicationShortcut);
+            addAction(a);
+            connect(a, &QAction::triggered, this, slot);
+        };
         item(
             terminalMenu, N("Open new tab"), [this] { terminal(localShell(), L("Local terminal")); }, "shell")
-            ->setShortcut(QKeySequence("Ctrl+Shift+T"));
+            ->setShortcut(keys("Ctrl+T", "Ctrl+Shift+T"));
         item(terminalMenu, N("Rename current tab"), [this] { renameTab(bar->currentIndex()); });
-        item(terminalMenu, N("Close current tab"), [this] { closePage(current()); });
+        item(terminalMenu, N("Close current tab"), [this] { closePage(current()); })
+            ->setShortcut(keys("Ctrl+W", "Ctrl+Shift+W"));
         item(terminalMenu, N("Close all tabs"), [this] { closeAll(nullptr); });
         terminalMenu->addSeparator();
         item(terminalMenu, N("Save terminal output..."),
@@ -4561,7 +4650,7 @@ public:
                  if (!file.isEmpty() && !saveOutput(t, file))
                      QMessageBox::warning(this, L("Save"), L("The file could not be written."));
              });
-        item(terminalMenu, N("Find..."), [this] { showFind(); })->setShortcut(QKeySequence("Ctrl+Shift+F"));
+        item(terminalMenu, N("Find..."), [this] { showFind(); })->setShortcut(keys("Ctrl+F", "Ctrl+Shift+F"));
         item(terminalMenu, N("Copy all"),
              [this]
              {
@@ -4577,7 +4666,7 @@ public:
         terminalMenu->addSeparator();
         item(terminalMenu, N("Exit"), [this] { close(); }, "exit");
 
-        item(sessionsMenu, N("New session"), [this] { edit(-1); }, "session")->setShortcut(QKeySequence("Ctrl+Shift+N"));
+        item(sessionsMenu, N("New session"), [this] { edit(-1); }, "session")->setShortcut(keys("Ctrl+N", "Ctrl+Shift+N"));
         item(sessionsMenu, N("Import from MobaXterm..."), [this] { importWizard(); }, "folder");
         item(sessionsMenu, N("Import sessions from file"), [this] { importFile(); });
         item(sessionsMenu, N("Import SCRT sessions"), [this] { importFile("SecureCRT (*.ini *.xml *.csv)"); });
@@ -4615,8 +4704,18 @@ public:
         sidebarToggle->setChecked(true);
         sidebarToggle->setShortcut(QKeySequence("Ctrl+Shift+B"));
         auto *fullscreen = item(viewMenu, N("Fullscreen"), [this] { isFullScreen() ? showNormal() : showFullScreen(); });
-        fullscreen->setShortcut(QKeySequence(Qt::Key_F11));
+        fullscreen->setShortcut(keys("Meta+Ctrl+F", "F11"));
         fullscreen->setShortcutContext(Qt::ApplicationShortcut);
+        // Terminal font zoom: Ctrl +/-/0 (Cmd on macOS), like browsers and other terminals.
+        auto zoomBy = [this](int steps)
+        {
+            if (auto *t = current()->terminal)
+                t->zoom(steps);
+        };
+        item(viewMenu, N("Zoom in"), [zoomBy] { zoomBy(1); })->setShortcut(QKeySequence("Ctrl++"));
+        item(viewMenu, N("Zoom out"), [zoomBy] { zoomBy(-1); })->setShortcut(QKeySequence("Ctrl+-"));
+        item(viewMenu, N("Reset zoom"), [zoomBy] { zoomBy(0); })->setShortcut(QKeySequence("Ctrl+0"));
+        alias(QKeySequence("Ctrl+="), [zoomBy] { zoomBy(1); }); // "+" without Shift on US keyboards
         viewMenu->addMenu(splitMenu);
 
         item(xMenu, N("Start X server"),
@@ -4715,7 +4814,7 @@ public:
                 [this](bool on)
                 {
                     multiExec = on;
-                    layoutPages();
+                    updateTitle(); // only the title changes: rebuilding the split would reset its sizes
                 });
         connect(button("tunneling", N("Tunneling"), N("SSH tunnels: local, remote and dynamic port forwarding")),
                 &QAction::triggered, this, [this] { tunnelDialog(); });
@@ -4993,8 +5092,25 @@ public:
             connect(a, &QAction::triggered, this, [cycle, step] { cycle(step); });
             shortcutActions << a;
         };
+#ifdef Q_OS_MACOS
+        tabAction(N("Next tab"), "Ctrl+Shift+]", 1); // Cmd+Shift+]; Control+Tab also works
+        tabAction(N("Previous tab"), "Ctrl+Shift+[", -1);
+        alias(QKeySequence("Meta+Tab"), [cycle] { cycle(1); });
+        alias(QKeySequence("Meta+Shift+Tab"), [cycle] { cycle(-1); });
+#else
         tabAction(N("Next tab"), "Ctrl+Tab", 1);
         tabAction(N("Previous tab"), "Ctrl+Shift+Tab", -1);
+        alias(QKeySequence("Ctrl+PgDown"), [cycle] { cycle(1); });
+        alias(QKeySequence("Ctrl+PgUp"), [cycle] { cycle(-1); });
+#endif
+        // Tab 1-8 by position, 9 = last tab: Cmd+N on macOS, Alt+N elsewhere.
+        for (int n = 1; n <= 9; ++n)
+#ifdef Q_OS_MACOS
+            alias(QKeySequence(QString("Ctrl+%1").arg(n)),
+#else
+            alias(QKeySequence(QString("Alt+%1").arg(n)),
+#endif
+                  [this, n] { bar->setCurrentIndex(n == 9 ? bar->count() - 1 : std::min(n - 1, bar->count() - 1)); });
         // Shortcuts: factory defaults stay available for "Restore defaults".
         for (auto *a : shortcutActions)
             defaultShortcuts.insert(a->objectName(), a->shortcut());

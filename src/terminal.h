@@ -49,6 +49,8 @@ public:
     // Ctrl+wheel zoom: new font size in points (the window saves it per session).
     std::function<void(int)> onZoom;
     void setFontPointSize(int points);
+    // Font zoom by whole points (Ctrl/Cmd + wheel, Ctrl/Cmd +/-); 0 = back to the size in the settings.
+    void zoom(int steps);
     // Predictions drawn over the screen (underlined if "terminal/predictionUnderline", on by default);
     // cursor.x() >= 0 shows the cursor there. The caller refreshes them after every output: real output wins.
     // With a MoshDevice the terminal runs MoshPredictor (mosh.h) on its own, according to "mosh/prediction".

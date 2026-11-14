@@ -21,6 +21,17 @@
 #include <QTimer>
 #include <vterm.h>
 #include <algorithm>
+
+namespace
+{
+// The key that makes control characters (^C, ^D...). Qt reports the macOS Command key as ControlModifier and the
+// Control key as MetaModifier: on macOS Control talks to the shell and Command runs CrossTerm commands.
+#ifdef Q_OS_MACOS
+constexpr Qt::KeyboardModifier ControlKey = Qt::MetaModifier;
+#else
+constexpr Qt::KeyboardModifier ControlKey = Qt::ControlModifier;
+#endif
+} // namespace
 #ifdef Q_OS_WIN
 #define NOMINMAX
 #include <windows.h>
@@ -926,23 +937,26 @@ void Terminal::setFontPointSize(int points)
     setFont(face);
 }
 
+void Terminal::zoom(int steps)
+{
+    QFont face = font();
+    face.setPointSize(steps ? std::clamp(face.pointSize() + steps, 6, 48) : QSettings().value("terminal/size", 10).toInt());
+    setFont(face);
+    if (onZoom)
+        onZoom(face.pointSize());
+}
+
 void Terminal::wheelEvent(QWheelEvent *event)
 {
     if (event->modifiers() & Qt::ControlModifier)
     {
-        // Ctrl+wheel: font zoom for this terminal (one point per notch; touchpads accumulate).
+        // Ctrl+wheel (Cmd+wheel on macOS): font zoom for this terminal (one point per notch; touchpads accumulate).
         static int pending = 0;
         pending += event->angleDelta().y();
         const int steps = pending / 120;
         pending %= 120;
         if (steps)
-        {
-            QFont face = font();
-            face.setPointSize(std::clamp(face.pointSize() + steps, 6, 48));
-            setFont(face);
-            if (onZoom)
-                onZoom(face.pointSize());
-        }
+            zoom(steps);
         event->accept();
         return;
     }
@@ -1024,7 +1038,8 @@ bool Terminal::event(QEvent *event)
     if (event->type() == QEvent::KeyPress)
     {
         auto *key = static_cast<QKeyEvent *>(event);
-        if ((key->key() == Qt::Key_Tab || key->key() == Qt::Key_Backtab) && !(key->modifiers() & Qt::ControlModifier))
+        if ((key->key() == Qt::Key_Tab || key->key() == Qt::Key_Backtab) &&
+            !(key->modifiers() & (Qt::ControlModifier | Qt::MetaModifier)))
         {
             keyPressEvent(key);
             key->accept();
@@ -1036,19 +1051,28 @@ bool Terminal::event(QEvent *event)
 
 void Terminal::keyPressEvent(QKeyEvent *event)
 {
-    if (event->modifiers() == (Qt::ControlModifier | Qt::ShiftModifier))
+    // Copy and paste: Cmd+C / Cmd+V on macOS; Ctrl+Shift+C / Ctrl+Shift+V, Ctrl+Insert / Shift+Insert elsewhere
+    // (plain Ctrl+C stays the interrupt).
+    const auto held = event->modifiers() & ~Qt::KeypadModifier;
+#ifdef Q_OS_MACOS
+    const bool copy = held == Qt::ControlModifier && event->key() == Qt::Key_C;
+    const bool pasteKey = held == Qt::ControlModifier && event->key() == Qt::Key_V;
+#else
+    const bool copy = (held == (Qt::ControlModifier | Qt::ShiftModifier) && event->key() == Qt::Key_C) ||
+                      (held == Qt::ControlModifier && event->key() == Qt::Key_Insert);
+    const bool pasteKey = (held == (Qt::ControlModifier | Qt::ShiftModifier) && event->key() == Qt::Key_V) ||
+                          (held == Qt::ShiftModifier && event->key() == Qt::Key_Insert);
+#endif
+    if (copy)
     {
-        if (event->key() == Qt::Key_C)
-        {
-            const auto text = selectedText();
-            QApplication::clipboard()->setText(text.isEmpty() ? contents() : text);
-            return;
-        }
-        if (event->key() == Qt::Key_V)
-        {
-            paste(QApplication::clipboard()->text());
-            return;
-        }
+        const auto text = selectedText();
+        QApplication::clipboard()->setText(text.isEmpty() ? contents() : text);
+        return;
+    }
+    if (pasteKey)
+    {
+        paste(QApplication::clipboard()->text());
+        return;
     }
     if (state->ended)
     {
@@ -1064,7 +1088,7 @@ void Terminal::keyPressEvent(QKeyEvent *event)
         if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)
             finishPrompt(s.promptBuffer);
         else if (event->key() == Qt::Key_Escape ||
-                 ((event->modifiers() & Qt::ControlModifier) && (event->key() == Qt::Key_C || event->key() == Qt::Key_D)))
+                 ((event->modifiers() & ControlKey) && (event->key() == Qt::Key_C || event->key() == Qt::Key_D)))
             finishPrompt(std::nullopt);
         else if (event->key() == Qt::Key_Backspace)
         {
@@ -1096,8 +1120,25 @@ void Terminal::keyPressEvent(QKeyEvent *event)
         state->anchor = state->extent;
         update();
     }
+#ifdef Q_OS_MACOS
+    // macOS line editing, as in Terminal.app: Option+arrows move by word, Cmd+arrows to the line ends,
+    // Cmd+Backspace deletes the line, Option+Backspace the previous word. Other Command keys belong to the app.
+    if (held & Qt::ControlModifier)
+    {
+        if (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right)
+            vterm_keyboard_unichar(state->vt, event->key() == Qt::Key_Left ? 'a' : 'e', VTERM_MOD_CTRL);
+        else if (event->key() == Qt::Key_Backspace)
+            vterm_keyboard_unichar(state->vt, 'u', VTERM_MOD_CTRL);
+        return;
+    }
+    if ((held & Qt::AltModifier) && (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right))
+    {
+        vterm_keyboard_unichar(state->vt, event->key() == Qt::Key_Left ? 'b' : 'f', VTERM_MOD_ALT);
+        return;
+    }
+#endif
     int mods = 0;
-    if (event->modifiers() & Qt::ControlModifier)
+    if (event->modifiers() & ControlKey)
         mods |= VTERM_MOD_CTRL;
     if ((event->modifiers() & Qt::ShiftModifier) || event->key() == Qt::Key_Backtab)
         mods |= VTERM_MOD_SHIFT;

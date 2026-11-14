@@ -540,8 +540,19 @@ public:
     void retryAutomatic()
     {
         if (listed.isEmpty() && !busy())
-            run(path->text(), {}, false);
+            run(startFolder(), {}, false);
     }
+    // The terminal's folder right after login (sftp starts in the remote home, so "~/x" is just "x").
+    QString startFolder() const
+    {
+        const auto dir = folderSource ? folderSource() : QString();
+        if (dir.isEmpty() || dir == "~")
+            return path->text();
+        return dir.startsWith("~/") ? dir.mid(2) : dir;
+    }
+    // True after the first successful listing: the server is reachable and speaks SFTP.
+    bool connected() const { return !home.isEmpty(); }
+    std::function<void()> onConnected;
     QString currentPath() const { return listed; }
     QTreeWidget *view() const { return files; }
     bool busy() const
@@ -989,7 +1000,8 @@ public:
                     }
                     std::sort(entries.begin(), entries.end(), [](const RemoteEntry &a, const RemoteEntry &b)
                               { return a.dir != b.dir ? a.dir : a.name.compare(b.name, Qt::CaseInsensitive) < 0; });
-                    if (home.isEmpty())
+                    const bool first = home.isEmpty();
+                    if (first)
                         home = listed; // first listed folder = remote home, used to resolve "~"
                     path->setText(listed.endsWith('/') ? listed : listed + "/");
                     files->clear();
@@ -1007,6 +1019,8 @@ public:
                         item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
                     }
                     status->setText(error.isEmpty() ? QString() : error.left(400));
+                    if (first && onConnected)
+                        onConnected();
                     if (!openAfter.isEmpty())
                     {
                         QDesktopServices::openUrl(QUrl::fromLocalFile(openAfter));
@@ -1014,7 +1028,7 @@ public:
                     }
                 });
         // First automatic listing when the SSH session opens.
-        QTimer::singleShot(1500, this, [this] { run(path->text(), {}, false); });
+        QTimer::singleShot(1500, this, [this] { run(startFolder(), {}, false); });
     }
 
     void download()
