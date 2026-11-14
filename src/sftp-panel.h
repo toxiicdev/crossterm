@@ -30,14 +30,6 @@
 #include <unistd.h>
 #endif
 
-static QString sftpQuote(QString text)
-{
-    if (text.contains(QRegularExpression("[\\x00-\\x1f\\x7f]")))
-        return {};
-    if (text.startsWith('-')) // otherwise sftp reads the name as flags ("rm -a": invalid flag, "get -r x": recursive)
-        text.prepend("./");
-    return "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
-}
 
 // A path for the shell prompt: inside double quotes a shell still expands $(...), `...` and !, so a file name
 // holding them is single-quoted (POSIX).

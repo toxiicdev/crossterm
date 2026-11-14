@@ -19,7 +19,7 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99)
 set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(relaycore STATIC ${SRC}/profiles.cpp ${SRC}/foreign.cpp ${SRC}/credentials.cpp ${SRC}/proxy.cpp
             ${SRC}/monitor.cpp ${SRC}/xserver.cpp ${SRC}/mobaimport.cpp ${SRC}/ftp.cpp ${SRC}/servers.cpp ${SRC}/vnc.cpp ${SRC}/rdp.cpp
-            ${SRC}/keepalive.cpp ${SRC}/syncvault.cpp ${SRC}/syncmerge.cpp)
+            ${SRC}/keepalive.cpp ${SRC}/syncvault.cpp ${SRC}/syncmerge.cpp ${SRC}/syncstorage.cpp)
 target_include_directories(relaycore PUBLIC ${SRC})
 target_link_libraries(relaycore PUBLIC Qt6::Core Qt6::Widgets Qt6::Network PRIVATE monocypher)
 if(WIN32)

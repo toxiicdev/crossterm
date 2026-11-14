@@ -918,3 +918,12 @@ QString portableRoot(const QString &executableDir, const QStringList &arguments)
         return QDir(executableDir).filePath("CrossTerm-data");
     return {};
 }
+
+QString sftpQuote(QString text)
+{
+    if (text.contains(QRegularExpression("[\\x00-\\x1f\\x7f]")))
+        return {};
+    if (text.startsWith('-')) // otherwise sftp reads the name as flags ("rm -a": invalid flag, "get -r x": recursive)
+        text.prepend("./");
+    return "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+}

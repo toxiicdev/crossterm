@@ -31,6 +31,8 @@ QByteArray aes256EncryptBlock(const QByteArray &key32, const QByteArray &block16
 // all), the programs they start in turn (sftp -> ssh) inherit it instead of opening a visible one.
 // Call before start(); no effect on other platforms.
 QProcess *hideConsoleWindow(QProcess *process);
+// Path quoted for an sftp batch line ("./" before a leading dash); empty when it holds control characters.
+QString sftpQuote(QString text);
 
 // "Hidden shell" mode (Windows): CrossTerm.exe started as %COMSPEC% with CROSSTERM_HIDDEN_SHELL set runs
 // "cmd.exe <same arguments>" inside an invisible pseudoconsole and returns its exit code.
