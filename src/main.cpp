@@ -3969,11 +3969,6 @@ public:
     // In-process end-to-end test (no global input): opens the first profile, which must point to a test
     // SSH/SFTP server, checks the SFTP browser, Split and dialogs, and saves screenshots via grab().
 
-
-
-
-
-
     int e2e(const QString &out)
     {
         QStringList log;
