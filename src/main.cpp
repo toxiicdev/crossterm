@@ -161,12 +161,12 @@ public:
         font.setBold(true);
         const QFontMetrics metrics(font);
         const int height = metrics.height();
-        QList<QRect> boxes;
+        QList<QRectF> boxes;
         int right = option.rect.right() - 8;
         for (const auto &[text, color] : badges)
         {
             const int width = std::max(height, metrics.horizontalAdvance(text) + 8);
-            boxes.append(QRect(right - width, option.rect.center().y() - height / 2 + 1, width, height));
+            boxes.append(QRectF(right - width, option.rect.top() + (option.rect.height() - height) / 2.0, width, height));
             right -= width + 4;
         }
         // Hover/selection background over the whole row, then the name elided before the badges.
@@ -179,24 +179,24 @@ public:
         QStyledItemDelegate::paint(painter, name, index);
         painter->save();
         painter->setRenderHint(QPainter::Antialiasing);
-        painter->setFont(font);
+        painter->setPen(Qt::NoPen);
         for (int i = 0; i < badges.size(); ++i)
         {
-            painter->setPen(Qt::NoPen);
             painter->setBrush(badges[i].second);
             painter->drawRoundedRect(boxes[i], 4, 4); // square with softly rounded corners
-            painter->setPen(Qt::white);
-            // Centered on the text's own outline: AlignCenter centers the font's line box and leaves digits low.
-            const QRectF ink = metrics.tightBoundingRect(badges[i].first);
-            painter->drawText(QPointF(boxes[i].left() + (boxes[i].width() - ink.width()) / 2.0 - ink.left(),
-                                      boxes[i].top() + (boxes[i].height() - ink.height()) / 2.0 - ink.top()),
-                              badges[i].first);
+            // Centered on the exact outline of the glyphs, in fractional coordinates: the font's line box (AlignCenter)
+            // leaves digits low, and whole-pixel metrics are off by one at 125% / 150% screen scaling.
+            QPainterPath glyphs;
+            glyphs.addText(QPointF(0, 0), font, badges[i].first);
+            const QRectF ink = glyphs.boundingRect();
+            painter->fillPath(glyphs.translated(boxes[i].center() - ink.center()), Qt::white);
         }
         painter->restore();
     }
 };
 
-// Session tree: the green of an open session also fills the indentation, as the selection does.
+// Session tree: the green of an open session also fills the indentation, as the selection does, and a green bar
+// marks the left edge of the row (still there when the row is selected).
 class SessionTree : public QTreeWidget
 {
 protected:
@@ -205,6 +205,9 @@ protected:
         if (const auto tint = index.data(Qt::BackgroundRole); tint.isValid() && !selectionModel()->isSelected(index))
             painter->fillRect(rect, tint.value<QBrush>());
         QTreeWidget::drawBranches(painter, rect, index);
+        if (index.data(Qt::UserRole + 4).toInt() > 0)
+            painter->fillRect(QRect(rect.left(), rect.top(), 3, rect.height()),
+                              QColor(appearanceIsDark(appearance) ? "#3fb950" : "#2e8b47"));
     }
 };
 
@@ -1096,7 +1099,7 @@ private:
             if (const auto *p = page(i); p && p != home)
                 if (const auto id = p->profile["id"].toString(); !id.isEmpty())
                     ++open[id];
-        const QBrush tint(QColor(appearanceIsDark(appearance) ? "#16261c" : "#e3f4e7"));
+        const QBrush tint(QColor(appearanceIsDark(appearance) ? "#1f4429" : "#e3f4e7"));
         for (QTreeWidgetItemIterator it(tree); *it; ++it)
             if ((*it)->data(0, Qt::UserRole + 1).toBool())
             {
@@ -3965,6 +3968,7 @@ public:
 
     // In-process end-to-end test (no global input): opens the first profile, which must point to a test
     // SSH/SFTP server, checks the SFTP browser, Split and dialogs, and saves screenshots via grab().
+
 
 
 
