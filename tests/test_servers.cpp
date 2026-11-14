@@ -364,13 +364,17 @@ static void testScanner()
         many << freeTcpPort();
     finished = false;
     int calls = 0;
-    scanner.progress = [&](int, int) { ++calls; };
+    // Cancel from the first callback: refused loopback connects are instant on Linux, so cancelling after
+    // spin() would race with the whole scan finishing.
+    scanner.progress = [&](int, int)
+    {
+        if (++calls == 1)
+            scanner.cancel();
+    };
     CHECK(scanner.start("127.0.0.1", many, 2, 300));
     CHECK(spin([&] { return calls > 0; }, 5000));
-    scanner.cancel();
-    const int frozen = calls;
     spin([] { return false; }, 1000);
-    CHECK(!scanner.isRunning() && calls == frozen && !finished);
+    CHECK(!scanner.isRunning() && calls == 1 && !finished);
 
     // /30 network: two usable hosts
     found.clear();
