@@ -72,7 +72,8 @@ public:
             return;
         const auto all = socket->peek(64 * 1024);
         const auto lines = all.split('\n');
-        const bool withValue = lines.size() > 1 && (lines[1].trimmed() == "PUT" || lines[1].trimmed() == "ASK");
+        const bool withValue = lines.size() > 1 && (lines[1].trimmed() == "PUT" || lines[1].trimmed() == "ASK" ||
+                                                    lines[1].trimmed() == "VPUT");
         if (lines.size() < 4 || (withValue && lines.size() < 5))
             return; // incomplete request: wait for more data
         socket->readAll();
@@ -107,6 +108,19 @@ public:
                 put(entry, decode(lines[3]));
             else if (command == "DEL")
                 forget(entry);
+            // System vault, read and written by this process for the askpass helpers: macOS then asks for
+            // Keychain access once, in the foreground app, instead of once per background helper.
+            else if (command == "VGET")
+            {
+                auto value = readSecret(entry);
+                reply = value ? "+" + encode(*value) + "\n" : QByteArray("-\n");
+                if (value)
+                    value->fill(QChar(0));
+            }
+            else if (command == "VPUT")
+                reply = storeSecret(entry, entry.section(':', 1).section('@', 0, 0), decode(lines[3])) ? "+\n" : "-\n";
+            else if (command == "VDEL")
+                reply = removeSecret(entry) ? "+\n" : "-\n";
         }
         socket->write(reply);
         socket->flush();
@@ -150,28 +164,62 @@ public:
     }
 };
 
-// Askpass side: queries the cache of the CrossTerm window that launched ssh.
-inline QString askSessionSecrets(const QByteArray &command, const QString &entry, const QString &secret = {})
+// Askpass side: one request to the CrossTerm window that launched ssh; nullopt when it cannot be reached.
+inline std::optional<QByteArray> requestSessionSecrets(const QByteArray &command, const QString &entry,
+                                                       const QString &secret = {}, int timeout = 2000)
 {
     const auto server = qEnvironmentVariable("CROSSTERM_ASKPASS_SERVER");
     const auto key = qEnvironmentVariable("CROSSTERM_ASKPASS_KEY");
     if (server.isEmpty() || key.isEmpty())
-        return {};
+        return std::nullopt;
     QLocalSocket socket;
     socket.connectToServer(server);
     if (!socket.waitForConnected(2000))
-        return {};
+        return std::nullopt;
     QByteArray request = key.toUtf8() + "\n" + command + "\n" + entry.toUtf8().toBase64() + "\n" +
-                         (command == "PUT" ? secret.toUtf8().toBase64() : QByteArray()) + "\n";
+                         (command == "PUT" || command == "VPUT" ? secret.toUtf8().toBase64() : QByteArray()) + "\n";
     socket.write(request);
     request.fill('\0');
     socket.flush();
     QByteArray reply;
-    while (!reply.contains('\n') && socket.waitForReadyRead(2000))
+    while (!reply.contains('\n') && socket.waitForReadyRead(timeout))
         reply += socket.readAll();
-    auto value = QString::fromUtf8(QByteArray::fromBase64(reply.trimmed()));
+    if (!reply.contains('\n'))
+        return std::nullopt;
+    return reply.trimmed();
+}
+
+// Askpass side: queries the cache of the CrossTerm window that launched ssh.
+inline QString askSessionSecrets(const QByteArray &command, const QString &entry, const QString &secret = {})
+{
+    auto reply = requestSessionSecrets(command, entry, secret).value_or(QByteArray());
+    auto value = QString::fromUtf8(QByteArray::fromBase64(reply));
     reply.fill('\0');
     return value;
+}
+
+// Askpass side: the system vault through the CrossTerm window (which may wait for a Keychain prompt), or directly
+// when there is no window to ask.
+inline std::optional<QString> vaultRead(const QString &target)
+{
+    auto reply = requestSessionSecrets("VGET", target, {}, 300000);
+    if (!reply)
+        return readSecret(target);
+    std::optional<QString> value;
+    if (reply->startsWith('+'))
+        value = QString::fromUtf8(QByteArray::fromBase64(reply->mid(1)));
+    reply->fill('\0');
+    return value;
+}
+inline void vaultStore(const QString &target, const QString &secret)
+{
+    if (!requestSessionSecrets("VPUT", target, secret, 300000))
+        storeSecret(target, target.section(':', 1).section('@', 0, 0), secret);
+}
+inline void vaultRemove(const QString &target)
+{
+    if (!requestSessionSecrets("VDEL", target, {}, 300000))
+        removeSecret(target);
 }
 
 // Askpass side: asks the CrossTerm window to read the answer inside the session's terminal.
@@ -310,7 +358,7 @@ inline int runAskpass(int &argc, char **argv)
     // Cache entry: the session password, or the passphrase of the key named in the prompt.
     const bool passphrase = prompt.contains("passphrase", Qt::CaseInsensitive);
     const auto entry = passphrase ? "passphrase:" + prompt.trimmed() : target;
-    const auto saved = target.isEmpty() || passphrase ? std::nullopt : readSecret(target);
+    const auto saved = target.isEmpty() || passphrase ? std::nullopt : vaultRead(target);
     if (attempt == 1 && saved)
     {
         writeAnswer(*saved);
@@ -334,7 +382,7 @@ inline int runAskpass(int &argc, char **argv)
         if (!typed.value)
             return 1;
         if (saved && !passphrase)
-            storeSecret(target, target.section(':', 1).section('@', 0, 0), *typed.value);
+            vaultStore(target, *typed.value);
         if (!entry.isEmpty())
             askSessionSecrets("PUT", entry, *typed.value);
         writeAnswer(*typed.value);
@@ -374,9 +422,9 @@ inline int runAskpass(int &argc, char **argv)
     if (remember->isVisible())
     {
         if (remember->isChecked())
-            storeSecret(target, target.section(':', 1).section('@', 0, 0), value);
+            vaultStore(target, value);
         else if (saved)
-            removeSecret(target);
+            vaultRemove(target);
     }
     if (!entry.isEmpty())
         askSessionSecrets("PUT", entry, value); // reused by the session's SFTP, monitoring and tunnels
