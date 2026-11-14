@@ -69,6 +69,19 @@ fi
 # 2) Otherwise a local self-signed certificate (created once in the login keychain).
 # Both keep the same signature across builds, so Keychain "Always Allow" stays valid; an ad hoc signature changes
 # at every build and the password is asked again.
+# An Apple certificate listed but not valid usually lacks its intermediate authority (a certificate created outside
+# Xcode, or an old Mac): import Apple's once from apple.com, then look again.
+APPLE_CERT='"(Developer ID Application|Apple Development): '
+if security find-identity -p codesigning 2>/dev/null | grep -qE "$APPLE_CERT" &&
+    ! security find-identity -v -p codesigning 2>/dev/null | grep -qE "$APPLE_CERT"; then
+    tmp="$(mktemp -d)"
+    for ca in AppleWWDRCAG3 DeveloperIDG2CA; do
+        echo "Importing Apple intermediate certificate $ca"
+        curl -fsSL "https://www.apple.com/certificateauthority/$ca.cer" -o "$tmp/$ca.cer" &&
+            security import "$tmp/$ca.cer" -k "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
+    done
+    rm -rf "$tmp"
+fi
 IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
 DEVELOPER_ID="${CROSSTERM_SIGN_IDENTITY:-$(printf '%s\n' "$IDENTITIES" |
     sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)}"
