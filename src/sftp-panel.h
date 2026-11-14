@@ -50,6 +50,236 @@ static QString shellQuote(const QString &path)
     return "'" + QString(path).replace("'", "'\\''") + "'";
 }
 
+// A word for a remote POSIX shell, always single-quoted; empty for control characters.
+static QString posixQuote(const QString &text)
+{
+    if (text.isEmpty() || text.contains(QRegularExpression("[\\x00-\\x1f\\x7f]")))
+        return {};
+    return "'" + QString(text).replace("'", "'\\''") + "'";
+}
+
+// Permissions dialog: read/write/execute checkboxes for owner, group and others, kept in step with the numeric
+// mode (whose fourth digit, setuid/setgid/sticky, is kept as it is). The new mode, or empty when cancelled.
+// With a shell on the server (shell): owner and group, and for a folder (dir) the same mode for its content too.
+struct SftpPermissions
+{
+    QString mode, owner, group; // owner and group as they were when unchanged
+    int recurse = 0;            // 0 the item alone; with its content: 1 files and folders, 2 files only, 3 folders only
+};
+static std::optional<SftpPermissions> sftpPermissionsDialog(QWidget *parent, const QString &path, const QString &start,
+                                                            const QString &owner = {}, const QString &group = {},
+                                                            bool shell = false, bool dir = false)
+{
+    QDialog dialog(parent);
+    dialog.setWindowTitle(L("Permissions"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *name = new QLabel(path);
+    name->setTextFormat(Qt::PlainText);
+    name->setWordWrap(true);
+    layout->addWidget(name);
+    auto *grid = new QGridLayout;
+    grid->setHorizontalSpacing(18);
+    const char *columns[] = {N("Read"), N("Write"), N("Execute")};
+    const char *rows[] = {N("Owner"), N("Group"), N("Others")};
+    for (int c = 0; c < 3; ++c)
+        grid->addWidget(new QLabel(L(columns[c])), 0, c + 1, Qt::AlignHCenter);
+    QCheckBox *boxes[3][3];
+    for (int r = 0; r < 3; ++r)
+    {
+        grid->addWidget(new QLabel(L(rows[r])), r + 1, 0);
+        for (int c = 0; c < 3; ++c)
+        {
+            boxes[r][c] = new QCheckBox;
+            boxes[r][c]->setAccessibleName(L(rows[r]) + " " + L(columns[c]));
+            grid->addWidget(boxes[r][c], r + 1, c + 1, Qt::AlignHCenter);
+        }
+    }
+    layout->addLayout(grid);
+    auto *numericRow = new QHBoxLayout;
+    auto *numeric = new QLineEdit(start);
+    numeric->setValidator(new QRegularExpressionValidator(QRegularExpression("[0-7]{0,4}"), numeric));
+    numeric->setMaximumWidth(80);
+    numericRow->addWidget(new QLabel(L("Numeric value:")));
+    numericRow->addWidget(numeric);
+    numericRow->addStretch();
+    layout->addLayout(numericRow);
+    QLineEdit *ownerEdit = nullptr, *groupEdit = nullptr;
+    QCheckBox *recurse = nullptr;
+    QComboBox *scope = nullptr;
+    static const QRegularExpression account("^[A-Za-z0-9._][A-Za-z0-9._-]*\\$?$");
+    if (shell)
+    {
+        auto *form = new QFormLayout;
+        ownerEdit = new QLineEdit(owner);
+        groupEdit = new QLineEdit(group);
+        for (auto *edit : {ownerEdit, groupEdit})
+            edit->setValidator(new QRegularExpressionValidator(QRegularExpression("[A-Za-z0-9._$-]{0,64}"), edit));
+        form->addRow(L("Owner") + ":", ownerEdit);
+        form->addRow(L("Group") + ":", groupEdit);
+        layout->addLayout(form);
+        if (dir)
+        {
+            recurse = new QCheckBox(L("Apply to the folder's content too"));
+            scope = new QComboBox;
+            scope->addItems({L("Files and folders"), L("Files only"), L("Folders only")});
+            scope->setEnabled(false);
+            QObject::connect(recurse, &QCheckBox::toggled, scope, &QWidget::setEnabled);
+            layout->addWidget(recurse);
+            layout->addWidget(scope);
+        }
+    }
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    static const QRegularExpression valid("^[0-7]{3,4}$");
+    bool syncing = false;
+    auto fromNumber = [&]
+    {
+        const auto mode = numeric->text();
+        const bool ok = valid.match(mode).hasMatch();
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(ok);
+        if (!ok || syncing)
+            return;
+        syncing = true;
+        const auto digits = mode.right(3);
+        for (int r = 0; r < 3; ++r)
+        {
+            const int v = digits[r].digitValue();
+            for (int c = 0; c < 3; ++c)
+                boxes[r][c]->setChecked(v & (4 >> c));
+        }
+        syncing = false;
+    };
+    auto fromBoxes = [&]
+    {
+        if (syncing)
+            return;
+        syncing = true;
+        QString digits;
+        for (int r = 0; r < 3; ++r)
+        {
+            int v = 0;
+            for (int c = 0; c < 3; ++c)
+                v |= boxes[r][c]->isChecked() ? 4 >> c : 0;
+            digits += QString::number(v);
+        }
+        const auto current = numeric->text();
+        const auto special = current.size() == 4 && current[0] != '0' ? current.left(1) : QString();
+        numeric->setText(special + digits);
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(true);
+        syncing = false;
+    };
+    QObject::connect(numeric, &QLineEdit::textChanged, &dialog, fromNumber);
+    for (auto &row : boxes)
+        for (auto *box : row)
+            QObject::connect(box, &QCheckBox::toggled, &dialog, fromBoxes);
+    fromNumber();
+    if (dialog.exec() != QDialog::Accepted || !valid.match(numeric->text()).hasMatch())
+        return std::nullopt;
+    SftpPermissions result{numeric->text(), owner, group, 0};
+    if (ownerEdit && account.match(ownerEdit->text()).hasMatch())
+        result.owner = ownerEdit->text();
+    if (groupEdit && account.match(groupEdit->text()).hasMatch())
+        result.group = groupEdit->text();
+    if (recurse && recurse->isChecked())
+        result.recurse = scope->currentIndex() + 1;
+    return result;
+}
+
+// Commands run on the server through sh for the operations that SFTP has no request for. Names are relative to
+// the folder dir ("./" first: never read as an option); empty when a path cannot be quoted.
+static QString sftpNames(const QStringList &names)
+{
+    QString words;
+    for (const auto &name : names)
+    {
+        if (const auto quoted = posixQuote("./" + name); !quoted.isEmpty())
+            words += " " + quoted;
+    }
+    return words;
+}
+// Extracts archive (zip, or a tar of any compression) into dir; files already there are kept, never replaced.
+static QString sftpExtractScript(const QString &dir, const QString &archive, bool zip)
+{
+    const auto folder = posixQuote(dir), file = posixQuote("./" + archive);
+    if (folder.isEmpty() || file.isEmpty())
+        return {};
+    if (zip)
+        return "cd " + folder + " && unzip -q -n " + file;
+    return "cd " + folder + " && if tar --version 2>/dev/null | grep -q GNU; then tar -x --skip-old-files -f " + file +
+           "; else tar -x -k -f " + file + "; fi";
+}
+static QString sftpCompressScript(const QString &dir, const QString &archive, const QStringList &names, bool zip)
+{
+    const auto folder = posixQuote(dir), out = posixQuote("./" + archive), words = sftpNames(names);
+    if (folder.isEmpty() || out.isEmpty() || words.isEmpty())
+        return {};
+    return "cd " + folder + " && " + (zip ? "zip -r -q -y " : "tar -czf ") + out + words;
+}
+static QString sftpSizeScript(const QString &dir, const QStringList &names)
+{
+    const auto folder = posixQuote(dir), words = sftpNames(names);
+    return folder.isEmpty() || words.isEmpty() ? QString() : "cd " + folder + " && du -sk" + words;
+}
+// Copies each source path to its target path; fails (exit 1) when any copy fails, after trying them all.
+static QString sftpCopyScript(const QList<std::pair<QString, QString>> &copies)
+{
+    QString script = "e=0";
+    for (const auto &[from, to] : copies)
+    {
+        const auto source = posixQuote(from), target = posixQuote(to);
+        if (!source.isEmpty() && !target.isEmpty())
+            script += "; cp -R -p -- " + source + " " + target + " || e=1";
+    }
+    return script + "; exit $e";
+}
+// recurse: 0 the item alone; 1 its content too; 2 files only; 3 folders only. owner empty: no chown.
+static QString sftpPermissionsScript(const QString &path, const QString &mode, const QString &owner, int recurse)
+{
+    // "--" before the mode and the owner: BSD chmod and chown end their options at the first operand.
+    const auto file = posixQuote(path.startsWith('/') ? path : "./" + path);
+    if (file.isEmpty() || !QRegularExpression("^[0-7]{3,4}$").match(mode).hasMatch())
+        return {};
+    QStringList steps;
+    if (!owner.isEmpty())
+        steps << QString("chown ") + (recurse ? "-R " : "") + "-- " + posixQuote(owner) + " " + file;
+    if (recurse == 1)
+        steps << "chmod -R -- " + mode + " " + file;
+    else if (recurse)
+        steps << "find " + file + (recurse == 2 ? " -type f" : " -type d") + " -exec chmod " + mode + " {} +";
+    else
+        steps << "chmod -- " + mode + " " + file;
+    return steps.join(" && ");
+}
+// "name (copy).ext", "name (copy) 2.ext"…: a name not in taken (a folder keeps its dots).
+static QString sftpCopyName(const QString &name, bool dir, const QStringList &taken)
+{
+    int dot = dir ? -1 : int(name.lastIndexOf('.'));
+    if (dot <= 0)
+        dot = int(name.size());
+    const auto base = name.left(dot), extension = name.mid(dot);
+    for (int n = 1;; ++n)
+    {
+        const auto candidate = L("%1 (copy)").arg(base) + (n > 1 ? " " + QString::number(n) : QString()) + extension;
+        if (!taken.contains(candidate))
+            return candidate;
+    }
+}
+// "zip" or "tar" for an archive name, empty otherwise.
+static QString sftpArchiveKind(const QString &name)
+{
+    const auto lower = name.toLower();
+    if (lower.endsWith(".zip"))
+        return "zip";
+    for (const char *extension : {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz"})
+    {
+        if (lower.endsWith(extension))
+            return "tar";
+    }
+    return {};
+}
+
 // A remote name usable as a local file name inside a folder (a name with '\' or ':' from a Unix server would
 // leave the folder on Windows).
 static bool safeLocalName(const QString &name)
@@ -264,6 +494,91 @@ protected:
     }
 };
 
+// Buttons in a row that wraps onto more lines when the panel is too narrow for them, instead of widening it.
+class SftpFlowLayout : public QLayout
+{
+    QList<QLayoutItem *> items;
+    int arrange(const QRect &rect, bool apply) const
+    {
+        const int gap = spacing() < 0 ? 4 : spacing();
+        int x = rect.x(), y = rect.y(), line = 0;
+        for (auto *item : items)
+        {
+            const auto size = item->sizeHint();
+            if (x > rect.x() && x + size.width() > rect.right() + 1)
+            {
+                x = rect.x();
+                y += line + gap;
+                line = 0;
+            }
+            if (apply)
+                item->setGeometry(QRect(QPoint(x, y), size));
+            x += size.width() + gap;
+            line = std::max(line, size.height());
+        }
+        return y + line - rect.y();
+    }
+
+public:
+    using QLayout::QLayout;
+    ~SftpFlowLayout() override
+    {
+        while (auto *item = takeAt(0))
+            delete item;
+    }
+    void addItem(QLayoutItem *item) override { items << item; }
+    int count() const override { return int(items.size()); }
+    QLayoutItem *itemAt(int i) const override { return items.value(i); }
+    QLayoutItem *takeAt(int i) override { return i >= 0 && i < items.size() ? items.takeAt(i) : nullptr; }
+    Qt::Orientations expandingDirections() const override { return {}; }
+    bool hasHeightForWidth() const override { return true; }
+    int heightForWidth(int width) const override { return arrange(QRect(0, 0, width, 0), false); }
+    void setGeometry(const QRect &rect) override
+    {
+        QLayout::setGeometry(rect);
+        arrange(rect, true);
+    }
+    QSize sizeHint() const override { return minimumSize(); }
+    QSize minimumSize() const override
+    {
+        QSize size; // the widest button: the narrowest the row can get
+        for (auto *item : items)
+            size = size.expandedTo(item->minimumSize());
+        return size;
+    }
+};
+
+// Rename in place in the list (F2, "Rename"): the name is edited in its row, as in Finder or Explorer. The row keeps
+// its old name until the server's listing shows the new one; renamed gets the old and the new name.
+class SftpRenameDelegate : public QStyledItemDelegate
+{
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+    std::function<void(const QString &, const QString &)> renamed;
+
+    void setEditorData(QWidget *editor, const QModelIndex &index) const override
+    {
+        auto *edit = qobject_cast<QLineEdit *>(editor);
+        if (!edit)
+            return QStyledItemDelegate::setEditorData(editor, index);
+        const auto name = index.data().toString();
+        edit->setText(name);
+        // The name without its extension selected, for a file ("report" of "report.pdf").
+        const int dot = name.lastIndexOf('.');
+        if (!index.data(Qt::UserRole).toBool() && dot > 0)
+            QTimer::singleShot(0, edit, [edit, dot] { edit->setSelection(0, dot); });
+        else
+            edit->selectAll();
+    }
+    void setModelData(QWidget *editor, QAbstractItemModel *, const QModelIndex &index) const override
+    {
+        auto *edit = qobject_cast<QLineEdit *>(editor);
+        const auto old = index.data().toString(), next = edit ? edit->text().trimmed() : QString();
+        if (renamed && !next.isEmpty() && next != old)
+            renamed(old, next);
+    }
+};
+
 // Dot of the connection state in the path field: 0 grey (not connected yet), 1 green, 2 red.
 static QPixmap sftpStateDot(int state)
 {
@@ -289,6 +604,23 @@ class SftpPanel : public QWidget
     int link = 0;                   // 0 not connected yet or connecting, 1 last listing succeeded, 2 cannot connect
     QProcess *process = hideConsoleWindow(new QProcess(this));
     Command command;
+    Command shell; // ssh to the same server: "rm -rf" in one go instead of walking the folders over sftp
+    QProcess *remover = hideConsoleWindow(new QProcess(this));
+    QStringList removing[2]; // folders and files of the "rm -rf" in progress (for the sftp fallback)
+    // Programs found on the server (asked once after the first listing): the menu shows what they make possible.
+    QSet<QString> tools;
+    QString note; // shown as the status once the listing in progress (or the next one) has finished
+    // History of the listed folders (Back/Forward) and the move waiting for its listing: -1 back, 1 forward.
+    QStringList backStack, forwardStack;
+    int historyMove = 0;
+    QString historyTarget;
+    // Cut or copied remote paths (this server only), pasted into the listed folder.
+    QStringList clipboardPaths;
+    bool clipboardCut = false;
+    QSet<QString> clipboardDirs;
+    QLineEdit *filter = new QLineEdit;
+    QAction *hiddenToggle = nullptr;
+    QAction *backAction = nullptr, *forwardAction = nullptr;
     QString listed, target;
     QString login; // user name of the session ("" when ssh picks it)
     Texts texts;
@@ -361,6 +693,7 @@ class SftpPanel : public QWidget
         QDateTime sourceTime;
         QString stamp;
         QString note; // warnings of a completed transfer (entries that sftp skipped)
+        bool temporary = false; // "Download as zip": the remote file is removed once downloaded (or the row cleared)
         QTreeWidgetItem *item = nullptr;
         QProgressBar *bar = nullptr;
         QProcess *process = nullptr; // while running
@@ -513,7 +846,7 @@ class SftpPanel : public QWidget
             row->note.clear();
             row->state = "queued";
             row->item->setText(1, fileSizeText(size));
-            row->item->setToolTip(3, {});
+            row->bar->setToolTip({});
             row->bar->setRange(0, 100);
             row->bar->setValue(0);
             showState(row);
@@ -731,6 +1064,16 @@ class SftpPanel : public QWidget
 #endif
     }
 
+    // The status of a row is written inside its progress bar (the Status column stays hidden, so the queue needs
+    // no horizontal scrolling): the percentage with the speed while running, the state otherwise.
+    void setStatus(Transfer &t, const QString &text)
+    {
+        t.item->setText(3, text);
+        if (t.state == "running")
+            t.bar->setFormat(t.rate.text().isEmpty() ? "%p%" : "%p% · " + t.rate.text());
+        else
+            t.bar->setFormat(text.isEmpty() ? "%p%" : text);
+    }
     void showState(const std::shared_ptr<Transfer> &t)
     {
         static const QHash<QString, const char *> labels{{"queued", N("Queued")},
@@ -739,11 +1082,11 @@ class SftpPanel : public QWidget
                                                          {"failed", N("Failed")},
                                                          {"cancelled", N("Cancelled")}};
         if (t->state == "running" && !t->rate.text().isEmpty())
-            t->item->setText(3, t->rate.text()); // speed and time left, once known
+            setStatus(*t, t->rate.text()); // speed and time left, once known
         else if (t->state == "done" && !t->note.isEmpty())
-            t->item->setText(3, L("Completed") + ": " + t->note.section('\n', 0, 0)); // all of it in the tooltip
+            setStatus(*t, L("Completed") + ": " + t->note.section('\n', 0, 0)); // all of it in the tooltip
         else if (t->state != "failed")
-            t->item->setText(3, L(labels.value(t->state, "")));
+            setStatus(*t, L(labels.value(t->state, "")));
         t->item->setIcon(0, icon(t->upload ? "upload" : "download", 16));
         if (t->state == "done")
             t->bar->setRange(0, 100), t->bar->setValue(100);
@@ -774,7 +1117,7 @@ class SftpPanel : public QWidget
             if (program.isEmpty() || directory.isEmpty() || name.isEmpty() || local.isEmpty() || !command.error.isEmpty())
             {
                 t->state = "failed";
-                t->item->setText(3,
+                setStatus(*t,
                                  L("Failed") + ": " + (command.error.isEmpty() ? L("Invalid path.") : describe(command.error)));
                 continue;
             }
@@ -858,7 +1201,7 @@ class SftpPanel : public QWidget
             if (t->size > 0)
                 t->bar->setValue(int(std::min<qint64>(99, done * 100 / t->size)));
             if (t->rate.add(done, t->size))
-                t->item->setText(3, t->rate.text());
+                setStatus(*t, t->rate.text());
         }
     }
 
@@ -983,20 +1326,26 @@ private:
         queueView->setRootIsDecorated(false);
         queueView->setColumnCount(4);
         queueView->setMaximumHeight(150);
-        queueView->setColumnWidth(0, 110);
-        queueView->setColumnWidth(1, 60);
-        queueView->setColumnWidth(2, 90);
+        // As wide as the panel, never wider: name and progress share the width, the size fits its text.
+        queueView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        queueView->setColumnHidden(3, true);
+        queueView->header()->setStretchLastSection(false);
+        queueView->header()->setMinimumSectionSize(30);
+        queueView->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+        queueView->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        queueView->header()->setSectionResizeMode(2, QHeaderView::Stretch);
         box->addWidget(queueView);
-        auto *row = new QHBoxLayout;
+        auto *row = new SftpFlowLayout;
+        row->setSpacing(4);
         auto *cancel = texts.text(new QPushButton, N("Cancel"));
         auto *resume = texts.text(new QPushButton, N("Resume"));
-        auto *clear = texts.text(new QPushButton, N("Clear finished"));
+        auto *clear = texts.text(new QPushButton, N("Clear"));
+        texts.tip(clear, N("Clear finished"));
         for (auto *b : {cancel, resume, clear})
         {
             b->setStyleSheet("padding: 2px 8px;");
             row->addWidget(b);
         }
-        row->addStretch();
         box->addLayout(row);
         connect(cancel, &QPushButton::clicked, this, [this] { cancelTransfer(selectedTransfer()); });
         connect(resume, &QPushButton::clicked, this, [this] { resumeTransfer(selectedTransfer()); });
@@ -1010,10 +1359,13 @@ private:
                         const auto &state = transfers[i]->state;
                         if ((state == "done" || state == "failed" || state == "cancelled") && !transfers[i]->process)
                         {
+                            removeTemporary(*transfers[i]);
                             delete transfers[i]->item;
                             transfers.removeAt(i);
                         }
                     }
+                    if (transfers.isEmpty())
+                        queueBox->hide();
                 });
         queueBox->hide();
         layout->addWidget(queueBox);
@@ -1050,14 +1402,14 @@ private:
                         t->state = "done";
                         // "put -r" and "get -r" skip what is not a file or a folder (links) and still end well.
                         t->note = error.split(QRegularExpression("[\\r\\n]+")).filter("not a regular file").join('\n');
-                        t->item->setToolTip(3, t->note);
+                        t->bar->setToolTip(t->note);
                     }
                     else
                     {
                         t->state = "failed";
-                        t->item->setText(3,
+                        setStatus(*t,
                                          L("Failed") + ": " + (error.isEmpty() ? L("SFTP operation failed.") : error.left(200)));
-                        t->item->setToolTip(3, error);
+                        t->bar->setToolTip(error);
                         if (!connected)
                             setLink(2);
                     }
@@ -1113,6 +1465,9 @@ private:
                     if (t->bar->maximum() == 0)
                         t->bar->setRange(0, 100);
                     showState(t);
+                    // A failed or cancelled zip download stays on the server for Resume until its row is cleared.
+                    if (t->state == "done")
+                        removeTemporary(*t);
                     if (t->state == "done" && t->upload && t->directory == listed)
                     {
                         if (process->state() == QProcess::NotRunning)
@@ -1135,6 +1490,7 @@ private:
                     if (!runningTransfers())
                         ticker->stop();
                     pump();
+                    QTimer::singleShot(2000, this, [this] { hideQueueIfIdle(); });
                 });
         connect(mover, &QProcess::errorOccurred, this,
                 [this, t, mover](QProcess::ProcessError e)
@@ -1142,7 +1498,7 @@ private:
                     if (e != QProcess::FailedToStart)
                         return;
                     t->state = "failed";
-                    t->item->setText(3, L("Failed") + ": " + mover->errorString());
+                    setStatus(*t, L("Failed") + ": " + mover->errorString());
                     if (auto edit = edited.find(t->local); t->edit && edit != edited.end())
                         edit->stamp = {}; // not on the server
                     setLink(2);
@@ -1232,7 +1588,7 @@ public:
     bool busy() const
     {
         return process->state() != QProcess::NotRunning || scanner->state() != QProcess::NotRunning || !scanQueue.isEmpty() ||
-               deletePending;
+               deletePending || remover->state() != QProcess::NotRunning;
     }
     std::function<QString()> folderSource;
     std::function<void(const QString &)> pasteToTerminal; // "Copy file path to terminal"
@@ -1307,7 +1663,427 @@ public:
             QDesktopServices::openUrl(QUrl::fromLocalFile(file));
         return !runnable;
     }
+    // Rows shown: those whose name holds the filter text, hidden files ("." names) only when they are shown.
+    void applyFilter()
+    {
+        const auto text = filter->text().trimmed();
+        const bool hidden = !hiddenToggle || hiddenToggle->isChecked();
+        for (int i = 0; i < files->topLevelItemCount(); ++i)
+        {
+            auto *item = files->topLevelItem(i);
+            const auto name = item->text(0);
+            const bool hide = name != ".." && ((!hidden && name.startsWith('.')) ||
+                                               (!text.isEmpty() && !name.contains(text, Qt::CaseInsensitive)));
+            if (hide)
+                item->setSelected(false); // a hidden row must not be downloaded or deleted with the selection
+            item->setHidden(hide);
+        }
+    }
+    void goHistory(int direction)
+    {
+        auto &from = direction < 0 ? backStack : forwardStack;
+        if (from.isEmpty() || process->state() != QProcess::NotRunning)
+            return;
+        historyMove = direction;
+        historyTarget = from.last();
+        run(historyTarget);
+    }
+    // After a listing: the folder before it goes into the history (or moves between Back and Forward).
+    void recordHistory(const QString &before)
+    {
+        const int move = std::exchange(historyMove, 0);
+        if (before.isEmpty() || before == listed)
+            return;
+        filter->clear(); // the filter was for the folder left
+        if (move && listed == historyTarget)
+        {
+            (move < 0 ? backStack : forwardStack).removeLast();
+            (move < 0 ? forwardStack : backStack) << before;
+        }
+        else
+        {
+            backStack << before;
+            forwardStack.clear();
+            if (backStack.size() > 50)
+                backStack.removeFirst();
+        }
+        backAction->setEnabled(!backStack.isEmpty());
+        forwardAction->setEnabled(!forwardStack.isEmpty());
+    }
+    // Favourite folders of this server (its credential target: user, host and port).
+    QString bookmarksKey() const { return "sftp/bookmarks/" + QString::fromLatin1(target.toUtf8().toHex()); }
+    QStringList bookmarks() const { return QSettings().value(bookmarksKey()).toStringList(); }
+    void fillBookmarks(QMenu *menu)
+    {
+        menu->clear();
+        auto saved = bookmarks();
+        const auto here = listed;
+        if (!here.isEmpty() && !saved.contains(here))
+            menu->addAction(icon("plus", 16), L("Add current folder"),
+                            [this, here]
+                            {
+                                auto list = bookmarks();
+                                list << here;
+                                QSettings().setValue(bookmarksKey(), list);
+                            });
+        else if (!here.isEmpty())
+            menu->addAction(icon("delete", 16), L("Remove current folder"),
+                            [this, here]
+                            {
+                                auto list = bookmarks();
+                                list.removeAll(here);
+                                QSettings().setValue(bookmarksKey(), list);
+                            });
+        if (!saved.isEmpty())
+            menu->addSeparator();
+        for (const auto &folder : saved)
+            menu->addAction(icon("folder", 16), folder, [this, folder] { run(folder); });
+    }
+    // Lists the current folder again, after the listing in progress if there is one.
+    void relistNow()
+    {
+        if (process->state() != QProcess::NotRunning)
+            relist = true;
+        else
+            refresh();
+    }
+    // The queue is hidden once nothing is waiting or running: completed rows go after a moment; failed and
+    // cancelled ones stay for Resume.
+    void hideQueueIfIdle()
+    {
+        for (const auto &t : std::as_const(transfers))
+        {
+            if (t->state == "queued" || t->state == "running" || t->process)
+                return;
+        }
+        for (int i = int(transfers.size()) - 1; i >= 0; --i)
+        {
+            if (transfers[i]->state == "done")
+            {
+                removeTemporary(*transfers[i]);
+                delete transfers[i]->item;
+                transfers.removeAt(i);
+            }
+        }
+        if (transfers.isEmpty())
+            queueBox->hide();
+    }
+    // Runs script in the remote shell over ssh (shell of the session's server); done gets its exit code (-1: ssh
+    // could not start or crashed), standard output and standard error. false: no ssh for this session.
+    bool runShell(const QString &script, bool interactive,
+                  const std::function<void(int, const QString &, const QString &)> &done)
+    {
+        const auto program = QStandardPaths::findExecutable(shell.program);
+        if (!shell.error.isEmpty() || shell.program != "ssh" || !shell.arguments.contains("--") || program.isEmpty())
+            return false;
+        auto *proc = hideConsoleWindow(new QProcess(this));
+        proc->setStandardInputFile(QProcess::nullDevice());
+        proc->setProcessEnvironment(sftpEnvironment(interactive));
+        auto finish = [this, proc, done](int code)
+        {
+            if (proc->property("ended").toBool())
+                return;
+            proc->setProperty("ended", true);
+            forgetAskpassAttempts(proc);
+            const auto out = QString::fromUtf8(proc->readAllStandardOutput());
+            const auto err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
+            proc->deleteLater();
+            if (done)
+                done(code, out, err);
+        };
+        connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [finish](int code, QProcess::ExitStatus exit) { finish(exit == QProcess::NormalExit ? code : -1); });
+        connect(proc, &QProcess::errorOccurred, this,
+                [finish](QProcess::ProcessError error)
+                {
+                    if (error == QProcess::FailedToStart)
+                        finish(-1);
+                });
+        QStringList arguments{"-T", "-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"};
+        if (!interactive)
+            arguments << "-o" << "NumberOfPasswordPrompts=1";
+        // Through sh: the same syntax whatever the login shell of the account (fish, csh).
+        proc->start(program, arguments + shell.arguments + QStringList{"sh -c " + posixQuote(script)});
+        return true;
+    }
+    bool has(const QString &tool) const { return tools.contains(tool); }
+    // Which programs the server has, asked once after the first listing (none without a shell: SFTP-only account).
+    void checkTools()
+    {
+        runShell("for t in zip unzip tar du sha256sum shasum cp chown find; do command -v $t >/dev/null 2>&1 && echo "
+                 "$t; done; exit 0",
+                 false,
+                 [this](int code, const QString &out, const QString &)
+                 {
+                     if (code != 0)
+                         return;
+                     for (const auto &line : out.split('\n', Qt::SkipEmptyParts))
+                         tools.insert(line.trimmed());
+                 });
+    }
+    // A command run on the server for an operation on the listed folder, which is listed again afterwards; its
+    // error (if any) stays as the status.
+    void shellJob(const QString &doing, const QString &script)
+    {
+        status->setText(doing);
+        files->setCursor(Qt::BusyCursor);
+        const bool started = runShell(script, true,
+                                      [this](int code, const QString &, const QString &error)
+                                      {
+                                          files->unsetCursor();
+                                          note = code == 0 ? QString()
+                                                           : (error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
+                                          relistNow();
+                                      });
+        if (!started)
+        {
+            files->unsetCursor();
+            status->setText(L("SFTP operation failed."));
+        }
+    }
+    void removeTemporary(Transfer &t)
+    {
+        if (!t.temporary)
+            return;
+        t.temporary = false;
+        if (const auto quoted = posixQuote(t.directory + "/" + t.name); !quoted.isEmpty())
+            runShell("rm -f -- " + quoted, false, nullptr);
+    }
+    // "zip" or "tar" for an archive the server can extract, empty otherwise.
+    QString archiveKind(const QString &name) const
+    {
+        const auto kind = sftpArchiveKind(name);
+        return has(kind == "zip" ? "unzip" : "tar") ? kind : QString();
+    }
+    void extractHere(const QString &name)
+    {
+        if (const auto script = sftpExtractScript(listed, name, archiveKind(name) == "zip"); !script.isEmpty())
+            shellJob(L("Extracting…"), script);
+    }
+    // An archive of the selection in the listed folder: zip when the server has it, otherwise tar.gz.
+    void compress(const QStringList &names)
+    {
+        const bool zip = has("zip");
+        const QString extension = zip ? ".zip" : ".tar.gz";
+        const auto taken = listedNames();
+        const auto base = names.size() == 1 ? names.value(0) : L("Archive");
+        auto out = base + extension;
+        for (int n = 2; taken.contains(out); ++n)
+            out = base + " " + QString::number(n) + extension;
+        if (const auto script = sftpCompressScript(listed, out, names, zip); !script.isEmpty())
+            shellJob(L("Compressing…"), script);
+    }
+    // Total size of folders (du), shown in their Size column.
+    void folderSizes(const QStringList &names)
+    {
+        const auto directory = listed;
+        const auto script = sftpSizeScript(directory, names);
+        if (script.isEmpty())
+            return;
+        status->setText(L("Calculating size…"));
+        runShell(script, true,
+                 [this, directory](int, const QString &out, const QString &error)
+                 {
+                     QStringList shown;
+                     for (const auto &line : out.split('\n', Qt::SkipEmptyParts))
+                     {
+                         const auto name = line.section('\t', 1).mid(2); // after "./"
+                         bool ok = false;
+                         const auto bytes = line.section('\t', 0, 0).toLongLong(&ok) * 1024;
+                         if (!ok || directory != listed)
+                             continue;
+                         for (int i = 0; i < files->topLevelItemCount(); ++i)
+                         {
+                             if (auto *item = files->topLevelItem(i); item->text(0) == name)
+                             {
+                                 item->setText(1, fileSizeText(bytes));
+                                 item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+                             }
+                         }
+                         shown << name + ": " + fileSizeText(bytes);
+                     }
+                     status->setText(!error.isEmpty() ? error.left(400) : shown.join('\n'));
+                 });
+    }
+    void checksum(const QString &name)
+    {
+        const auto file = posixQuote(join(name));
+        if (file.isEmpty())
+            return;
+        status->setText(L("Calculating checksum…"));
+        const auto script = (has("sha256sum") ? "sha256sum -- " : "shasum -a 256 -- ") + file;
+        runShell(script, true,
+                 [this, name](int code, const QString &out, const QString &error)
+                 {
+                     const auto hash = out.section(' ', 0, 0).trimmed();
+                     if (code != 0 || !QRegularExpression("^[0-9a-fA-F]{64}$").match(hash).hasMatch())
+                     {
+                         status->setText(error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
+                         return;
+                     }
+                     status->clear();
+                     QApplication::clipboard()->setText(hash);
+                     QMessageBox box(QMessageBox::Information, L("Checksum (SHA-256)"),
+                                     name + "\n\n" + hash + "\n\n" + L("Copied to the clipboard."), QMessageBox::Ok, this);
+                     box.setTextInteractionFlags(Qt::TextSelectableByMouse);
+                     box.exec();
+                 });
+    }
+    void cutOrCopy(bool cut)
+    {
+        const auto names = selectedNames();
+        if (names.isEmpty() || listed.isEmpty())
+            return;
+        clipboardPaths.clear();
+        clipboardDirs.clear();
+        for (const auto &name : names)
+        {
+            clipboardPaths << join(name);
+            if (isDir(name))
+                clipboardDirs.insert(join(name));
+        }
+        clipboardCut = cut;
+        status->setText((cut ? L("%1 item(s) cut") : L("%1 item(s) copied")).arg(names.size()));
+    }
+    bool canPaste() const { return !clipboardPaths.isEmpty() && (clipboardCut || has("cp")); }
+    // Into the listed folder: what was cut is moved there (an sftp rename, which never replaces), what was copied
+    // is copied there by the server, under a "(copy)" name when the name is taken.
+    void paste()
+    {
+        if (!canPaste() || listed.isEmpty())
+            return;
+        if (!clipboardCut)
+        {
+            copyInto(clipboardPaths);
+            return;
+        }
+        QStringList ops;
+        for (const auto &source : std::as_const(clipboardPaths))
+        {
+            const auto name = source.section('/', -1);
+            const auto from = source.left(source.size() - name.size());
+            if (QDir::cleanPath(from) == QDir::cleanPath(listed) || !plainName(name) || sftpQuote(source).isEmpty())
+                continue;
+            ops << "rename -l " + sftpQuote(source) + " " + sftpQuote(name);
+        }
+        clipboardPaths.clear();
+        clipboardDirs.clear();
+        if (!ops.isEmpty())
+            run(listed, ops);
+    }
+    void copyInto(const QStringList &sources)
+    {
+        auto taken = listedNames();
+        QList<std::pair<QString, QString>> copies;
+        for (const auto &source : sources)
+        {
+            const auto name = source.section('/', -1);
+            if (!plainName(name))
+                continue;
+            const bool dir = clipboardDirs.contains(source) || (source == join(name) && isDir(name));
+            const auto target = taken.contains(name) ? sftpCopyName(name, dir, taken) : name;
+            taken << target;
+            copies.append({source, join(target)});
+        }
+        if (!copies.isEmpty())
+            shellJob(L("Copying…"), sftpCopyScript(copies));
+    }
+    void duplicate()
+    {
+        QStringList sources;
+        for (const auto &name : selectedNames())
+            sources << join(name);
+        if (!sources.isEmpty() && has("cp"))
+            copyInto(sources);
+    }
+    // chmod (and chown) of one item; through the shell when owner, group or the folder's content change.
+    void applyPermissions(const QString &remotePath, const SftpPermissions &p, const QString &owner, const QString &group)
+    {
+        const bool chown = p.owner != owner || p.group != group;
+        if (!chown && !p.recurse)
+        {
+            run(listed, {"chmod " + p.mode + " " + sftpQuote(remotePath)});
+            return;
+        }
+        const auto script = sftpPermissionsScript(remotePath, p.mode, chown ? p.owner + ":" + p.group : QString(), p.recurse);
+        if (!script.isEmpty())
+            shellJob(L("Changing permissions…"), script);
+    }
+    // Zips the selected items on the server into /tmp/download-<date time>.zip, downloads it to a file the user
+    // chooses and removes it from the server.
+    void downloadZip()
+    {
+        const auto names = selectedNames();
+        const auto directory = listed; // before the dialog: a listing may finish while it is open
+        const auto dir = posixQuote(directory);
+        if (names.isEmpty() || dir.isEmpty())
+            return;
+        const auto name = "download-" + QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss") + ".zip";
+        const auto local = QFileDialog::getSaveFileName(
+            this, L("Download as zip"),
+            QDir(QStandardPaths::writableLocation(QStandardPaths::DownloadLocation)).filePath(name), "Zip (*.zip)");
+        if (local.isEmpty())
+            return;
+        const auto remote = "/tmp/" + name;
+        // "./": a name starting with '-' is not read as an option of zip. -y keeps links as links.
+        QString script = "cd " + dir + " && zip -r -q -y " + posixQuote(remote);
+        for (const auto &item : names)
+        {
+            if (const auto quoted = posixQuote("./" + item); !quoted.isEmpty())
+                script += " " + quoted;
+        }
+        // 18: some files could not be read; the zip holds the others.
+        script += "; code=$?; [ $code -eq 0 ] || [ $code -eq 18 ] && wc -c < " + posixQuote(remote) + "; exit $code";
+        status->setText(L("Compressing…"));
+        const bool started = runShell(
+            script, true,
+            [this, name, local](int code, const QString &out, const QString &error)
+            {
+                if (code != 0 && code != 18)
+                {
+                    status->setText(error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
+                    if (code > 0 && code != 255) // zip may have left a partial file
+                        runShell("rm -f -- " + posixQuote("/tmp/" + name), false, nullptr);
+                    return;
+                }
+                status->setText(code == 18 ? error.left(400) : QString());
+                const auto size = out.trimmed().section('\n', -1).trimmed().toLongLong();
+                enqueue("/tmp", name, local, false, false, size > 0 ? size : -1, false,
+                        [](Transfer &t) { t.temporary = true; });
+            });
+        if (!started)
+            status->setText(L("SFTP operation failed."));
+    }
+    // One "rm -rf" over ssh; servers without a POSIX shell (SFTP only, Windows) get the walk over sftp instead.
     void removeRecursive(const QStringList &directories, const QStringList &filesToRemove)
+    {
+        if (remover->state() != QProcess::NotRunning)
+        {
+            status->setText(L("Operation in progress…"));
+            return;
+        }
+        const auto program = QStandardPaths::findExecutable(shell.program);
+        QString script = "rm -rf --";
+        for (const auto &item : directories + filesToRemove)
+        {
+            if (const auto quoted = posixQuote(item); !quoted.isEmpty())
+                script += " " + quoted;
+        }
+        if (!shell.error.isEmpty() || shell.program != "ssh" || !shell.arguments.contains("--") || program.isEmpty())
+        {
+            removeBySftp(directories, filesToRemove);
+            return;
+        }
+        removing[0] = directories;
+        removing[1] = filesToRemove;
+        status->setText(L("Deleting…"));
+        files->setCursor(Qt::BusyCursor);
+        remover->setProcessEnvironment(sftpEnvironment(true));
+        remover->start(program, QStringList{"-T", "-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes", "-o",
+                                            "ConnectTimeout=10"} +
+                                    shell.arguments + QStringList{"sh -c " + posixQuote(script)});
+    }
+    void removeBySftp(const QStringList &directories, const QStringList &filesToRemove)
     {
         if (scanner->state() != QProcess::NotRunning || !scanQueue.isEmpty() || deletePending)
         {
@@ -1436,6 +2212,9 @@ public:
     {
         profile["protocol"] = "sftp";
         profile["x11"] = false;
+        auto sshProfile = profile;
+        sshProfile["protocol"] = "ssh";
+        shell = sessionCommand(sshProfile, platform, false);
         command = sessionCommand(profile, platform, false);
         login = profile["user"].toString();
         target = credentialTarget(profile, QCoreApplication::applicationName());
@@ -1465,6 +2244,10 @@ public:
             files->addAction(a);
             return a;
         };
+        backAction = action("back", N("Back"), [this] { goHistory(-1); }, QKeySequence(QKeySequence::Back));
+        forwardAction = action("forward", N("Forward"), [this] { goHistory(1); }, QKeySequence(QKeySequence::Forward));
+        backAction->setEnabled(false);
+        forwardAction->setEnabled(false);
         action(
             "parent", N("Parent directory"),
             [this]
@@ -1526,23 +2309,44 @@ public:
             [this]
             {
                 const auto names = selectedNames();
-                if (names.size() != 1)
+                if (names.size() != 1 || busy())
                     return;
-                const auto directory = listed; // the folder may be listed again while the dialog is open
-                const auto next = QInputDialog::getText(this, L("Rename"), L("New name:"), QLineEdit::Normal, names[0]).trimmed();
-                if (next.isEmpty() || next == names[0] || sftpQuote(names[0]).isEmpty() || refused(directory, next))
-                    return;
-                // "-l": the plain rename request, which fails on an existing name (sftp's default one replaces it on
-                // OpenSSH servers). Except for a change of case alone, the same file on a case-insensitive server.
-                const bool sameFile = directory == listed && next.compare(names[0], Qt::CaseInsensitive) == 0;
-                run(directory, {QString(sameFile ? "rename " : "rename -l ") + sftpQuote(names[0]) + " " + sftpQuote(next)});
+                for (auto *item : files->selectedItems())
+                {
+                    if (item->text(0) != names[0])
+                        continue;
+                    item->setFlags(item->flags() | Qt::ItemIsEditable);
+                    files->scrollToItem(item);
+                    files->editItem(item, 0);
+                }
             },
             QKeySequence(Qt::Key_F2));
 
+        // Cut, copy and paste of remote files (Cmd/Ctrl+X, C, V in the list).
+        for (const auto &[key, slot] : std::initializer_list<std::pair<QKeySequence::StandardKey, std::function<void()>>>{
+                 {QKeySequence::Cut, [this] { cutOrCopy(true); }},
+                 {QKeySequence::Copy, [this] { if (has("cp")) cutOrCopy(false); }},
+                 {QKeySequence::Paste, [this] { paste(); }}})
+        {
+            auto *a = new QAction(files);
+            a->setShortcut(key);
+            a->setShortcutContext(Qt::WidgetShortcut);
+            connect(a, &QAction::triggered, this, slot);
+            files->addAction(a);
+        }
         texts.bind(path, &QWidget::setAccessibleName, N("Remote SFTP path"));
         path->setObjectName("sftpPath");
         auto *go = path->addAction(icon("ok"), QLineEdit::TrailingPosition);
         texts.tip(go, N("Go to this folder"));
+        // Favourite folders: a menu under the star at the end of the path field.
+        {
+            auto *favourites = path->addAction(icon("star", 16), QLineEdit::TrailingPosition);
+            texts.tip(favourites, N("Favourite folders"));
+            auto *menu = new QMenu(this);
+            connect(menu, &QMenu::aboutToShow, this, [this, menu] { fillBookmarks(menu); });
+            connect(favourites, &QAction::triggered, this,
+                    [this, menu] { menu->popup(path->mapToGlobal(QPoint(path->width() - 40, path->height()))); });
+        }
         connect(go, &QAction::triggered, this, [this] { run(path->text()); });
         connect(path, &QLineEdit::returnPressed, this, [this] { run(path->text()); });
         dot->setPixmap(sftpStateDot(link));
@@ -1552,9 +2356,67 @@ public:
         path->setTextMargins(14, 0, 0, 0);
         path->installEventFilter(this); // keeps the dot centred vertically
         layout->addWidget(path);
+        texts.bind(filter, &QLineEdit::setPlaceholderText, N("Filter"));
+        texts.bind(filter, &QWidget::setAccessibleName, N("Filter"));
+        filter->setClearButtonEnabled(true);
+        filter->setObjectName("sftpFilter");
+        // The eye is bright while hidden files are shown, faded while they are not (the field's buttons do not
+        // draw a checked state).
+        const QIcon eyeOn = icon("eye", 16), eyeOff(toggleIcon("eye", 16).pixmap(QSize(16, 16), QIcon::Normal, QIcon::Off));
+        hiddenToggle = filter->addAction(eyeOn, QLineEdit::TrailingPosition);
+        hiddenToggle->setCheckable(true);
+        texts.tip(hiddenToggle, N("Show hidden files"));
+        connect(hiddenToggle, &QAction::toggled, this,
+                [this, eyeOn, eyeOff](bool on)
+                {
+                    hiddenToggle->setIcon(on ? eyeOn : eyeOff);
+                    QSettings().setValue("sftp/showHidden", on);
+                    applyFilter();
+                });
+        {
+            const bool shown = QSettings().value("sftp/showHidden", true).toBool();
+            hiddenToggle->setChecked(shown);
+            hiddenToggle->setIcon(shown ? eyeOn : eyeOff);
+        }
+        connect(filter, &QLineEdit::textChanged, this, [this] { applyFilter(); });
+        // Escape empties the filter; Down moves into the list.
+        filter->installEventFilter(this);
+        layout->addWidget(filter);
+        {
+            auto *find = new QAction(this);
+            find->setShortcut(QKeySequence::Find);
+            find->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+            connect(find, &QAction::triggered, this,
+                    [this]
+                    {
+                        filter->setFocus();
+                        filter->selectAll();
+                    });
+            addAction(find);
+        }
 
         retranslate();
         files->setRootIsDecorated(false);
+        // Only F2 and "Rename" edit a name: a double click opens.
+        files->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        auto *renamer = new SftpRenameDelegate(files);
+        renamer->renamed = [this](const QString &old, const QString &next)
+        {
+            const auto directory = listed;
+            if (sftpQuote(old).isEmpty() || refused(directory, next))
+                return;
+            // "-l": the plain rename request, which fails on an existing name (sftp's default one replaces it on
+            // OpenSSH servers). Except for a change of case alone, the same file on a case-insensitive server.
+            const bool sameFile = next.compare(old, Qt::CaseInsensitive) == 0;
+            // After the editor has closed: the listing that follows replaces the rows.
+            QTimer::singleShot(0, this,
+                               [this, directory, sameFile, old, next]
+                               {
+                                   run(directory, {QString(sameFile ? "rename " : "rename -l ") + sftpQuote(old) + " " +
+                                                   sftpQuote(next)});
+                               });
+        };
+        files->setItemDelegateForColumn(0, renamer);
         files->setSelectionMode(QAbstractItemView::ExtendedSelection);
         files->setUniformRowHeights(true);
         files->setIconSize(QSize(16, 16));
@@ -1572,7 +2434,18 @@ public:
                 {
                     auto *item = files->itemAt(at);
                     if (!item || item->text(0) == "..")
+                    {
+                        // Empty space: what applies to the folder itself.
+                        if (listed.isEmpty())
+                            return;
+                        files->clearSelection();
+                        QMenu menu(this);
+                        if (canPaste())
+                            menu.addAction(QIcon(), L("Paste"), [this] { paste(); });
+                        menu.addAction(icon("refresh", 16), L("Refresh current folder"), [this] { refresh(); });
+                        menu.exec(files->viewport()->mapToGlobal(at));
                         return;
+                    }
                     const auto name = item->text(0);
                     const bool dir = item->data(0, Qt::UserRole).toBool();
                     const auto size = item->data(0, Qt::UserRole + 1).toLongLong();
@@ -1593,6 +2466,20 @@ public:
                     else
                         menu.addAction(icon("folder", 16), L("Open"), [=] { run(remotePath); });
                     menu.addAction(icon("download", 16), L("Download"), [this] { download(); });
+                    if (has("zip"))
+                        menu.addAction(icon("download", 16), L("Download as zip"), [this] { downloadZip(); });
+                    if (!dir && !archiveKind(name).isEmpty())
+                        menu.addAction(icon("packages", 16), L("Extract here"), [this, name] { extractHere(name); });
+                    if (has("zip") || has("tar"))
+                        menu.addAction(icon("packages", 16), L("Compress"), [this] { compress(selectedNames()); });
+                    menu.addSeparator();
+                    menu.addAction(QIcon(), L("Cut"), [this] { cutOrCopy(true); });
+                    if (has("cp"))
+                        menu.addAction(icon("copy", 16), L("Copy"), [this] { cutOrCopy(false); });
+                    if (canPaste())
+                        menu.addAction(QIcon(), L("Paste"), [this] { paste(); });
+                    if (has("cp"))
+                        menu.addAction(icon("copy", 16), L("Duplicate"), [this] { duplicate(); });
                     menu.addSeparator();
                     menu.addAction(icon("delete", 16), L("Delete"), [this] { remove(); });
                     menu.addAction(icon("rename", 16), L("Rename"), renameAction, &QAction::trigger);
@@ -1606,6 +2493,18 @@ public:
                                            if (pasteToTerminal)
                                                pasteToTerminal(shellQuote(remotePath));
                                        });
+                    if (dir && has("du"))
+                        menu.addAction(icon("info", 16), L("Calculate size"),
+                                       [this]
+                                       {
+                                           QStringList dirs;
+                                           for (const auto &selected : selectedNames())
+                                               if (isDir(selected))
+                                                   dirs << selected;
+                                           folderSizes(dirs);
+                                       });
+                    if (!dir && (has("sha256sum") || has("shasum")))
+                        menu.addAction(icon("lock", 16), L("Checksum (SHA-256)"), [this, name] { checksum(name); });
                     menu.addAction(icon("info", 16), L("Properties"),
                                    [this, remotePath, columns]
                                    {
@@ -1617,17 +2516,15 @@ public:
                                                                     .arg(columns[5]));
                                    });
                     menu.addAction(icon("lock", 16), L("Permissions"),
-                                   [this, remotePath, access = columns[5]]
+                                   [this, remotePath, dir, access = columns[5], owner = columns[3], group = columns[4]]
                                    {
                                        // The current mode as the starting value: a confirmed default must not drop
                                        // setuid, setgid or sticky.
-                                       bool ok = false;
-                                       const auto mode =
-                                           QInputDialog::getText(this, L("Permissions"), L("Octal mode (e.g. 644, 755):"),
-                                                                 QLineEdit::Normal, sftpOctalMode(access), &ok)
-                                               .trimmed();
-                                       if (ok && QRegularExpression("^[0-7]{3,4}$").match(mode).hasMatch())
-                                           run(listed, {"chmod " + mode + " " + sftpQuote(remotePath)});
+                                       const bool shellTools = has("chown") && has("find");
+                                       const auto chosen = sftpPermissionsDialog(this, remotePath, sftpOctalMode(access), owner,
+                                                                                 group, shellTools, dir);
+                                       if (chosen)
+                                           applyPermissions(remotePath, *chosen, owner, group);
                                    });
                     menu.exec(files->viewport()->mapToGlobal(at));
                 });
@@ -1678,6 +2575,55 @@ public:
                                            syncEdit(file);
                                        });
                 });
+        remover->setStandardInputFile(QProcess::nullDevice());
+        connect(remover, &QProcess::errorOccurred, this,
+                [this](QProcess::ProcessError error)
+                {
+                    if (error != QProcess::FailedToStart)
+                        return;
+                    files->unsetCursor();
+                    QTimer::singleShot(0, this, [this] { removeBySftp(removing[0], removing[1]); }); // no "finished"
+                });
+        connect(remover, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this](int code, QProcess::ExitStatus exit)
+                {
+                    files->unsetCursor();
+                    forgetAskpassAttempts(remover);
+                    const auto error = QString::fromUtf8(remover->readAllStandardError()).trimmed();
+                    if (code == 0 && exit == QProcess::NormalExit)
+                    {
+                        // Gone from the list at once; the listing that follows confirms it.
+                        for (const auto &path : removing[0] + removing[1])
+                        {
+                            for (int i = files->topLevelItemCount() - 1; i >= 0; --i)
+                            {
+                                if (join(files->topLevelItem(i)->text(0)) == path)
+                                    delete files->topLevelItem(i);
+                            }
+                        }
+                        status->clear();
+                        relistNow();
+                        return;
+                    }
+                    // ssh could not log in: the sftp walk would fail the same way.
+                    if (code == 255 || exit != QProcess::NormalExit)
+                    {
+                        note = error.isEmpty() ? L("SFTP operation failed.") : error.left(400);
+                        relistNow();
+                        return;
+                    }
+                    // rm ran and refused some items (permissions): what it could delete is gone.
+                    const auto lines = error.split('\n', Qt::SkipEmptyParts);
+                    if (!lines.isEmpty() && std::all_of(lines.begin(), lines.end(),
+                                                         [](const QString &line) { return line.startsWith("rm: "); }))
+                    {
+                        note = error.left(400);
+                        relistNow();
+                        return;
+                    }
+                    // No POSIX shell or no rm (SFTP-only account, Windows server): file by file over sftp.
+                    removeBySftp(removing[0], removing[1]);
+                });
         connect(scanner, &QProcess::started, this,
                 [this]
                 {
@@ -1695,6 +2641,8 @@ public:
                         scanQueue.clear();
                         foundFiles.clear();
                         foundDirs.clear();
+                        if (reached(output))
+                            relistNow(); // what a partial walk could see is unchanged, but the list may be stale
                         status->setText(error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
                         if (!reached(output))
                             setLink(2);
@@ -1807,8 +2755,10 @@ public:
                             targets.insert(entry.name, target);
                         links.insert(entry.name, line.simplified().section(' ', 1, 1).toInt());
                     }
+                    const auto before = listed;
                     if (folders.size() == 2)
                         listed = folders[1];
+                    recordHistory(before);
                     std::sort(entries.begin(), entries.end(), [](const RemoteEntry &a, const RemoteEntry &b)
                               { return a.dir != b.dir ? a.dir : a.name.compare(b.name, Qt::CaseInsensitive) < 0; });
                     const bool first = home.isEmpty();
@@ -1835,8 +2785,12 @@ public:
                         if (const auto target = targets.value(e.name); !target.isEmpty())
                             item->setToolTip(0, e.name + " → " + target);
                     }
+                    applyFilter();
                     setLink(1);
-                    status->setText(error.isEmpty() ? QString() : error.left(400));
+                    const auto remark = std::exchange(note, {});
+                    status->setText(!error.isEmpty() ? error.left(400) : remark);
+                    if (first)
+                        checkTools();
                     if (first && onConnected)
                         onConnected();
                 });
@@ -1987,6 +2941,20 @@ public:
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
+        if (watched == filter && event->type() == QEvent::KeyPress)
+        {
+            const int key = static_cast<QKeyEvent *>(event)->key();
+            if (key == Qt::Key_Escape && !filter->text().isEmpty())
+            {
+                filter->clear();
+                return true;
+            }
+            if (key == Qt::Key_Down)
+            {
+                files->setFocus();
+                return true;
+            }
+        }
         if (watched == path && event->type() == QEvent::Resize)
             dot->move(7, (path->height() - dot->height()) / 2);
         if (watched == dot && event->type() == QEvent::ToolTip)
