@@ -10,14 +10,18 @@ file(GLOB VTERM_SOURCES CONFIGURE_DEPENDS vendor/libvterm/src/*.c)
 add_library(vterm STATIC ${VTERM_SOURCES})
 target_include_directories(vterm PUBLIC vendor/libvterm/include)
 set_target_properties(vterm PROPERTIES C_STANDARD 99)
+# Monocypher 4.0.3 (BSD-2 or CC0): XChaCha20-Poly1305 and Argon2id for the encrypted sync file (syncvault.cpp).
+add_library(monocypher STATIC vendor/monocypher/monocypher.c)
+target_include_directories(monocypher PUBLIC vendor/monocypher)
+set_target_properties(monocypher PROPERTIES C_STANDARD 99)
 
 # Terminal-independent logic: profiles, vault, proxy, monitoring, X server, MobaXterm session import.
 set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(relaycore STATIC ${SRC}/profiles.cpp ${SRC}/foreign.cpp ${SRC}/credentials.cpp ${SRC}/proxy.cpp
             ${SRC}/monitor.cpp ${SRC}/xserver.cpp ${SRC}/mobaimport.cpp ${SRC}/ftp.cpp ${SRC}/servers.cpp ${SRC}/vnc.cpp ${SRC}/rdp.cpp
-            ${SRC}/keepalive.cpp)
+            ${SRC}/keepalive.cpp ${SRC}/syncvault.cpp)
 target_include_directories(relaycore PUBLIC ${SRC})
-target_link_libraries(relaycore PUBLIC Qt6::Core Qt6::Widgets Qt6::Network)
+target_link_libraries(relaycore PUBLIC Qt6::Core Qt6::Widgets Qt6::Network PRIVATE monocypher)
 if(WIN32)
     target_link_libraries(relaycore PUBLIC advapi32 bcrypt ole32 oleaut32 uuid ws2_32)
 elseif(APPLE)

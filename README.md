@@ -2,7 +2,7 @@
 
 CrossTerm is a cross-platform, all-in-one toolbox for managing remote servers: a tabbed terminal with SSH, SFTP, Telnet, Rlogin, Rsh, Mosh, serial, FTP/FTPS, VNC, RDP and WSL sessions, plus SSH tunnels, an integrated X server, remote monitoring and small network servers. It is a native C++17 / Qt Widgets application with no web engine.
 
-The local terminal uses ConPTY on Windows and forkpty on Linux and macOS. Terminal emulation is handled by libvterm (revision 934bc2fbf21800ac3458a499df8820ca5fb45fd3, license in vendor/libvterm/LICENSE). The vendored copy carries local changes: four fixes in `src/screen.c` and `src/state.c` (resize of wrapped lines and of a shrunk scroll region, repeat of a combining character, no `abort()` on resize) and the faint attribute (SGR 2, `VTERM_ATTR_DIM`, in `include/vterm.h`, `src/pen.c`, `src/screen.c`, `src/vterm.c` and `src/vterm_internal.h`). Keep them when updating it.
+The local terminal uses ConPTY on Windows and forkpty on Linux and macOS. Terminal emulation is handled by libvterm (revision 934bc2fbf21800ac3458a499df8820ca5fb45fd3, license in vendor/libvterm/LICENSE). The vendored copy carries local changes: four fixes in `src/screen.c` and `src/state.c` (resize of wrapped lines and of a shrunk scroll region, repeat of a combining character, no `abort()` on resize) and the faint attribute (SGR 2, `VTERM_ATTR_DIM`, in `include/vterm.h`, `src/pen.c`, `src/screen.c`, `src/vterm.c` and `src/vterm_internal.h`). Keep them when updating it. The encrypted sync file (`src/syncvault.cpp`) uses Monocypher 4.0.3, unmodified (XChaCha20-Poly1305 and Argon2id; BSD-2 or CC0, license in vendor/monocypher/LICENCE.md).
 
 ## Features
 
