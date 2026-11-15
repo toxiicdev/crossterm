@@ -24,6 +24,7 @@ env:
 jobs:
   windows:
     runs-on: windows-2022
+    timeout-minutes: 60 # a stalled step fails the job instead of running for hours
     steps:
       - uses: actions/checkout@v4
       - uses: jurplel/install-qt-action@v4
@@ -55,6 +56,7 @@ jobs:
   linux:
     # The oldest supported runner: the AppImage runs on systems with this glibc (2.35) or newer.
     runs-on: ubuntu-22.04
+    timeout-minutes: 60 # a stalled step fails the job instead of running for hours
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
@@ -81,6 +83,7 @@ jobs:
     # Apple Silicon runner (the current image: older ones are retired); a universal app (arm64 + x86_64, like Qt's
     # macOS build), so it runs on Intel Macs too.
     runs-on: macos-latest
+    timeout-minutes: 60 # a stalled step fails the job instead of running for hours
     env:
       CMAKE_OSX_ARCHITECTURES: "arm64;x86_64"
     steps:

@@ -13,6 +13,12 @@ int main(int argc, char **argv)
         std::puts("vault not available: test skipped");
         return 0;
     }
+    // CI runners (GitHub Actions sets CI): the macOS Keychain can wait for an unlock dialog nobody answers.
+    if (!qEnvironmentVariableIsEmpty("CI"))
+    {
+        std::puts("CI: system vault not tested (it may wait for a dialog)");
+        return 0;
+    }
     const QString target = "CrossTerm-VaultTest:" + QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString first = QString(u"p\u00e0ss-") + QUuid::createUuid().toString(),
                   second = QString(u"secondo-\u20ac-") + QUuid::createUuid().toString();

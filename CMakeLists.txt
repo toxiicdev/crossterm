@@ -106,6 +106,7 @@ add_executable(profile_tests tests/test.cpp)
 target_link_libraries(profile_tests PRIVATE relaycore)
 target_compile_definitions(profile_tests PRIVATE CROSSTERM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME profiles COMMAND profile_tests)
+set_tests_properties(profiles PROPERTIES TIMEOUT 300)
 
 # One executable per tests/test_<area>.cpp; windows run offscreen.
 file(GLOB AREA_TESTS CONFIGURE_DEPENDS tests/test_*.cpp)
@@ -115,5 +116,6 @@ foreach(source ${AREA_TESTS})
     target_link_libraries(${name} PRIVATE termwidget)
     target_compile_definitions(${name} PRIVATE CROSSTERM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME ${name} COMMAND ${name})
-    set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    # TIMEOUT: a test waiting on something nobody answers (a dialog, a server) fails instead of stalling the build.
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 300)
 endforeach()
