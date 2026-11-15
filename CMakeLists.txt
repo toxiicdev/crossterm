@@ -6,9 +6,19 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 # Qt 6.8 links the AGL framework, which recent macOS SDKs no longer have ("framework 'AGL' not found"): its
-# FindWrapOpenGL uses WrapOpenGL_AGL when set, so point it at OpenGL when AGL is missing (linked twice, harmless).
+# FindWrapOpenGL uses WrapOpenGL_AGL when set, so point it at OpenGL when the SDK the linker uses has no AGL
+# (linked twice, harmless). A search with find_library is not enough: it can find AGL outside that SDK.
 if(APPLE)
-    find_library(WrapOpenGL_AGL NAMES AGL OpenGL)
+    set(CROSSTERM_SDK "${CMAKE_OSX_SYSROOT}")
+    if(NOT IS_DIRECTORY "${CROSSTERM_SDK}")
+        execute_process(COMMAND xcrun --show-sdk-path OUTPUT_VARIABLE CROSSTERM_SDK OUTPUT_STRIP_TRAILING_WHITESPACE
+                        ERROR_QUIET)
+    endif()
+    if(IS_DIRECTORY "${CROSSTERM_SDK}" AND NOT EXISTS "${CROSSTERM_SDK}/System/Library/Frameworks/AGL.framework")
+        message(STATUS "No AGL framework in ${CROSSTERM_SDK}: Qt links OpenGL in its place")
+        set(WrapOpenGL_AGL "${CROSSTERM_SDK}/System/Library/Frameworks/OpenGL.framework" CACHE FILEPATH
+            "AGL framework (OpenGL when the SDK has no AGL)" FORCE)
+    endif()
 endif()
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core Widgets Network)
 file(GLOB VTERM_SOURCES CONFIGURE_DEPENDS vendor/libvterm/src/*.c)
