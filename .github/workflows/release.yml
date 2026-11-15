@@ -78,8 +78,9 @@ jobs:
           if-no-files-found: error
 
   macos:
-    # Apple Silicon runner; a universal app (arm64 + x86_64, like Qt's macOS build), so it runs on Intel Macs too.
-    runs-on: macos-14
+    # Apple Silicon runner (the current image: older ones are retired); a universal app (arm64 + x86_64, like Qt's
+    # macOS build), so it runs on Intel Macs too.
+    runs-on: macos-latest
     env:
       CMAKE_OSX_ARCHITECTURES: "arm64;x86_64"
     steps:
