@@ -1,6 +1,8 @@
-# Release builds: pushing a tag v* builds the Windows installer and the Linux AppImage and attaches them to a draft
-# GitHub release for that tag. The macOS .dmg is built and signed on a Mac (scripts/build-macos.sh) and added to the
-# same draft by hand; then the draft is published.
+# Release builds: pushing a tag v* builds the Windows installer, the Linux AppImage and the macOS .dmg and attaches
+# them to a draft GitHub release for that tag; then the draft is published.
+# The macOS build here is signed ad hoc (no Apple certificate on the runner): other Macs open it with right click >
+# Open the first time. A Developer ID signed and notarized .dmg is still built on a Mac (scripts/build-macos.sh) and
+# replaces this one in the draft.
 # Run by hand (Actions > Release > Run workflow) to get the files as workflow artifacts without a release.
 name: Release
 
@@ -75,9 +77,29 @@ jobs:
           path: build/CrossTerm-*-x86_64.AppImage
           if-no-files-found: error
 
+  macos:
+    # Apple Silicon runner; a universal app (arm64 + x86_64, like Qt's macOS build), so it runs on Intel Macs too.
+    runs-on: macos-14
+    env:
+      CMAKE_OSX_ARCHITECTURES: "arm64;x86_64"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: clang_64
+          cache: true
+      - name: Build, test, disk image
+        run: CMAKE_PREFIX_PATH="$QT_ROOT_DIR" sh scripts/build-macos.sh build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: build/CrossTerm-*-macOS.dmg
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows, linux]
+    needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -92,3 +114,4 @@ jobs:
           files: |
             CrossTerm-*-Windows-Setup.exe
             CrossTerm-*-x86_64.AppImage
+            CrossTerm-*-macOS.dmg

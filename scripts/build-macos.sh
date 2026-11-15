@@ -113,6 +113,15 @@ if [ -n "$DEVELOPER_ID" ]; then
     make_dmg
     exit 0
 fi
+# CI (GitHub Actions sets CI): a throwaway machine, no keychain worth a certificate, and codesign must not wait on a
+# keychain access prompt; ad hoc.
+if [ -n "${CI:-}" ]; then
+    codesign --force --deep --sign - "$BUILD/CrossTerm.app"
+    echo "Signed ad hoc (CI)"
+    echo "Built: $BUILD/CrossTerm.app"
+    make_dmg
+    exit 0
+fi
 IDENTITY="CrossTerm Local Signing"
 if ! security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
     echo "Creating the local signing certificate \"$IDENTITY\" (once)"
