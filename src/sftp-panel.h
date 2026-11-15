@@ -557,11 +557,14 @@ public:
 
 // Rename in place in the list (F2, "Rename"): the name is edited in its row, as in Finder or Explorer. The row keeps
 // its old name until the server's listing shows the new one; renamed gets the old and the new name.
+// A row marked sftpNewRole is a folder being created: created gets the name typed, even the proposed one unchanged.
+static constexpr int sftpNewRole = Qt::UserRole + 3;
 class SftpRenameDelegate : public QStyledItemDelegate
 {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
     std::function<void(const QString &, const QString &)> renamed;
+    std::function<void(const QString &)> created;
 
     void setEditorData(QWidget *editor, const QModelIndex &index) const override
     {
@@ -581,7 +584,12 @@ public:
     {
         auto *edit = qobject_cast<QLineEdit *>(editor);
         const auto old = index.data().toString(), next = edit ? edit->text().trimmed() : QString();
-        if (renamed && !next.isEmpty() && next != old)
+        if (index.data(sftpNewRole).toBool())
+        {
+            if (created && !next.isEmpty())
+                created(next);
+        }
+        else if (renamed && !next.isEmpty() && next != old)
             renamed(old, next);
     }
 };
@@ -2322,14 +2330,27 @@ public:
                    upload(names, directory, &present);
                });
         action("refresh", N("Refresh current folder"), [this] { refresh(); }, QKeySequence(Qt::Key_F5));
-        action("newfolder", N("Create new directory"),
-               [this]
-               {
-                   const auto directory = listed; // the folder may be listed again while the dialog is open
-                   const auto name = QInputDialog::getText(this, L("New directory"), L("Directory name:")).trimmed();
-                   if (!name.isEmpty() && !sftpQuote(name).isEmpty())
-                       run(directory, {"mkdir " + sftpQuote(name)});
-               });
+        // A "New folder" row whose name is edited in place, as in Explorer or Finder: Enter creates it, Esc drops it.
+        auto *newFolderAction = action("newfolder", N("Create new directory"),
+                                       [this]
+                                       {
+                                           if (listed.isEmpty() || busy())
+                                               return;
+                                           const auto taken = listedNames();
+                                           auto name = L("New folder");
+                                           for (int n = 2; taken.contains(name); ++n)
+                                               name = L("New folder") + " " + QString::number(n);
+                                           auto *item = new RemoteFileItem(files, {name});
+                                           item->setData(0, Qt::UserRole, true);
+                                           item->setData(1, Qt::UserRole, qint64(-1));
+                                           item->setData(0, sftpNewRole, true);
+                                           item->setIcon(0, fileIcon({}, true));
+                                           item->setFlags(item->flags() | Qt::ItemIsEditable);
+                                           files->clearSelection();
+                                           files->setCurrentItem(item);
+                                           files->scrollToItem(item);
+                                           files->editItem(item, 0);
+                                       });
         action("newfile", N("Create new file"),
                [this]
                {
@@ -2471,6 +2492,25 @@ public:
                                                    sftpQuote(next)});
                                });
         };
+        // The "New folder" row goes when its editor closes (created or not): the listing after mkdir shows the folder.
+        auto dropNewFolder = [this]
+        {
+            for (int i = files->topLevelItemCount() - 1; i >= 0; --i)
+                if (files->topLevelItem(i)->data(0, sftpNewRole).toBool())
+                    delete files->topLevelItem(i);
+        };
+        renamer->created = [this, dropNewFolder](const QString &name)
+        {
+            const auto directory = listed;
+            QTimer::singleShot(0, this,
+                               [this, directory, name, dropNewFolder]
+                               {
+                                   dropNewFolder();
+                                   if (!refused(directory, name))
+                                       run(directory, {"mkdir " + sftpQuote(name)});
+                               });
+        };
+        connect(renamer, &QAbstractItemDelegate::closeEditor, this, [this, dropNewFolder] { QTimer::singleShot(0, this, dropNewFolder); });
         files->setItemDelegateForColumn(0, renamer);
         files->setSelectionMode(QAbstractItemView::ExtendedSelection);
         files->setUniformRowHeights(true);
@@ -2485,7 +2525,7 @@ public:
         // Right click on a file: open, edit and download / delete and rename / path, properties, permissions.
         files->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(files, &QWidget::customContextMenuRequested, this,
-                [this, renameAction](const QPoint &at)
+                [this, renameAction, newFolderAction](const QPoint &at)
                 {
                     auto *item = files->itemAt(at);
                     if (!item || item->text(0) == "..")
@@ -2497,6 +2537,7 @@ public:
                         QMenu menu(this);
                         if (canPaste())
                             menu.addAction(QIcon(), L("Paste"), [this] { paste(); });
+                        menu.addAction(icon("newfolder", 16), L("Create new directory"), newFolderAction, &QAction::trigger);
                         menu.addAction(icon("refresh", 16), L("Refresh current folder"), [this] { refresh(); });
                         menu.exec(files->viewport()->mapToGlobal(at));
                         return;
