@@ -384,6 +384,7 @@
  "Recovery key": "Kurtarma anahtarı",
  "Redirect local drives": "Yerel sürücüleri yeniden yönlendir",
  "Refresh current folder": "Geçerli klasörü yenile",
+ "Remember this choice while the session is open": "Oturum açık kaldığı sürece bu seçimi hatırla",
  "Remote": "Uzak",
  "Remote Desktop connection could not start (0x%1)": "Uzak Masaüstü bağlantısı başlatılamadı (0x%1)",
  "Remote Desktop: %1": "Uzak Masaüstü: %1",

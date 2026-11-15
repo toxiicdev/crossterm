@@ -384,6 +384,7 @@
  "Recovery key": "คีย์กู้คืน",
  "Redirect local drives": "เปลี่ยนเส้นทางไดรฟ์ภายในเครื่อง",
  "Refresh current folder": "รีเฟรชโฟลเดอร์ปัจจุบัน",
+ "Remember this choice while the session is open": "จำตัวเลือกนี้ไว้ขณะที่เซสชันเปิดอยู่",
  "Remote": "ระยะไกล",
  "Remote Desktop connection could not start (0x%1)": "ไม่สามารถเริ่มการเชื่อมต่อเดสก์ท็อประยะไกลได้ (0x%1)",
  "Remote Desktop: %1": "เดสก์ท็อประยะไกล: %1",

@@ -384,6 +384,7 @@
  "Recovery key": "Wiederherstellungsschlüssel",
  "Redirect local drives": "Lokale Laufwerke umleiten",
  "Refresh current folder": "Aktuellen Ordner aktualisieren",
+ "Remember this choice while the session is open": "Diese Auswahl merken, solange die Sitzung geöffnet ist",
  "Remote": "Remote",
  "Remote Desktop connection could not start (0x%1)": "Die Remotedesktopverbindung konnte nicht gestartet werden (0x%1)",
  "Remote Desktop: %1": "Remotedesktop: %1",

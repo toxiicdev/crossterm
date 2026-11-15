@@ -384,6 +384,7 @@
   "Recovery key": "Recovery key",
   "Redirect local drives": "I-redirect ang mga lokal na drive",
   "Refresh current folder": "I-refresh ang kasalukuyang folder",
+  "Remember this choice while the session is open": "Tandaan ang pagpiling ito habang bukas ang session",
   "Remote": "Remote",
   "Remote Desktop connection could not start (0x%1)": "Hindi masimulan ang koneksyon ng Remote Desktop (0x%1)",
   "Remote Desktop: %1": "Remote Desktop: %1",

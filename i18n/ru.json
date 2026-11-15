@@ -384,6 +384,7 @@
  "Recovery key": "Ключ восстановления",
  "Redirect local drives": "Перенаправлять локальные диски",
  "Refresh current folder": "Обновить текущую папку",
+ "Remember this choice while the session is open": "Запомнить этот выбор, пока сеанс открыт",
  "Remote": "Удалённый",
  "Remote Desktop connection could not start (0x%1)": "Не удалось запустить подключение к удалённому рабочему столу (0x%1)",
  "Remote Desktop: %1": "Удалённый рабочий стол: %1",

@@ -384,6 +384,7 @@
  "Recovery key": "مفتاح الاسترداد",
  "Redirect local drives": "إعادة توجيه محركات الأقراص المحلية",
  "Refresh current folder": "تحديث المجلد الحالي",
+ "Remember this choice while the session is open": "تذكر هذا الاختيار ما دامت الجلسة مفتوحة",
  "Remote": "بعيد",
  "Remote Desktop connection could not start (0x%1)": "تعذّر بدء اتصال سطح المكتب البعيد (0x%1)",
  "Remote Desktop: %1": "سطح المكتب البعيد: %1",

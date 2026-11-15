@@ -384,6 +384,7 @@
  "Recovery key": "回復キー",
  "Redirect local drives": "ローカル ドライブをリダイレクト",
  "Refresh current folder": "現在のフォルダーを更新",
+ "Remember this choice while the session is open": "セッションが開いている間はこの選択を記憶する",
  "Remote": "リモート",
  "Remote Desktop connection could not start (0x%1)": "リモート デスクトップ接続を開始できませんでした (0x%1)",
  "Remote Desktop: %1": "リモート デスクトップ: %1",

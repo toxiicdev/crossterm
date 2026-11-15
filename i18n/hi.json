@@ -384,6 +384,7 @@
  "Recovery key": "पुनर्प्राप्ति कुंजी",
  "Redirect local drives": "स्थानीय ड्राइव रीडायरेक्ट करें",
  "Refresh current folder": "वर्तमान फ़ोल्डर रीफ़्रेश करें",
+ "Remember this choice while the session is open": "सत्र खुला रहने तक यह विकल्प याद रखें",
  "Remote": "रिमोट",
  "Remote Desktop connection could not start (0x%1)": "रिमोट डेस्कटॉप कनेक्शन प्रारंभ नहीं हो सका (0x%1)",
  "Remote Desktop: %1": "रिमोट डेस्कटॉप: %1",

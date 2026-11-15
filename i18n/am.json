@@ -384,6 +384,7 @@
   "Recovery key": "የመልሶ ማግኛ ቁልፍ",
   "Redirect local drives": "አካባቢያዊ ድራይቮችን አዙር",
   "Refresh current folder": "የአሁኑን አቃፊ አድስ",
+  "Remember this choice while the session is open": "ክፍለ-ጊዜው ክፍት እስካለ ድረስ ይህን ምርጫ አስታውስ",
   "Remote": "የርቀት",
   "Remote Desktop connection could not start (0x%1)": "የርቀት ዴስክቶፕ ግንኙነት መጀመር አልቻለም (0x%1)",
   "Remote Desktop: %1": "የርቀት ዴስክቶፕ፦ %1",

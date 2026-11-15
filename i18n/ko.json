@@ -384,6 +384,7 @@
  "Recovery key": "복구 키",
  "Redirect local drives": "로컬 드라이브 리디렉션",
  "Refresh current folder": "현재 폴더 새로 고침",
+ "Remember this choice while the session is open": "세션이 열려 있는 동안 이 선택 기억",
  "Remote": "원격",
  "Remote Desktop connection could not start (0x%1)": "원격 데스크톱 연결을 시작할 수 없음(0x%1)",
  "Remote Desktop: %1": "원격 데스크톱: %1",

@@ -384,6 +384,7 @@
  "Recovery key": "恢复密钥",
  "Redirect local drives": "重定向本地驱动器",
  "Refresh current folder": "刷新当前文件夹",
+ "Remember this choice while the session is open": "在会话打开期间记住此选择",
  "Remote": "远程",
  "Remote Desktop connection could not start (0x%1)": "无法启动远程桌面连接（0x%1）",
  "Remote Desktop: %1": "远程桌面：%1",

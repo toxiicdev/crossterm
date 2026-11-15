@@ -384,6 +384,7 @@
  "Recovery key": "Khóa khôi phục",
  "Redirect local drives": "Chuyển hướng ổ đĩa cục bộ",
  "Refresh current folder": "Làm mới thư mục hiện tại",
+ "Remember this choice while the session is open": "Ghi nhớ lựa chọn này khi phiên còn mở",
  "Remote": "Từ xa",
  "Remote Desktop connection could not start (0x%1)": "Không thể bắt đầu kết nối Remote Desktop (0x%1)",
  "Remote Desktop: %1": "Remote Desktop: %1",
