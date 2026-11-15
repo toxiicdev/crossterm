@@ -28,6 +28,9 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
+; CrossTerm closed for the update is not restarted by Setup: the "Launch CrossTerm" box of the last page starts it,
+; and two launches at once made the second one say the configuration is already in use.
+RestartApplications=no
 ShowLanguageDialog=auto
 
 ; Every language of the program; the system language is picked automatically. In inno-languages\: the unofficial

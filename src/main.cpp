@@ -403,7 +403,13 @@ class Window : public QMainWindow
     QSplitter *splitRoot = nullptr;
     Page *home = new Page;
     QListWidget *recent = new QListWidget;
-    QSet<QString> expanded;
+    // Open folders of the session tree (their paths), kept in the settings: the tree reopens as it was left.
+    // expandedKnown: saved at least once, so an empty set means everything closed, not "first run" (root open).
+    QSet<QString> expanded = [] {
+        const auto saved = QSettings().value("sessions/expanded").toStringList();
+        return QSet<QString>(saved.begin(), saved.end());
+    }();
+    bool expandedKnown = QSettings().contains("sessions/expanded");
     int splitMode = 1, counter = 0;
     QString lastFilter;
     ServersDialog *serversDialog = nullptr;
@@ -977,6 +983,7 @@ private:
         if (tree->topLevelItemCount() && lastFilter.isEmpty())
         {
             expanded.clear();
+            expandedKnown = true;
             QTreeWidgetItemIterator it(tree);
             for (; *it; ++it)
                 if ((*it)->isExpanded())
@@ -1083,8 +1090,8 @@ private:
         {
             QTreeWidgetItemIterator it(tree);
             for (; *it; ++it)
-                (*it)->setExpanded(expanded.isEmpty() ? *it == root
-                                                      : expanded.contains((*it)->data(0, Qt::UserRole + 2).toString()));
+                (*it)->setExpanded(!expandedKnown ? *it == root
+                                                  : expanded.contains((*it)->data(0, Qt::UserRole + 2).toString()));
         }
         refreshRecent();
         markOpenSessions();
@@ -5906,6 +5913,21 @@ public:
                 });
         connect(bar, &QTabBar::customContextMenuRequested, this, [this](const QPoint &at) { tabMenu(at); });
         connect(tree, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint &at) { treeMenu(at); });
+        // A folder opened or closed by hand is saved at once; not while a filter shows every folder open.
+        const auto saveExpanded = [this](QTreeWidgetItem *item, bool open)
+        {
+            const auto path = item->data(0, Qt::UserRole + 2).toString();
+            if (!lastFilter.isEmpty() || path.isEmpty())
+                return;
+            if (open)
+                expanded.insert(path);
+            else
+                expanded.remove(path);
+            expandedKnown = true;
+            QSettings().setValue("sessions/expanded", QStringList(expanded.begin(), expanded.end()));
+        };
+        connect(tree, &QTreeWidget::itemExpanded, this, [saveExpanded](QTreeWidgetItem *item) { saveExpanded(item, true); });
+        connect(tree, &QTreeWidget::itemCollapsed, this, [saveExpanded](QTreeWidgetItem *item) { saveExpanded(item, false); });
         connect(tree, &QTreeWidget::itemActivated, this,
                 [this](QTreeWidgetItem *item)
                 {
