@@ -1467,7 +1467,18 @@ private:
         box->addWidget(title);
         queueView->setRootIsDecorated(false);
         queueView->setColumnCount(4);
-        queueView->setMaximumHeight(150);
+        // As tall as its rows, up to 150 px (then it scrolls): one transfer leaves no empty space under it.
+        const auto fitQueue = [this]
+        {
+            const int rows = queueView->topLevelItemCount();
+            const int height = queueView->header()->sizeHint().height() + 2 * queueView->frameWidth() +
+                               (rows ? rows * queueView->sizeHintForRow(0) : 0);
+            queueView->setFixedHeight(std::min(height, 150));
+        };
+        // After the event: the row's progress bar is set right after the row is added.
+        connect(queueView->model(), &QAbstractItemModel::rowsInserted, this, [this, fitQueue] { QTimer::singleShot(0, this, fitQueue); });
+        connect(queueView->model(), &QAbstractItemModel::rowsRemoved, this, [this, fitQueue] { QTimer::singleShot(0, this, fitQueue); });
+        fitQueue();
         // As wide as the panel, never wider: name and progress share the width, the size fits its text.
         queueView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         queueView->setColumnHidden(3, true);
@@ -2742,7 +2753,11 @@ public:
                     else
                         menu.addAction(icon("folder", 16), L("Open"), [=] { run(remotePath); });
                     menu.addAction(icon("download", 16), L("Download"), [this] { download(); });
-                    if (has("zip"))
+                    // Not for zip files alone: zipping them again only wraps them.
+                    const auto chosen = selectedNames();
+                    const bool allZip = std::all_of(chosen.begin(), chosen.end(),
+                                                    [](const QString &n) { return sftpArchiveKind(n) == "zip"; });
+                    if (has("zip") && !allZip)
                         menu.addAction(icon("download", 16), L("Download as zip"), [this] { downloadZip(); });
                     if (!dir && !archiveKind(name).isEmpty())
                     {
