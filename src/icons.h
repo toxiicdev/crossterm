@@ -472,18 +472,16 @@ static QIcon icon(const QString &name, int size = 32)
     return *cache.insert(key, drawIcon(name, size));
 }
 
-// Remote file icon by extension, from the OS (Windows shell, freedesktop theme, macOS); our "file" icon for names
-// without one, which the OS would show as a blank page anyway. Once per extension.
-static QIcon fileIcon(const QString &name)
+// Remote file or folder icon as the user's own system shows it (Windows shell, freedesktop theme, macOS): by
+// extension, the system's generic file or folder otherwise. Asked each time, so a new file association or icon
+// theme shows at the next listing (the system caches them itself); our drawn icons only if it has none.
+static QIcon fileIcon(const QString &name, bool dir = false)
 {
+    const QFileIconProvider provider;
     const auto suffix = QFileInfo(name).suffix().toLower();
-    if (suffix.isEmpty())
-        return icon("file");
-    static QHash<QString, QIcon> cache;
-    if (const auto it = cache.constFind(suffix); it != cache.constEnd())
-        return *it;
-    const auto shown = QFileIconProvider().icon(QFileInfo("file." + suffix)); // the file need not exist
-    return *cache.insert(suffix, shown.isNull() ? icon("file") : shown);
+    auto shown = dir || suffix.isEmpty() ? provider.icon(dir ? QFileIconProvider::Folder : QFileIconProvider::File)
+                                         : provider.icon(QFileInfo("file." + suffix)); // the file need not exist
+    return shown.isNull() ? icon(dir ? "folder" : "file") : shown;
 }
 
 // Icon with a dimmed "off" state (side stripe, matching inactive tabs), drawn at the 34px of the side strip.

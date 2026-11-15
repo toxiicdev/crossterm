@@ -1733,7 +1733,7 @@ void FtpPanel::fill(const QList<RemoteEntry> &entries)
     auto *up = new RemoteFileItem(files, {".."});
     up->setIcon(0, icon("parent"));
     up->setData(1, Qt::UserRole, qint64(-2)); // first when sorted by size
-    const auto folderIcon = icon("folder");
+    const auto folderIcon = fileIcon({}, true);
     for (const auto &e : shown)
     {
         auto *item = new RemoteFileItem(files, {e.name, e.dir ? QString() : fileSizeText(e.size), e.modified, e.access});

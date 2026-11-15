@@ -2811,7 +2811,7 @@ public:
                     up->setIcon(0, icon("parent"));
                     up->setData(0, Qt::UserRole, true);
                     up->setData(1, Qt::UserRole, qint64(-2)); // first when sorted by size
-                    const auto folderIcon = icon("folder");
+                    const auto folderIcon = fileIcon({}, true);
                     for (const auto &e : entries)
                     {
                         auto *item = new RemoteFileItem(
