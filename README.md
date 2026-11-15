@@ -135,7 +135,7 @@ The release workflow reads them from repository variables; a missing one leaves 
 </details>
 
 > [!WARNING]
-> The Linux and macOS builds have not been verified on those systems yet.
+> The Linux build has not been verified on Linux yet.
 
 ---
 
@@ -154,7 +154,7 @@ Catalogs live in `i18n/*.json`. After changing user-visible strings run `python 
 
 UI tests open the window off screen without activating it, so they never steal focus.
 
-📋 The status of each feature is in [FEATURES.md](FEATURES.md). Tested on Windows; Linux and macOS builds still need verification on those platforms.
+📋 The status of each feature is in [FEATURES.md](FEATURES.md). Tested on Windows and macOS; the Linux build still needs verification.
 
 ---
 
