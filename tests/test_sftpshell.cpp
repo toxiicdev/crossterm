@@ -42,10 +42,10 @@ int main(int argc, char **argv)
     check(sftpCopyName("site.v2", true, {}) == "site.v2 (copy)", "a folder keeps its dots");
     check(sftpCopyName(".bashrc", false, {}) == ".bashrc (copy)", "a dot file has no extension");
     check(sftpArchiveKind("a.ZIP") == "zip" && sftpArchiveKind("b.tar.gz") == "tar" && sftpArchiveKind("c.tgz") == "tar" &&
-              sftpArchiveKind("d.txt").isEmpty(),
+              sftpArchiveKind("e.RAR") == "rar" && sftpArchiveKind("f.7z") == "7z" && sftpArchiveKind("d.txt").isEmpty(),
           "archive kinds");
     check(sftpPermissionsScript("/x", "64", {}, 0).isEmpty(), "invalid mode refused");
-    check(sftpExtractScript("/x", "a\nb.zip", true).isEmpty(), "control characters refused");
+    check(sftpExtractScript("/x", "a\nb.zip", "zip").isEmpty() && sftpExtractScript("/x", "a.txt", {}).isEmpty(), "control characters refused");
 
     if (QStandardPaths::findExecutable("sh").isEmpty())
     {
@@ -90,11 +90,21 @@ int main(int argc, char **argv)
         QDir().mkpath(target);
         QFile::copy(dir + "/" + archive, target + "/" + archive);
         write(target + "/-notes.txt", "mine"); // already there: replaced
-        const auto [extracted, listing] = sh(sftpExtractScript(target, archive, zip));
+        const auto [extracted, listing] = sh(sftpExtractScript(target, archive, zip ? "zip" : "tar"));
         check(extracted == 0 && read(target + "/site/css/a.css") == "body{}", label + ": folders extracted");
         check(read(target + "/-notes.txt") == "notes", label + ": existing file replaced");
         if (zip)
             check(listing.section('\n', 0, 0).trimmed().toInt() >= 4, "zip: entry count on the first line");
+        check(QFileInfo::exists(target + "/" + archive), label + ": archive kept by Extract here");
+        // Extract and delete: the archive goes only after a successful extraction.
+        QFile::remove(target + "/site/css/a.css");
+        const auto [removed, _] = sh(sftpExtractScript(target, archive, zip ? "zip" : "tar", true));
+        check(removed == 0 && read(target + "/site/css/a.css") == "body{}" && !QFileInfo::exists(target + "/" + archive),
+              label + ": extract and delete");
+        const QString broken = zip ? "broken.zip" : "broken.tar.gz";
+        write(target + "/" + broken, "not an archive");
+        sh(sftpExtractScript(target, broken, zip ? "zip" : "tar", true));
+        check(QFileInfo::exists(target + "/" + broken), label + ": failed extraction keeps the archive");
     }
     // Permissions: files only, folders only, everything.
     {

@@ -191,17 +191,27 @@ static QString sftpNames(const QStringList &names)
     }
     return words;
 }
-// Extracts archive (zip, or a tar of any compression) into dir, replacing files already there (unzip's "A").
+// Extracts archive of kind (sftpArchiveKind) into dir, replacing files already there (unzip's "A"); remove: the
+// archive is deleted afterwards, only if the extraction succeeded.
 // zip: the first output line is the number of entries, then unzip writes one line per entry (progress); its exit
-// code 1 is warnings only (names in another encoding), the files are extracted.
-static QString sftpExtractScript(const QString &dir, const QString &archive, bool zip)
+// code 1 is warnings only (names in another encoding), the files are extracted. rar: unrar, or 7z without it.
+static QString sftpExtractScript(const QString &dir, const QString &archive, const QString &kind, bool remove = false)
 {
     const auto folder = posixQuote(dir), file = posixQuote("./" + archive);
     if (folder.isEmpty() || file.isEmpty())
         return {};
-    if (zip)
-        return "cd " + folder + " || exit 2; unzip -Z1 " + file + " | wc -l; unzip -o " + file + "; [ $? -le 1 ]";
-    return "cd " + folder + " && tar -x -f " + file;
+    QString extract;
+    if (kind == "zip")
+        extract = "unzip -Z1 " + file + " | wc -l; unzip -o " + file + "; [ $? -le 1 ]";
+    else if (kind == "tar")
+        extract = "tar -x -f " + file;
+    else if (kind == "rar")
+        extract = "if command -v unrar >/dev/null 2>&1; then unrar x -o+ -y " + file + "; else 7z x -y " + file + "; fi";
+    else if (kind == "7z")
+        extract = "7z x -y " + file;
+    else
+        return {};
+    return "cd " + folder + " || exit 2; " + extract + (remove ? " && rm -f -- " + file : QString());
 }
 static QString sftpCompressScript(const QString &dir, const QString &archive, const QStringList &names, bool zip)
 {
@@ -259,12 +269,16 @@ static QString sftpCopyName(const QString &name, bool dir, const QStringList &ta
             return candidate;
     }
 }
-// "zip" or "tar" for an archive name, empty otherwise.
+// "zip", "tar", "rar" or "7z" for an archive name, empty otherwise.
 static QString sftpArchiveKind(const QString &name)
 {
     const auto lower = name.toLower();
     if (lower.endsWith(".zip"))
         return "zip";
+    if (lower.endsWith(".rar"))
+        return "rar";
+    if (lower.endsWith(".7z"))
+        return "7z";
     for (const char *extension : {".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz"})
     {
         if (lower.endsWith(extension))
@@ -1823,7 +1837,7 @@ public:
     // Which programs the server has, asked once after the first listing (none without a shell: SFTP-only account).
     void checkTools()
     {
-        runShell("for t in zip unzip tar du sha256sum shasum cp chown find; do command -v $t >/dev/null 2>&1 && echo "
+        runShell("for t in zip unzip tar unrar 7z du sha256sum shasum cp chown find; do command -v $t >/dev/null 2>&1 && echo "
                  "$t; done; exit 0",
                  false,
                  [this](int code, const QString &out, const QString &)
@@ -1865,19 +1879,22 @@ public:
         if (const auto quoted = posixQuote(t.directory + "/" + t.name); !quoted.isEmpty())
             runShell("rm -f -- " + quoted, false, nullptr);
     }
-    // "zip" or "tar" for an archive the server can extract, empty otherwise.
+    // "zip", "tar", "rar" or "7z" for an archive the server can extract, empty otherwise.
     QString archiveKind(const QString &name) const
     {
         const auto kind = sftpArchiveKind(name);
-        return has(kind == "zip" ? "unzip" : "tar") ? kind : QString();
+        const bool can = kind == "zip" ? has("unzip") : kind == "tar" ? has("tar") : kind == "rar" ? has("unrar") || has("7z")
+                                                                                   : kind == "7z" && has("7z");
+        return can ? kind : QString();
     }
-    void extractHere(const QString &name)
+    void extractHere(const QString &name, bool remove = false)
     {
-        const bool zip = archiveKind(name) == "zip";
-        const auto script = sftpExtractScript(listed, name, zip);
+        const auto kind = archiveKind(name);
+        const bool zip = kind == "zip";
+        const auto script = sftpExtractScript(listed, name, kind, remove);
         if (script.isEmpty())
             return;
-        // zip: entries extracted out of the count on the first line; tar: no count, a busy bar.
+        // zip: entries extracted out of the count on the first line; others: no count, a busy bar.
         jobBar->setRange(0, zip ? 100 : 0);
         jobBar->setValue(0);
         jobBar->show();
@@ -2507,7 +2524,10 @@ public:
                     if (has("zip"))
                         menu.addAction(icon("download", 16), L("Download as zip"), [this] { downloadZip(); });
                     if (!dir && !archiveKind(name).isEmpty())
+                    {
                         menu.addAction(icon("packages", 16), L("Extract here"), [this, name] { extractHere(name); });
+                        menu.addAction(icon("packages", 16), L("Extract and delete"), [this, name] { extractHere(name, true); });
+                    }
                     if (has("zip") || has("tar"))
                         menu.addAction(icon("packages", 16), L("Compress"), [this] { compress(selectedNames()); });
                     menu.addSeparator();
