@@ -89,11 +89,12 @@ int main(int argc, char **argv)
         const QString target = root.filePath(QString("out ") + (zip ? "zip" : "tar"));
         QDir().mkpath(target);
         QFile::copy(dir + "/" + archive, target + "/" + archive);
-        write(target + "/-notes.txt", "mine"); // already there: kept
-        const auto [extracted, _] = sh(sftpExtractScript(target, archive, zip));
-        check(read(target + "/site/css/a.css") == "body{}", label + ": folders extracted");
-        check(read(target + "/-notes.txt") == "mine", label + ": existing file not replaced");
-        Q_UNUSED(extracted);
+        write(target + "/-notes.txt", "mine"); // already there: replaced
+        const auto [extracted, listing] = sh(sftpExtractScript(target, archive, zip));
+        check(extracted == 0 && read(target + "/site/css/a.css") == "body{}", label + ": folders extracted");
+        check(read(target + "/-notes.txt") == "notes", label + ": existing file replaced");
+        if (zip)
+            check(listing.section('\n', 0, 0).trimmed().toInt() >= 4, "zip: entry count on the first line");
     }
     // Permissions: files only, folders only, everything.
     {

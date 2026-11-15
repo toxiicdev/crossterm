@@ -1733,12 +1733,12 @@ void FtpPanel::fill(const QList<RemoteEntry> &entries)
     auto *up = new RemoteFileItem(files, {".."});
     up->setIcon(0, icon("parent"));
     up->setData(1, Qt::UserRole, qint64(-2)); // first when sorted by size
-    const auto folderIcon = icon("folder"), fileIcon = icon("file");
+    const auto folderIcon = icon("folder");
     for (const auto &e : shown)
     {
         auto *item = new RemoteFileItem(files, {e.name, e.dir ? QString() : fileSizeText(e.size), e.modified, e.access});
         item->setData(1, Qt::UserRole, e.dir ? qint64(-1) : e.size);
-        item->setIcon(0, !e.link ? (e.dir ? folderIcon : fileIcon) : linkIcon(e.dir ? folderIcon : fileIcon, e.dir));
+        item->setIcon(0, !e.link ? (e.dir ? folderIcon : fileIcon(e.name)) : linkIcon(e.dir ? folderIcon : fileIcon(e.name), e.dir));
         item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
         if (const auto target = e.link ? shownTargets.value(e.name) : QString(); !target.isEmpty())
             item->setToolTip(0, e.name + " → " + target);

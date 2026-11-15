@@ -191,16 +191,17 @@ static QString sftpNames(const QStringList &names)
     }
     return words;
 }
-// Extracts archive (zip, or a tar of any compression) into dir; files already there are kept, never replaced.
+// Extracts archive (zip, or a tar of any compression) into dir, replacing files already there (unzip's "A").
+// zip: the first output line is the number of entries, then unzip writes one line per entry (progress); its exit
+// code 1 is warnings only (names in another encoding), the files are extracted.
 static QString sftpExtractScript(const QString &dir, const QString &archive, bool zip)
 {
     const auto folder = posixQuote(dir), file = posixQuote("./" + archive);
     if (folder.isEmpty() || file.isEmpty())
         return {};
     if (zip)
-        return "cd " + folder + " && unzip -q -n " + file;
-    return "cd " + folder + " && if tar --version 2>/dev/null | grep -q GNU; then tar -x --skip-old-files -f " + file +
-           "; else tar -x -k -f " + file + "; fi";
+        return "cd " + folder + " || exit 2; unzip -Z1 " + file + " | wc -l; unzip -o " + file + "; [ $? -le 1 ]";
+    return "cd " + folder + " && tar -x -f " + file;
 }
 static QString sftpCompressScript(const QString &dir, const QString &archive, const QStringList &names, bool zip)
 {
@@ -1061,10 +1062,25 @@ class SftpPanel : public QWidget
     void setStatus(Transfer &t, const QString &text)
     {
         t.item->setText(3, text);
+        // A narrow column clipped the centred text on both sides: drop the time left, then the speed, so what is
+        // shown fits ("100%" measures the widest percentage); other states are elided on the right.
+        const auto metrics = t.bar->fontMetrics();
+        const int room = t.bar->width() - 8;
         if (t.state == "running")
-            t.bar->setFormat(t.rate.text().isEmpty() ? "%p%" : "%p% · " + t.rate.text());
+        {
+            const auto rate = t.rate.text();
+            QString format = "%p%";
+            if (!rate.isEmpty())
+                for (const QString &c : {"%p% · " + rate, "%p% · " + rate.section(" — ", 0, 0)})
+                    if (metrics.horizontalAdvance(QString(c).replace("%p", "100")) <= room)
+                    {
+                        format = c;
+                        break;
+                    }
+            t.bar->setFormat(format);
+        }
         else
-            t.bar->setFormat(text.isEmpty() ? "%p%" : text);
+            t.bar->setFormat(text.isEmpty() ? "%p%" : metrics.elidedText(text, Qt::ElideRight, room));
     }
     void showState(const std::shared_ptr<Transfer> &t)
     {
@@ -1586,6 +1602,7 @@ public:
     std::function<void(const QString &)> pasteToTerminal; // "Copy file path to terminal"
     std::function<void(bool)> onMonitoring;               // the window starts/stops monitoring the session
     QPushButton *monitoring = new QPushButton;            // Remote monitoring toggle
+    QProgressBar *jobBar = new QProgressBar;              // progress of an extraction, above Remote monitoring
     bool launchEditor = true;                             // false in tests: no external editor
     void setFollow(bool on) { follow->setChecked(on); }
     QCheckBox *followBox() const { return follow; }
@@ -1762,8 +1779,10 @@ public:
     }
     // Runs script in the remote shell over ssh (shell of the session's server); done gets its exit code (-1: ssh
     // could not start or crashed), standard output and standard error. false: no ssh for this session.
+    // output: standard output as it arrives (then not passed to done).
     bool runShell(const QString &script, bool interactive,
-                  const std::function<void(int, const QString &, const QString &)> &done)
+                  const std::function<void(int, const QString &, const QString &)> &done,
+                  const std::function<void(const QByteArray &)> &output = nullptr)
     {
         const auto program = QStandardPaths::findExecutable(shell.program);
         if (!shell.error.isEmpty() || shell.program != "ssh" || !shell.arguments.contains("--") || program.isEmpty())
@@ -1783,6 +1802,8 @@ public:
             if (done)
                 done(code, out, err);
         };
+        if (output)
+            connect(proc, &QProcess::readyReadStandardOutput, this, [proc, output] { output(proc->readAllStandardOutput()); });
         connect(proc, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [finish](int code, QProcess::ExitStatus exit) { finish(exit == QProcess::NormalExit ? code : -1); });
         connect(proc, &QProcess::errorOccurred, this,
@@ -1815,7 +1836,8 @@ public:
     }
     // A command run on the server for an operation on the listed folder, which is listed again afterwards; its
     // error (if any) stays as the status.
-    void shellJob(const QString &doing, const QString &script)
+    void shellJob(const QString &doing, const QString &script,
+                  const std::function<void(const QByteArray &)> &output = nullptr)
     {
         status->setText(doing);
         files->setCursor(Qt::BusyCursor);
@@ -1823,6 +1845,7 @@ public:
                                       [this](int code, const QString &, const QString &error)
                                       {
                                           files->unsetCursor();
+                                          jobBar->hide();
                                           note = code == 0 ? QString()
                                                            : (error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
                                           relistNow();
@@ -1830,6 +1853,7 @@ public:
         if (!started)
         {
             files->unsetCursor();
+            jobBar->hide();
             status->setText(L("SFTP operation failed."));
         }
     }
@@ -1849,8 +1873,30 @@ public:
     }
     void extractHere(const QString &name)
     {
-        if (const auto script = sftpExtractScript(listed, name, archiveKind(name) == "zip"); !script.isEmpty())
-            shellJob(L("Extracting…"), script);
+        const bool zip = archiveKind(name) == "zip";
+        const auto script = sftpExtractScript(listed, name, zip);
+        if (script.isEmpty())
+            return;
+        // zip: entries extracted out of the count on the first line; tar: no count, a busy bar.
+        jobBar->setRange(0, zip ? 100 : 0);
+        jobBar->setValue(0);
+        jobBar->show();
+        auto lines = std::make_shared<qint64>(-1), total = std::make_shared<qint64>(0);
+        auto pending = std::make_shared<QByteArray>();
+        shellJob(L("Extracting…"), script,
+                 !zip ? std::function<void(const QByteArray &)>()
+                      : [this, lines, total, pending](const QByteArray &chunk)
+                        {
+                            *pending += chunk;
+                            for (int end; (end = pending->indexOf('\n')) >= 0; pending->remove(0, end + 1))
+                            {
+                                if (*lines < 0)
+                                    *total = pending->left(end).trimmed().toLongLong();
+                                ++*lines;
+                            }
+                            if (*total > 0)
+                                jobBar->setValue(int(std::min<qint64>(99, *lines * 100 / *total)));
+                        });
     }
     // An archive of the selection in the listed folder: zip when the server has it, otherwise tar.gz.
     void compress(const QStringList &names)
@@ -2673,6 +2719,9 @@ public:
         auto *bottom = new QVBoxLayout;
         bottom->setContentsMargins(1, 0, 1, 2);
         bottom->setSpacing(2);
+        jobBar->setMaximumHeight(14);
+        jobBar->hide();
+        bottom->addWidget(jobBar);
         bottom->addWidget(monitoring);
         bottom->addWidget(follow, 0, Qt::AlignHCenter);
         layout->addLayout(bottom);
@@ -2762,7 +2811,7 @@ public:
                     up->setIcon(0, icon("parent"));
                     up->setData(0, Qt::UserRole, true);
                     up->setData(1, Qt::UserRole, qint64(-2)); // first when sorted by size
-                    const auto folderIcon = icon("folder"), fileIcon = icon("file");
+                    const auto folderIcon = icon("folder");
                     for (const auto &e : entries)
                     {
                         auto *item = new RemoteFileItem(
@@ -2772,7 +2821,7 @@ public:
                         item->setData(0, Qt::UserRole + 2, links.value(e.name));
                         item->setData(1, Qt::UserRole, e.dir ? qint64(-1) : e.size);
                         item->setIcon(0,
-                                      !e.link ? (e.dir ? folderIcon : fileIcon) : linkIcon(e.dir ? folderIcon : fileIcon, e.dir));
+                                      !e.link ? (e.dir ? folderIcon : fileIcon(e.name)) : linkIcon(e.dir ? folderIcon : fileIcon(e.name), e.dir));
                         item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
                         if (const auto target = targets.value(e.name); !target.isEmpty())
                             item->setToolTip(0, e.name + " → " + target);

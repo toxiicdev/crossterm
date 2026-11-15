@@ -1,5 +1,7 @@
 #pragma once
 // Icons: system icon font glyphs where available, otherwise drawn at runtime with QPainter.
+#include <QFileIconProvider>
+#include <QFileInfo>
 #include <QFontDatabase>
 #include <QFontMetrics>
 #include <QGuiApplication>
@@ -468,6 +470,20 @@ static QIcon icon(const QString &name, int size = 32)
     if (const auto it = cache.constFind(key); it != cache.constEnd())
         return *it;
     return *cache.insert(key, drawIcon(name, size));
+}
+
+// Remote file icon by extension, from the OS (Windows shell, freedesktop theme, macOS); our "file" icon for names
+// without one, which the OS would show as a blank page anyway. Once per extension.
+static QIcon fileIcon(const QString &name)
+{
+    const auto suffix = QFileInfo(name).suffix().toLower();
+    if (suffix.isEmpty())
+        return icon("file");
+    static QHash<QString, QIcon> cache;
+    if (const auto it = cache.constFind(suffix); it != cache.constEnd())
+        return *it;
+    const auto shown = QFileIconProvider().icon(QFileInfo("file." + suffix)); // the file need not exist
+    return *cache.insert(suffix, shown.isNull() ? icon("file") : shown);
 }
 
 // Icon with a dimmed "off" state (side stripe, matching inactive tabs), drawn at the 34px of the side strip.
