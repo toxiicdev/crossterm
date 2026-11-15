@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
     add_compile_options(/utf-8)
 endif()
+# Qt 6.8 links the AGL framework, which recent macOS SDKs no longer have ("framework 'AGL' not found"): its
+# FindWrapOpenGL uses WrapOpenGL_AGL when set, so point it at OpenGL when AGL is missing (linked twice, harmless).
+if(APPLE)
+    find_library(WrapOpenGL_AGL NAMES AGL OpenGL)
+endif()
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core Widgets Network)
 file(GLOB VTERM_SOURCES CONFIGURE_DEPENDS vendor/libvterm/src/*.c)
 add_library(vterm STATIC ${VTERM_SOURCES})

@@ -1,5 +1,6 @@
 // Drag from the SFTP browser to the outside: formats, deferred rendering and cache.
-// Network part against the test server 127.0.0.1:2222 (reads only); "--network" makes it mandatory.
+// Network part against the test server 127.0.0.1:2222 (reads only; CROSSTERM_TEST_PORT for another port); "--network"
+// makes it mandatory.
 #include <QtWidgets> // icons.h assumes QMap is already included
 #include "sftp-panel.h"
 #include <QTcpSocket>
@@ -73,19 +74,20 @@ int main(int argc, char **argv)
     }
 
     // --- With network: test server managed by others, reads only.
+    const int port = qEnvironmentVariableIntValue("CROSSTERM_TEST_PORT") ? qEnvironmentVariableIntValue("CROSSTERM_TEST_PORT") : 2222;
     QTcpSocket probe;
-    probe.connectToHost("127.0.0.1", 2222);
+    probe.connectToHost("127.0.0.1", quint16(port));
     const bool reachable = probe.waitForConnected(1500);
     probe.abort();
     // Test server key from the CROSSTERM_TEST_DATA variable (folder with srv/client_key).
     const QString identity = qEnvironmentVariable("CROSSTERM_TEST_DATA") + "/srv/client_key";
     if ((!reachable || !QFileInfo::exists(identity)) && !force)
     {
-        std::printf("SKIPPED: network part (127.0.0.1:2222 not reachable or CROSSTERM_TEST_DATA not set)\n");
+        std::printf("SKIPPED: network part (test server not reachable or CROSSTERM_TEST_DATA not set)\n");
         return failures ? 1 : 0;
     }
     SftpPanel panel(
-        QJsonObject{{"protocol", "sftp"}, {"host", "127.0.0.1"}, {"port", 2222}, {"user", "test"}, {"identity", identity}},
+        QJsonObject{{"protocol", "sftp"}, {"host", "127.0.0.1"}, {"port", port}, {"user", "test"}, {"identity", identity}},
         "windows");
     panel.launchEditor = false;
     auto names = [&]
@@ -105,6 +107,23 @@ int main(int argc, char **argv)
         return failures ? 1 : 0;
     }
     check(listed, "remote listing");
+    // Later listings go through the remote shell kept open: no new login, so they take milliseconds, not seconds.
+    for (const QString &folder : {"/docs", "/", "/docs"})
+    {
+        QElapsedTimer timer;
+        timer.start();
+        panel.run(folder, {}, false);
+        const bool there = wait(5000, [&] { return !panel.busy() && panel.currentPath() == folder; });
+        check(there && timer.elapsed() < 500,
+              "fast listing of " + folder.toUtf8() + " (" + QByteArray::number(timer.elapsed()) + " ms)");
+    }
+    check(names().contains("a.txt"), "listing through the shell shows the files");
+    panel.run("/missing-folder", {}, false);
+    wait(5000, [&] { return !panel.busy(); });
+    check(panel.currentPath() == "/docs" && panel.message().contains("missing-folder"),
+          "a missing folder keeps the listing and reports why: " + panel.message().toUtf8());
+    panel.run("/", {}, false);
+    wait(5000, [&] { return !panel.busy() && panel.currentPath() == "/"; });
     // Selection and hook of the QTreeWidget used by QDrag.
     for (int i = 0; i < panel.view()->topLevelItemCount(); ++i)
     {

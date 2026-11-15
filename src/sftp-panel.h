@@ -11,6 +11,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QUuid>
 #include <QStandardPaths>
 #include <memory>
 #include <vector>
@@ -1017,6 +1018,117 @@ class SftpPanel : public QWidget
         run(dir, {}, false);
     }
 
+    // Remote shell kept open for listings ("ssh -T host sh", fed "cd; pwd; ls -la" per folder): a listing takes
+    // milliseconds instead of a new sftp login each time (Windows' sftp.exe holds its output until it exits, so an open
+    // sftp would not answer). Started after a listing succeeds; when it ends (connection lost, timeout) the folder is
+    // listed again over sftp, which reconnects and starts it again. An account without a shell ends it at once:
+    // after two such tries listings stay on sftp.
+    QProcess *lister = nullptr;
+    QByteArray listerOut;
+    QString listerToken;  // end marker of this shell's answers, random so that no file name can fake it
+    QString listerWanted; // folder of the request in flight, empty when idle
+    bool listerReady = false;
+    int listerFailures = 0, listerRequest = 0;
+
+    void startLister()
+    {
+        if (lister || listerFailures >= 2 || !shell.error.isEmpty() || shell.program != "ssh" ||
+            !shell.arguments.contains("--"))
+            return;
+        const auto program = QStandardPaths::findExecutable(shell.program);
+        if (program.isEmpty())
+            return;
+        lister = hideConsoleWindow(new QProcess(this));
+        lister->setProcessEnvironment(sftpEnvironment(false));
+        listerToken = "__crossterm_" + QUuid::createUuid().toString(QUuid::Id128) + "__";
+        listerOut.clear();
+        listerWanted.clear();
+        listerReady = false;
+        connect(lister, &QProcess::readyReadStandardOutput, this, [this] { listerRead(); });
+        connect(lister, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this] { listerEnded(); });
+        connect(lister, &QProcess::errorOccurred, this,
+                [this](QProcess::ProcessError error)
+                {
+                    if (error == QProcess::FailedToStart)
+                        listerEnded(); // no "finished" follows
+                });
+        // ServerAlive: a dead connection ends the shell within ~30 s instead of stalling listings.
+        lister->start(program, QStringList{"-T", "-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes", "-o",
+                                           "ConnectTimeout=10", "-o", "NumberOfPasswordPrompts=1", "-o",
+                                           "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2"} +
+                                   shell.arguments + QStringList{"sh"});
+    }
+    void listerEnded()
+    {
+        if (!lister)
+            return;
+        if (!listerReady)
+            ++listerFailures;
+        forgetAskpassAttempts(lister);
+        lister->disconnect(this);
+        lister->deleteLater();
+        lister = nullptr;
+        // The folder asked for, over sftp: it reconnects, and its success starts a new shell.
+        if (const auto wanted = std::exchange(listerWanted, {}); !wanted.isEmpty())
+        {
+            files->unsetCursor();
+            run(wanted, {}, false);
+        }
+    }
+    // A listing through the open shell; false when there is none (or it is busy, or the path is not absolute).
+    bool listViaShell(const QString &directory)
+    {
+        const auto quoted = posixQuote(directory);
+        if (!lister || !listerWanted.isEmpty() || home.isEmpty() || !directory.startsWith('/') || quoted.isEmpty())
+            return false;
+        listerWanted = directory;
+        listerOut.clear();
+        const int request = ++listerRequest;
+        lister->write(("cd " + quoted + " 2>&1 && pwd && LC_ALL=C ls -la 2>&1; echo " + listerToken + "\n").toUtf8());
+        status->setText(L("Listing %1…").arg(directory));
+        files->setCursor(Qt::BusyCursor);
+        // No answer (connection stalled): the shell goes, and listerEnded lists the folder over sftp.
+        QTimer::singleShot(10000, this,
+                           [this, request]
+                           {
+                               if (lister && request == listerRequest && !listerWanted.isEmpty())
+                                   lister->kill();
+                           });
+        return true;
+    }
+    void listerRead()
+    {
+        listerOut += lister->readAllStandardOutput();
+        const int end = listerOut.indexOf(listerToken.toUtf8());
+        if (end < 0)
+            return;
+        const auto lines = QString::fromUtf8(listerOut.left(end)).split(QRegularExpression("[\\r\\n]+"), Qt::SkipEmptyParts);
+        listerOut.clear();
+        listerReady = true;
+        listerFailures = 0;
+        ++listerRequest; // its timeout no longer applies
+        files->unsetCursor();
+        if (std::exchange(listerWanted, {}).isEmpty())
+            return;
+        // "cd" failed: only its message; the listing shown stays.
+        if (lines.isEmpty() || !lines[0].startsWith('/'))
+        {
+            status->setText(lines.join('\n').left(400));
+            return;
+        }
+        // The shape of sftp's output (home, then the listed folder): showListing reads both the same way.
+        QString output = "Remote working directory: " + home + "\nRemote working directory: " + lines[0] + "\n";
+        QStringList errors;
+        for (int i = 1; i < lines.size(); ++i)
+        {
+            if (lines[i].startsWith("ls: "))
+                errors << lines[i];
+            else
+                output += lines[i] + "\n";
+        }
+        showListing(output, errors.join('\n'));
+    }
+
     // Bytes read by the sftp process (upload estimate: sftp reads the file while sending it).
     static qint64 bytesRead(qint64 pid, const QString &local)
     {
@@ -1557,6 +1669,8 @@ public:
             status->setText(L("Operation in progress…"));
             return;
         }
+        if (operations.isEmpty() && listViaShell(directory))
+            return;
         if (!command.error.isEmpty())
         {
             status->setText(describe(command.error));
@@ -1589,6 +1703,72 @@ public:
         files->setCursor(Qt::BusyCursor);
         process->start(program, sftpArguments(interactive));
     }
+    // Shows a listing: the output of "pwd, cd, pwd, ls -la" (sftp, or the remote shell in the same shape); error is
+    // what the server wrote on the side, shown as the status.
+    void showListing(const QString &output, const QString &error)
+    {
+        QList<RemoteEntry> entries;
+        // Link name -> target, when the listing tells it.
+        QHash<QString, QString> targets;
+        QHash<QString, int> links; // name -> link count of the file (0 when the listing shows '?')
+        QStringList folders;       // the two "pwd" answers: start folder (remote home), then the listed one
+        for (const auto &line : output.split(QRegularExpression("[\\r\\n]+"), Qt::SkipEmptyParts))
+        {
+            // Only those two: a file name with a line break can fake this line inside the listing.
+            if (folders.size() < 2 && line.startsWith("Remote working directory: "))
+            {
+                folders << line.mid(26).trimmed();
+                continue;
+            }
+            RemoteEntry entry;
+            if (!parseListing(line, entry))
+                continue;
+            entries << entry;
+            if (const auto target = listedLinkTarget(line, entry); !target.isEmpty())
+                targets.insert(entry.name, target);
+            links.insert(entry.name, line.simplified().section(' ', 1, 1).toInt());
+        }
+        const auto before = listed;
+        if (folders.size() == 2)
+            listed = folders[1];
+        recordHistory(before);
+        std::sort(entries.begin(), entries.end(), [](const RemoteEntry &a, const RemoteEntry &b)
+                  { return a.dir != b.dir ? a.dir : a.name.compare(b.name, Qt::CaseInsensitive) < 0; });
+        const bool first = home.isEmpty();
+        if (first)
+            home = folders.value(0, listed); // used to resolve "~" of the terminal folder
+        path->setText(listed.endsWith('/') ? listed : listed + "/");
+        files->clear();
+        auto *up = new RemoteFileItem(files, {".."});
+        up->setIcon(0, icon("parent"));
+        up->setData(0, Qt::UserRole, true);
+        up->setData(1, Qt::UserRole, qint64(-2)); // first when sorted by size
+        const auto folderIcon = fileIcon({}, true);
+        for (const auto &e : entries)
+        {
+            auto *item = new RemoteFileItem(
+                files, {e.name, e.dir ? QString() : fileSizeText(e.size), e.modified, e.owner, e.group, e.access});
+            item->setData(0, Qt::UserRole, e.dir);
+            item->setData(0, Qt::UserRole + 1, e.size);
+            item->setData(0, Qt::UserRole + 2, links.value(e.name));
+            item->setData(1, Qt::UserRole, e.dir ? qint64(-1) : e.size);
+            item->setIcon(0,
+                          !e.link ? (e.dir ? folderIcon : fileIcon(e.name)) : linkIcon(e.dir ? folderIcon : fileIcon(e.name), e.dir));
+            item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+            if (const auto target = targets.value(e.name); !target.isEmpty())
+                item->setToolTip(0, e.name + " → " + target);
+        }
+        applyFilter();
+        setLink(1);
+        const auto remark = std::exchange(note, {});
+        status->setText(!error.isEmpty() ? error.left(400) : remark);
+        if (first)
+            checkTools();
+        if (first && onConnected)
+            onConnected();
+        startLister();
+    }
+
     void retranslate()
     {
         texts.apply();
@@ -1618,7 +1798,7 @@ public:
     bool busy() const
     {
         return process->state() != QProcess::NotRunning || scanner->state() != QProcess::NotRunning || !scanQueue.isEmpty() ||
-               deletePending || remover->state() != QProcess::NotRunning;
+               deletePending || remover->state() != QProcess::NotRunning || !listerWanted.isEmpty();
     }
     std::function<QString()> folderSource;
     std::function<void(const QString &)> pasteToTerminal; // "Copy file path to terminal"
@@ -2658,7 +2838,7 @@ public:
                 [this](bool on)
                 {
                     followed.clear();
-                    on ? followTimer->start(800) : followTimer->stop();
+                    on ? followTimer->start(250) : followTimer->stop(); // reads a string: cheap
                 });
         connect(followTimer, &QTimer::timeout, this, [this] { followTick(); });
         connect(watcher, &QFileSystemWatcher::fileChanged, this,
@@ -2836,65 +3016,7 @@ public:
                             setLink(2);
                         return;
                     }
-                    QList<RemoteEntry> entries;
-                    // Link name -> target, when the listing tells it.
-                    QHash<QString, QString> targets;
-                    QHash<QString, int> links; // name -> link count of the file (0 when the listing shows '?')
-                    QStringList folders;       // the two "pwd" answers: start folder (remote home), then the listed one
-                    for (const auto &line : output.split(QRegularExpression("[\\r\\n]+"), Qt::SkipEmptyParts))
-                    {
-                        // Only those two: a file name with a line break can fake this line inside the listing.
-                        if (folders.size() < 2 && line.startsWith("Remote working directory: "))
-                        {
-                            folders << line.mid(26).trimmed();
-                            continue;
-                        }
-                        RemoteEntry entry;
-                        if (!parseListing(line, entry))
-                            continue;
-                        entries << entry;
-                        if (const auto target = listedLinkTarget(line, entry); !target.isEmpty())
-                            targets.insert(entry.name, target);
-                        links.insert(entry.name, line.simplified().section(' ', 1, 1).toInt());
-                    }
-                    const auto before = listed;
-                    if (folders.size() == 2)
-                        listed = folders[1];
-                    recordHistory(before);
-                    std::sort(entries.begin(), entries.end(), [](const RemoteEntry &a, const RemoteEntry &b)
-                              { return a.dir != b.dir ? a.dir : a.name.compare(b.name, Qt::CaseInsensitive) < 0; });
-                    const bool first = home.isEmpty();
-                    if (first)
-                        home = folders.value(0, listed); // used to resolve "~" of the terminal folder
-                    path->setText(listed.endsWith('/') ? listed : listed + "/");
-                    files->clear();
-                    auto *up = new RemoteFileItem(files, {".."});
-                    up->setIcon(0, icon("parent"));
-                    up->setData(0, Qt::UserRole, true);
-                    up->setData(1, Qt::UserRole, qint64(-2)); // first when sorted by size
-                    const auto folderIcon = fileIcon({}, true);
-                    for (const auto &e : entries)
-                    {
-                        auto *item = new RemoteFileItem(
-                            files, {e.name, e.dir ? QString() : fileSizeText(e.size), e.modified, e.owner, e.group, e.access});
-                        item->setData(0, Qt::UserRole, e.dir);
-                        item->setData(0, Qt::UserRole + 1, e.size);
-                        item->setData(0, Qt::UserRole + 2, links.value(e.name));
-                        item->setData(1, Qt::UserRole, e.dir ? qint64(-1) : e.size);
-                        item->setIcon(0,
-                                      !e.link ? (e.dir ? folderIcon : fileIcon(e.name)) : linkIcon(e.dir ? folderIcon : fileIcon(e.name), e.dir));
-                        item->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
-                        if (const auto target = targets.value(e.name); !target.isEmpty())
-                            item->setToolTip(0, e.name + " → " + target);
-                    }
-                    applyFilter();
-                    setLink(1);
-                    const auto remark = std::exchange(note, {});
-                    status->setText(!error.isEmpty() ? error.left(400) : remark);
-                    if (first)
-                        checkTools();
-                    if (first && onConnected)
-                        onConnected();
+                    showListing(output, error);
                 });
         // First automatic listing when the SSH session opens.
         QTimer::singleShot(1500, this, [this] { run(startFolder(), {}, false); });
