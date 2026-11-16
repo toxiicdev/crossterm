@@ -1865,7 +1865,8 @@ public:
         const bool runnable = sftpRunnable(QFileInfo(file).fileName());
 #ifdef Q_OS_WIN
         const auto native = QDir::toNativeSeparators(file);
-        if (openMode == 1 && !runnable)
+        // "Open with": the chooser for every type, scripts too (.js, .bat...): the user picks the program.
+        if (openMode == 1)
         {
             const auto wide = native.toStdWString();
             OPENASINFO info{wide.c_str(), nullptr, OAIF_ALLOW_REGISTRATION | OAIF_EXEC};
