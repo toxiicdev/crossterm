@@ -1889,9 +1889,19 @@ void FtpPanel::removeItems(const QList<Item> &items)
 // One question for the whole operation; No keeps the existing files (the others are still transferred).
 bool FtpPanel::replaceConfirmed(const QStringList &existing, const char *title)
 {
+    auto &remembered = rememberedReplaces();
+    if (const auto it = remembered.constFind(title); it != remembered.constEnd())
+        return *it;
     const auto text = existing.size() == 1 ? ui("%1 already exists. Replace it?").arg(existing[0])
                                            : ui("%1 files already exist. Replace them?").arg(existing.size());
-    return QMessageBox::question(this, ui(title), text, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+    QMessageBox box(QMessageBox::Question, ui(title), text, QMessageBox::Yes | QMessageBox::No, this);
+    box.setDefaultButton(QMessageBox::No);
+    auto *remember = new QCheckBox(ui("Remember this choice until CrossTerm closes"));
+    box.setCheckBox(remember);
+    const bool replace = box.exec() == QMessageBox::Yes;
+    if (remember->isChecked())
+        remembered.insert(title, replace);
+    return replace;
 }
 
 void FtpPanel::upload(const QStringList &localFiles)

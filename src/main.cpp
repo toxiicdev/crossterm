@@ -413,7 +413,8 @@ class Window : public QMainWindow
         return QSet<QString>(saved.begin(), saved.end());
     }();
     bool expandedKnown = QSettings().contains("sessions/expanded");
-    QJsonObject copiedSettings; // "Copy settings" of a session, for "Paste settings"
+    QJsonObject copiedSettings;     // "Copy settings" of a session, for "Paste settings"
+    bool multilineAccepted = false; // "Paste several lines without asking until CrossTerm closes"
     int loginSettleMs = 5000;   // after a new password is typed, the time the server has to refuse it
     int splitMode = 1, counter = 0;
     QString lastFilter;
@@ -4190,7 +4191,8 @@ protected:
     {
         const auto risks = pasteRisks(text);
         const int lines = pasteLineCount(text);
-        if (risks.isEmpty() && (lines == 1 || !QSettings().value("terminal/confirmMultiline", true).toBool()))
+        if (risks.isEmpty() &&
+            (lines == 1 || multilineAccepted || !QSettings().value("terminal/confirmMultiline", true).toBool()))
             return text;
         QDialog dialog(from ? from->window() : this);
         dialog.setWindowTitle(L("Confirm paste"));
@@ -4264,6 +4266,13 @@ protected:
         if (invisible)
             connect(buttons->addButton(L("Remove invisible characters"), QDialogButtonBox::ActionRole), &QPushButton::clicked,
                     &dialog, [edit] { edit->setPlainText(pasteCleaned(edit->toPlainText())); });
+        // Only for text that is just several lines: risky text is always shown.
+        QCheckBox *remember = nullptr;
+        if (risks.isEmpty())
+        {
+            remember = new QCheckBox(L("Paste several lines without asking until CrossTerm closes"));
+            layout->addWidget(remember);
+        }
         layout->addWidget(buttons);
         connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
         connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -4273,6 +4282,8 @@ protected:
         dialog.resize(640, 360);
         if (dialog.exec() != QDialog::Accepted)
             return std::nullopt;
+        if (remember && remember->isChecked())
+            multilineAccepted = true;
         return edit->toPlainText();
     }
 
@@ -4507,6 +4518,22 @@ public:
                     });
             check(wait(5000, [&] { return g->terminal->contents().contains("GUARD2"); }),
                   "Return pastes the text as edited in the confirmation");
+            // Several plain lines: "until CrossTerm closes" stops the question for the next ones; risky text has no
+            // such box.
+            bool boxShown = false;
+            onModal([&] { userPaste(g->terminal, "echo ML1\recho ML2\r"); },
+                    [&](QWidget *w)
+                    {
+                        if (auto *box = w->findChild<QCheckBox *>())
+                            boxShown = true, box->setChecked(true);
+                        w->resize(640, 360);
+                        shot("46-paste-multiline.png", w);
+                        static_cast<QDialog *>(w)->accept();
+                    });
+            const bool askedAgain = onModal([&] { userPaste(g->terminal, "echo ML3\recho ML4\r"); }, [](QWidget *w) { w->close(); });
+            check(boxShown && !askedAgain && wait(5000, [&] { return g->terminal->contents().contains("ML4"); }),
+                  "several lines: remembered choice pastes without asking until CrossTerm closes");
+            multilineAccepted = false;
             // A single safe line goes straight in.
             const bool asked = onModal([&] { userPaste(g->terminal, "echo GUARD3"); }, [](QWidget *w) { w->close(); });
             g->terminal->paste("\r");

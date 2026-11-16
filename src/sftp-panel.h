@@ -3125,11 +3125,10 @@ public:
     }
 
     // One question for all the names that would be replaced; "No" leaves those out, the others are transferred.
-    // "Remember": the answer is reused, without asking, for the same kind of transfer (title) until the panel
-    // closes with its session.
-    QHash<QString, bool> rememberedReplace;
+    // "Remember": the answer is reused, without asking, for the same kind of transfer (title) until CrossTerm closes.
     bool confirmReplace(const QStringList &names, const char *title)
     {
+        auto &rememberedReplace = rememberedReplaces();
         if (const auto it = rememberedReplace.constFind(title); it != rememberedReplace.constEnd())
             return *it;
         const auto text = names.size() == 1 ? L("%1 already exists. Replace it?").arg(names[0])
@@ -3137,7 +3136,7 @@ public:
         if (askReplace)
             return askReplace(text);
         QMessageBox box(QMessageBox::Question, L(title), text, QMessageBox::Yes | QMessageBox::No, this);
-        auto *remember = new QCheckBox(L("Remember this choice while the session is open"));
+        auto *remember = new QCheckBox(L("Remember this choice until CrossTerm closes"));
         box.setCheckBox(remember);
         const bool replace = box.exec() == QMessageBox::Yes;
         if (remember->isChecked())
