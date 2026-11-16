@@ -200,6 +200,13 @@ int main(int argc, char **argv)
         wheelDevice->feed("\x1b[?1h"); // application cursor keys
         spin(-120);
         CHECK(wheelDevice->written == "\x1bOB\x1bOB\x1bOB")
+        // nano's redraw after a scroll: cursor hidden, placed, then shown where it is: drawn again.
+        wheelDevice->feed("\x1b[?25l\x1b[5;3H");
+        QApplication::processEvents();
+        const QImage hidden = wheel.grab().toImage();
+        wheelDevice->feed("\x1b[?25h");
+        QApplication::processEvents();
+        CHECK(wheel.grab().toImage() != hidden)
         wheelDevice->feed("\x1b[?1049l");
         wheelDevice->written.clear();
         spin(-120);

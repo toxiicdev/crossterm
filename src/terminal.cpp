@@ -743,6 +743,10 @@ void Terminal::setup()
         {
             if (prop == VTERM_PROP_ALTSCREEN)
                 static_cast<State *>(context)->alternate = value->boolean;
+            // Shown again without moving (nano and vim hide it, redraw, place it, then show it): movecursor alone
+            // would leave it hidden until the next move.
+            if (prop == VTERM_PROP_CURSORVISIBLE)
+                static_cast<State *>(context)->cursor = value->boolean;
             return 1;
         };
         return cb;
