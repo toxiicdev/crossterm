@@ -449,6 +449,25 @@ static void testDialogs(const QString &root)
     CHECK(start->isEnabled());
 }
 
+static void testWakeOnLan()
+{
+    const auto good = wakeOnLanPacket("00-1A-2B-3C-4D-5E");
+    CHECK(wakeOnLanPacket("00:1a:2B-3c.4D5E") == good) // separators and case as typed
+    CHECK(good.size() == 102 && good.startsWith(QByteArray(6, char(0xFF))) &&
+          good.mid(6, 6) == QByteArray::fromHex("001A2B3C4D5E") && good.endsWith(QByteArray::fromHex("001A2B3C4D5E")))
+    CHECK(wakeOnLanPacket("001A2B3C4D5E") == good)
+    CHECK(wakeOnLanPacket("001a.2b3c.4d5e") == good)
+    CHECK(wakeOnLanPacket("00:1A:2B:3C:4D").isEmpty())
+    CHECK(wakeOnLanPacket("zz:1A:2B:3C:4D:5E").isEmpty())
+    QUdpSocket receiver;
+    CHECK(receiver.bind(QHostAddress::LocalHost, 0))
+    QString error;
+    CHECK(sendWakeOnLan("00:1A:2B:3C:4D:5E", QHostAddress::LocalHost, receiver.localPort(), &error))
+    CHECK(spin([&] { return receiver.hasPendingDatagrams(); }, 3000))
+    CHECK(receiver.receiveDatagram().data() == good)
+    CHECK(!sendWakeOnLan("nope", QHostAddress::LocalHost, receiver.localPort(), &error) && error == "MAC")
+}
+
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
@@ -464,6 +483,7 @@ int main(int argc, char **argv)
     testHttp(root);
     testTftp(root);
     testScanner();
+    testWakeOnLan();
     testDialogs(root);
     qInfo() << (failures ? "FAILED" : "OK") << failures;
     return failures ? 1 : 0;

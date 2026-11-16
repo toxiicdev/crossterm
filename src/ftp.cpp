@@ -23,6 +23,28 @@ static QString ui(const char *text)
 
 // ---------------------------------------------------------------- shared with the SFTP browser
 
+void rememberColumnWidths(QTreeView *view, const QString &key)
+{
+    // Once the event loop runs: the column titles (and so the columns) may be set after this call. Saved only from
+    // then on, so the layout of a list being built does not overwrite the stored widths.
+    QTimer::singleShot(0, view,
+                       [view, key]
+                       {
+                           const auto widths = QSettings().value(key).toList();
+                           for (int i = 0; i < widths.size() && i < view->header()->count(); ++i)
+                               if (const int w = widths[i].toInt(); w > 0)
+                                   view->setColumnWidth(i, w);
+                           QObject::connect(view->header(), &QHeaderView::sectionResized, view,
+                                            [view, key]
+                                            {
+                                                QVariantList now;
+                                                for (int i = 0; i < view->header()->count(); ++i)
+                                                    now << view->columnWidth(i);
+                                                QSettings().setValue(key, now);
+                                            });
+                       });
+}
+
 QString fileSizeText(qint64 bytes)
 {
     if (bytes < 0)
@@ -1531,6 +1553,7 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
     files->setIconSize(QSize(16, 16));
     files->setColumnCount(4);
     files->setColumnWidth(0, 150);
+    rememberColumnWidths(files, "ftp/columns");
     files->setAcceptDrops(true);
     files->viewport()->setAcceptDrops(true);
     files->viewport()->installEventFilter(this);

@@ -29,12 +29,18 @@ Tests: CTest (`profiles` plus one executable per area in `tests\`), `--smoke-tes
 | Reflow on resize | Done | `test_terminal` (60 random resizes without loss); two libvterm defects worked around without patching it |
 | Scrollback, selection, search, output saving and logging | Done | e2e |
 | Macros, session recovery, favorites, sessions opened at startup | Done | e2e |
+| Macros that include another macro (no loops) | Done | e2e |
+| Paste confirmation: several lines, download piped to a shell, writes to startup files, archives extracted into /, look-alike letters, invisible characters; one dialog with MultiExec | Done | `test_pasteguard`, e2e |
+| Close tabs to the left / right, close ended tabs | Done | e2e |
+| Log lines with date and time in milliseconds (option) | Done | e2e |
 
 ## Protocols
 
 | Feature | Status | Verification / notes |
 | --- | --- | --- |
 | SSH (keys, agent, jump hosts, compression, keepalive) | Done | e2e |
+| Multi-line PAM prompts (judged by their last line), clickable links in prompt dialogs | Partial | Code path shared with the inline prompts; no PAM server in the tests |
+| New password accepted after the saved one was rejected: asked before replacing it | Partial | Not covered by a test (needs a password server with interactive prompts) |
 | SSH with password: system vault and in-memory session password | Done | CrossTerm askpass. A password typed once is reused by terminal, SFTP, monitoring, tunnels and Mosh; e2e |
 | HTTP / SOCKS5 / SOCKS4(a) proxy for SSH | Done | CrossTerm acts as ProxyCommand; `test_services` runs real ssh to the container through all three proxy types |
 | X11 forwarding with integrated X server | Done | VcXsrv in `dist\xserver` started on demand; `-Y` on Windows; e2e: `DISPLAY` set on the real Linux server |
@@ -57,6 +63,7 @@ Tests: CTest (`profiles` plus one executable per area in `tests\`), `--smoke-tes
 | Queue with progress, cancel, resume | Done | e2e with 64 MB |
 | Drag and drop from the desktop and to Explorer | Done | Upload: e2e. To Explorer: download on drop, tested with `test_sftpdrag`; a real drop in Explorer cannot be automated |
 | Remote editing with upload on save, Follow terminal folder | Done | e2e |
+| Column widths of the SFTP and FTP lists kept across restarts | Partial | Not covered by a test |
 | Remote monitoring (CPU, RAM, network, uptime, user, disk) | Done | Bar under the terminal; e2e against the real Linux server |
 
 ## Sessions, credentials and import
@@ -78,4 +85,7 @@ Tests: CTest (`profiles` plus one executable per area in `tests\`), `--smoke-tes
 | Local, remote and dynamic SSH tunnels | Done | e2e with real traffic |
 | Built-in servers: HTTP, TFTP, FTP/FTPS | Done | `test_servers` and `test_ftp` (root folder jail, Range, TFTP options, FTPS with a PEM certificate set in Configuration); Servers dialog in e2e |
 | Port scanner | Done | `test_servers` |
+| Wake On LAN | Done | `test_servers` (packet formats, UDP send) and e2e |
+| Session tree: open SFTP with the SSH settings, copy/paste settings, settings for new sessions, collapse all, own icon per session | Done | e2e (open SFTP needs a server: not tested) |
+| Duplicate SSH tunnel | Done | e2e |
 | Cygwin packages / plugins | Not supported | Not applicable to a native Qt client |

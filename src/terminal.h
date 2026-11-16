@@ -39,9 +39,9 @@ public:
     void paste(const QString &text);
     // The paste shortcut of this platform (Cmd+V; Ctrl+Shift+V or Shift+Insert elsewhere).
     static bool isPasteKey(const QKeyEvent *event);
-    // Called after a paste made with the mouse (middle or right click), with the pasted text: the window replicates
-    // it to the other terminals with MultiExec and records it in a macro, as it does for keys.
-    std::function<void(const QString &text)> onMousePaste;
+    // A paste the user made (shortcut or mouse) into the running session, not at a password prompt: called instead of
+    // paste(), so the window can confirm risky text, then paste it, replicate it with MultiExec and record it.
+    std::function<void(const QString &text)> onUserPaste;
     bool finished() const;
     // Searches the visible text and the scrollback starting from the last match; selects and reveals the result.
     // Every other occurrence on screen gets a soft highlight until clearFind() (or an empty text, or typing).
@@ -49,7 +49,7 @@ public:
     void clearFind(); // search closed: removes the highlights of the matches
     QString selection() const;
     QString allText() const;              // scrollback + screen, one line per terminal row
-    bool setLogFile(const QString &path); // records the session output to a text file
+    bool setLogFile(const QString &path, bool timestamps = false); // records the session output to a text file
     // Current shell directory: from OSC 7 if the shell sends it, otherwise from the prompt (may be "~/...").
     QString workingDirectory() const;
     // Called after "Session stopped": Enter closes the tab, R restarts the session.
@@ -106,6 +106,7 @@ protected:
     void wheelEvent(QWheelEvent *) override;
 
 private:
+    void userPaste(const QString &text);
     struct State;
     std::unique_ptr<State> state;
     void setup();

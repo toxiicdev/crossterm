@@ -2707,6 +2707,7 @@ public:
         files->setUniformRowHeights(true);
         files->setIconSize(QSize(16, 16));
         files->setColumnWidth(0, 150);
+        rememberColumnWidths(files, "sftp/columns");
         files->setAcceptDrops(true);
         files->viewport()->setAcceptDrops(true);
         files->viewport()->installEventFilter(this);

@@ -28,6 +28,8 @@ class QTreeWidget;
 // ---- Shared by the SFTP and FTP browsers.
 // "512 B", "12 KB", "1.2 MB", "3.4 GB" (1024 based; the units are not translated).
 QString fileSizeText(qint64 bytes);
+// Column widths of a file list kept across restarts under key (one value for every SFTP or FTP tab).
+void rememberColumnWidths(class QTreeView *view, const QString &key);
 // The file or folder icon with a small link arrow at the bottom left (symbolic links); composed once per kind.
 QIcon linkIcon(const QIcon &base, bool folder);
 // Target of a symbolic link when its "ls -l" line carries it ("name -> target": parseListing keeps the name only).

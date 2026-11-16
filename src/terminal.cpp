@@ -6,6 +6,7 @@
 #include <QBuffer>
 #include <QClipboard>
 #include <QCursor>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
@@ -324,6 +325,21 @@ struct Terminal::State
     std::unique_ptr<MoshPredictor> predictor;
     QPoint anchor, extent;
     std::unique_ptr<QFile> log; // session log: lines scrolled off the screen + final screen
+    // Log with times: when the cursor last left or entered each screen row, the moment its text was written.
+    bool logTimes = false;
+    std::deque<qint64> rowTimes;
+    qint64 &rowTime(int row)
+    {
+        if (int(rowTimes.size()) < rows)
+            rowTimes.resize(size_t(rows), QDateTime::currentMSecsSinceEpoch());
+        return rowTimes[size_t(std::clamp(row, 0, int(rowTimes.size()) - 1))];
+    }
+    void writeLog(const QString &text, qint64 time)
+    {
+        const auto stamp = logTimes ? "[" + QDateTime::fromMSecsSinceEpoch(time).toString("yyyy-MM-dd HH:mm:ss.zzz") + "] "
+                                    : QString();
+        log->write((stamp + text + "\n").toUtf8());
+    }
     QColor background{"#1c1c1c"}, foreground{"#dadada"}, cursorColor{"#c8c8c8"};
     // Derived from the scheme (applyScheme): selection, other search matches, character under the block cursor.
     QColor selection, selectionText, match, matchText, cursorText;
@@ -414,7 +430,13 @@ struct Terminal::State
         if (logged > 0)
             --logged;
         else if (log)
-            log->write((lineText(-1) + "\n").toUtf8());
+            writeLog(lineText(-1), rowTime(0));
+        if (logTimes) // the screen moved up one row
+        {
+            rowTime(0);
+            rowTimes.pop_front();
+            rowTimes.push_back(QDateTime::currentMSecsSinceEpoch());
+        }
         if (scrollback.size() > 5000)
             scrollback.pop_front();
         // Every line moved up by one: a scrolled-back view and the selection stay on their text
@@ -606,7 +628,7 @@ struct Terminal::State
             while (last >= 0 && lineText(last).isEmpty())
                 --last;
             for (int row = std::min(logged, last + 1); row <= last; ++row)
-                log->write((lineText(row) + "\n").toUtf8());
+                writeLog(lineText(row), rowTime(row));
             log->close();
         }
         vterm_free(vt);
@@ -679,9 +701,12 @@ void Terminal::setup()
     static const VTermScreenCallbacks callbacks = []
     {
         VTermScreenCallbacks cb{};
-        cb.movecursor = [](VTermPos, VTermPos, int visible, void *context)
+        cb.movecursor = [](VTermPos pos, VTermPos old, int visible, void *context)
         {
-            static_cast<State *>(context)->cursor = visible;
+            auto &s = *static_cast<State *>(context);
+            if (s.logTimes && pos.row != old.row)
+                s.rowTime(old.row) = s.rowTime(pos.row) = QDateTime::currentMSecsSinceEpoch();
+            s.cursor = visible;
             return 1;
         };
         cb.sb_pushline4 = [](int cols, const VTermScreenCell *cells, bool continuation, void *context)
@@ -1581,12 +1606,7 @@ void Terminal::mousePressEvent(QMouseEvent *event)
     else if (event->button() == Qt::MiddleButton ||
              (event->button() == Qt::RightButton && QSettings().value("terminal/rightPaste", true).toBool()))
     {
-        const auto text = QApplication::clipboard()->text();
-        // Not a password prompt answer, nor text kept for one.
-        const bool session = !state->ended && !state->promptDone && !holdingKeys();
-        paste(text);
-        if (session && !text.isEmpty() && onMousePaste)
-            onMousePaste(text);
+        userPaste(QApplication::clipboard()->text());
     }
 }
 
@@ -1800,6 +1820,15 @@ bool Terminal::finished() const
     return state->ended;
 }
 
+void Terminal::userPaste(const QString &text)
+{
+    // Not a password prompt answer, nor text kept for one.
+    if (onUserPaste && !text.isEmpty() && !state->ended && !state->promptDone && !holdingKeys())
+        onUserPaste(text);
+    else
+        paste(text);
+}
+
 void Terminal::paste(const QString &text)
 {
     if (text.isEmpty() || state->ended)
@@ -1887,7 +1916,7 @@ void Terminal::keyPressEvent(QKeyEvent *event)
     }
     if (pasteKey)
     {
-        paste(QApplication::clipboard()->text());
+        userPaste(QApplication::clipboard()->text());
         return;
     }
     if (state->ended)
@@ -2115,8 +2144,9 @@ QString Terminal::allText() const
     return lines.join('\n');
 }
 
-bool Terminal::setLogFile(const QString &path)
+bool Terminal::setLogFile(const QString &path, bool timestamps)
 {
+    state->logTimes = timestamps;
     auto file = std::make_unique<QFile>(path);
     if (!file->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
         return false;

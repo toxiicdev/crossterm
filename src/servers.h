@@ -23,6 +23,12 @@ class QListWidget;
 // hidden file or folder (a component starting with a dot).
 QString jailedPath(const QString &root, const QString &relative);
 
+// Wake On LAN magic packet: 6 bytes 0xFF, then the MAC address 16 times. Empty for an invalid address (accepted:
+// 12 hex digits, optionally separated by ':', '-' or '.').
+QByteArray wakeOnLanPacket(const QString &mac);
+// Sends the packet as a UDP broadcast (or to the given address); false with the reason in error.
+bool sendWakeOnLan(const QString &mac, const QHostAddress &to, quint16 port, QString *error = nullptr);
+
 // Read-only HTTP/1.1 server (GET/HEAD, Range, directory listing) confined to a folder.
 class HttpFileServer
 {

@@ -334,6 +334,14 @@ public:
             }
             else if (command == "VDEL")
                 reply = removeSecret(target) ? "+\n" : "-\n";
+            else if (command == "VOFFER")
+            {
+                // A password typed after the saved one was rejected: the window asks whether to save it, once the
+                // login went through.
+                if (offered)
+                    QTimer::singleShot(0, &server, [this, target] { offered(target); });
+                reply = "+\n";
+            }
         }
         socket->write(reply);
         reply.fill('\0');
@@ -341,6 +349,8 @@ public:
         socket->disconnectFromServer();
     }
 
+    // A new password for target was typed in the terminal after its saved one was rejected (VOFFER).
+    std::function<void(const QString &target)> offered;
     // Called (queued) after a secret is cached: SFTP and monitoring that failed before login retry.
     std::function<void(const QString &)> stored;
     // Shows the prompt inside the terminal with the given id; false if that terminal does not exist.
@@ -457,10 +467,49 @@ inline bool vaultStore(const QString &target, const QString &secret)
     const auto reply = requestSessionSecrets("VPUT", target, secret, 300000);
     return reply && reply->startsWith('+');
 }
+// The saved password was rejected and another one typed in the terminal (and cached): the window offers to save it.
+inline void vaultOffer(const QString &target)
+{
+    requestSessionSecrets("VOFFER", target, {}, 5000);
+}
 inline bool vaultRemove(const QString &target)
 {
     const auto reply = requestSessionSecrets("VDEL", target, {}, 300000);
     return reply && reply->startsWith('+');
+}
+
+// The question of a prompt: its last non-empty line (PAM may put a banner, a menu or a link above it).
+inline QString askpassQuestion(const QString &prompt)
+{
+    const auto lines = QString(prompt).replace("\r\n", "\n").split('\n', Qt::SkipEmptyParts);
+    for (auto it = lines.crbegin(); it != lines.crend(); ++it)
+        if (!it->trimmed().isEmpty())
+            return it->trimmed();
+    return prompt.trimmed();
+}
+
+// The prompt text for a dialog: plain text from the server, with its web links clickable (device login pages).
+inline QLabel *askpassPromptLabel(const QString &prompt)
+{
+    static const QRegularExpression link("https?://[^\\s<>\"']*[^\\s<>\"'.,;:!?)\\]]");
+    QString html;
+    const auto text = prompt.trimmed();
+    qsizetype done = 0;
+    for (auto it = link.globalMatch(text); it.hasNext();)
+    {
+        const auto m = it.next();
+        html += text.mid(done, m.capturedStart() - done).toHtmlEscaped();
+        const auto url = m.captured().toHtmlEscaped();
+        html += "<a href=\"" + url + "\">" + url + "</a>";
+        done = m.capturedEnd();
+    }
+    html += text.mid(done).toHtmlEscaped();
+    auto *label = new QLabel("<div style='white-space: pre-wrap'>" + html + "</div>");
+    label->setTextFormat(Qt::RichText);
+    label->setOpenExternalLinks(true);
+    label->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    label->setWordWrap(true);
+    return label;
 }
 
 // Askpass side: asks the CrossTerm window to read the answer inside the session's terminal.
@@ -622,8 +671,12 @@ inline int runAskpass(int &argc, char **argv)
     const auto target = qEnvironmentVariable("CROSSTERM_CREDENTIAL");
     const bool interactive = !qEnvironmentVariableIsSet("CROSSTERM_ASKPASS_NONINTERACTIVE");
     applyLanguage(currentLanguage());
-    const bool secretPrompt = prompt.contains("password", Qt::CaseInsensitive) ||
-                              prompt.contains("passphrase", Qt::CaseInsensitive) || prompt.contains("PIN", Qt::CaseSensitive);
+    // PAM can send several lines (a banner, a menu of second factors, a link to open) before the question itself:
+    // only the last line says what is asked. "Your password expires in 3 days" above a code prompt is no password
+    // prompt, and the session password must never be sent to it.
+    const auto question = askpassQuestion(prompt);
+    const bool secretPrompt = question.contains("password", Qt::CaseInsensitive) ||
+                              question.contains("passphrase", Qt::CaseInsensitive) || question.contains("PIN", Qt::CaseSensitive);
     if (!secretPrompt)
     {
         if (!interactive)
@@ -636,20 +689,40 @@ inline int runAskpass(int &argc, char **argv)
             return 0;
         }
         gui();
-        QMessageBox question(QMessageBox::Question, "CrossTerm", prompt.trimmed(), QMessageBox::Yes | QMessageBox::No);
-        question.setTextFormat(Qt::PlainText); // the text comes from ssh and, in part, from the server
-        writeAnswer(question.exec() == QMessageBox::Yes ? "yes" : "no");
+        if (question.contains("yes/no", Qt::CaseInsensitive)) // host key
+        {
+            QMessageBox box(QMessageBox::Question, "CrossTerm", prompt.trimmed(), QMessageBox::Yes | QMessageBox::No);
+            box.setTextFormat(Qt::PlainText); // the text comes from ssh and, in part, from the server
+            writeAnswer(box.exec() == QMessageBox::Yes ? "yes" : "no");
+            return 0;
+        }
+        // Any other question from the server (one-time code, choice of second factor): answered as typed.
+        QDialog dialog;
+        dialog.setWindowTitle(L("Authentication"));
+        auto *layout = new QVBoxLayout(&dialog);
+        layout->addWidget(askpassPromptLabel(prompt));
+        auto *answer = new QLineEdit;
+        layout->addWidget(answer);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        layout->addWidget(buttons);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        dialog.setWindowFlag(Qt::WindowStaysOnTopHint);
+        dialog.resize(420, dialog.sizeHint().height());
+        if (dialog.exec() != QDialog::Accepted)
+            return 1;
+        writeAnswer(answer->text());
         return 0;
     }
     // A jump host asks for its own password: never the session's saved or typed one, and what is typed for it is
     // cached under its own name (asked once per run) and never saved as the session's password.
-    const auto who = promptIdentity(prompt);
+    const auto who = promptIdentity(question);
     const bool foreign =
         askpassForeign(who, target, qEnvironmentVariable("CROSSTERM_CREDENTIAL_HOPS").split(',', Qt::SkipEmptyParts),
                        qEnvironmentVariable("CROSSTERM_CREDENTIAL_IDENTITY"));
     // Cache entry: the session password, the passphrase of the key named in the prompt (a prompt relayed from the
     // server, "(user@host) ...", is never one) or the jump host's password.
-    const bool passphrase = !who.keyboard && prompt.contains("passphrase", Qt::CaseInsensitive);
+    const bool passphrase = !who.keyboard && question.contains("passphrase", Qt::CaseInsensitive);
     const char kind = passphrase ? 'p' : 'c';
     const auto entry = passphrase ? "passphrase:" + prompt.trimmed() : foreign ? "hop:" + who.user + "@" + who.host : target;
     // Attempt counter for this ssh process. Only secret prompts count: a host key question answered first must
@@ -710,14 +783,15 @@ inline int runAskpass(int &argc, char **argv)
     {
         if (!typed.value)
             return 1;
-        if (saved && !passphrase)
-            vaultStore(target, *typed.value);
         if (!entry.isEmpty())
         {
             askSessionSecrets("PUT", entry, *typed.value);
             answered += kind;
             record();
         }
+        // The saved password was rejected: replaced only if the user agrees, once this one is accepted.
+        if (saved && !passphrase && !foreign)
+            vaultOffer(target);
         writeAnswer(*typed.value);
         typed.value->fill(QChar(0));
         return 0;
@@ -732,10 +806,7 @@ inline int runAskpass(int &argc, char **argv)
         rejected->setStyleSheet("color: #c0392b;");
         layout->addWidget(rejected);
     }
-    auto *label = new QLabel(prompt.trimmed());
-    label->setTextFormat(Qt::PlainText);
-    label->setWordWrap(true);
-    layout->addWidget(label);
+    layout->addWidget(askpassPromptLabel(prompt));
     auto *secret = new QLineEdit;
     secret->setEchoMode(QLineEdit::Password);
     layout->addWidget(secret);

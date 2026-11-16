@@ -1,4 +1,5 @@
 #include "profiles.h"
+#include "pasteguard.h"
 #include "terminal.h"
 #include "sftp-panel.h"
 #include "icons.h"
@@ -22,6 +23,8 @@
 #include "syncui.h"
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QUdpSocket>
+#include <QNetworkDatagram>
 #include <QtWidgets>
 #include <QJsonDocument>
 #include <QProcess>
@@ -410,6 +413,8 @@ class Window : public QMainWindow
         return QSet<QString>(saved.begin(), saved.end());
     }();
     bool expandedKnown = QSettings().contains("sessions/expanded");
+    QJsonObject copiedSettings; // "Copy settings" of a session, for "Paste settings"
+    int loginSettleMs = 5000;   // after a new password is typed, the time the server has to refuse it
     int splitMode = 1, counter = 0;
     QString lastFilter;
     ServersDialog *serversDialog = nullptr;
@@ -427,6 +432,7 @@ class Window : public QMainWindow
     }
     QJsonArray macros, recordingSteps;
     bool recording = false, playing = false;
+    QStringList macroStack; // ids of the macros being played, outermost first
     QListWidget *macroList = new QListWidget;
     QLabel *macroHint = new QLabel;
     QPushButton *recoverButton = new QPushButton, *startButton = new QPushButton;
@@ -475,6 +481,31 @@ private:
         for (int i = 0; i < strip.size(); ++i)
             strip[i]->setChecked(i == index);
         side->setCurrentIndex(index);
+    }
+
+    // The session's own icon (a PNG stored in it, "icon"), else the one of its protocol.
+    static QIcon sessionIcon(const QJsonObject &profile, const QString &fallback)
+    {
+        QPixmap own;
+        if (const auto data = profile["icon"].toString(); !data.isEmpty() && own.loadFromData(QByteArray::fromBase64(data.toLatin1()), "PNG"))
+            return QIcon(own);
+        return icon(fallback);
+    }
+
+    // An image file as a session icon: 32x32 PNG in base64, small enough to travel with the session (export, sync).
+    static QString iconFromFile(const QString &file)
+    {
+        QImageReader reader(file);
+        reader.setScaledSize(QSize(32, 32) * 4); // SVG and ICO: drawn at a useful size before scaling
+        auto image = reader.read();
+        if (image.isNull())
+            return {};
+        image = image.scaled(32, 32, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        QByteArray png;
+        QBuffer buffer(&png);
+        buffer.open(QIODevice::WriteOnly);
+        image.save(&buffer, "PNG");
+        return QString::fromLatin1(png.toBase64());
     }
 
     void addPage(Page *p, const QString &title, const QIcon &tabIcon)
@@ -648,7 +679,7 @@ private:
         // Harmless X11 notices: Windows ssh has no xauth, and servers without xauth refuse forwarding.
         t->hideOutput({"Warning: No xauth data; using fake authentication data for X11 forwarding.",
                        "X11 forwarding request failed on channel 0"});
-        t->onMousePaste = [this, t](const QString &text) { pasted(t, text); };
+        t->onUserPaste = [this, t](const QString &text) { userPaste(t, text); };
         // A crashed server or a lost network ends ssh with an error: say so in red, like MobaXterm, instead of only
         // "Session stopped". t outlives its own callback.
         const auto protocol = p->profile["protocol"].toString();
@@ -717,7 +748,7 @@ private:
             if (settings.value(key + "/monitoring", settings.value("session/last/monitoring", monitoringByDefault)).toBool())
                 QTimer::singleShot(0, p->sftp, [sftp = p->sftp] { sftp->monitoring->setChecked(true); });
         }
-        addPage(p, QString("%1. %2").arg(++counter).arg(name), icon(protocol.isEmpty() ? "shell" : protocol));
+        addPage(p, QString("%1. %2").arg(++counter).arg(name), sessionIcon(profile, protocol.isEmpty() ? "shell" : protocol));
         p->terminal->setFocus();
     }
 
@@ -1025,7 +1056,7 @@ private:
             auto *row = new QTreeWidgetItem(parent, {name});
             row->setData(0, Qt::UserRole, i);
             row->setData(0, Qt::UserRole + 1, true);
-            row->setIcon(0, icon(protocol));
+            row->setIcon(0, sessionIcon(p, protocol));
             // Names and hosts may come from an imported file: shown as text, never interpreted as HTML (images, links).
             row->setToolTip(0, Qt::convertFromPlainText(QString("%1\n%2 %3%4")
                                                             .arg(name, protocol.toUpper(), p["host"].toString(),
@@ -1064,7 +1095,7 @@ private:
             auto *row = new QTreeWidgetItem(favorites, {name});
             row->setData(0, Qt::UserRole, i);
             row->setData(0, Qt::UserRole + 1, true);
-            row->setIcon(0, icon(p["protocol"].toString()));
+            row->setIcon(0, sessionIcon(p, p["protocol"].toString()));
         }
         // Folders before sessions, both sorted alphabetically.
         std::function<void(QTreeWidgetItem *)> arrange = [&](QTreeWidgetItem *item)
@@ -1127,7 +1158,7 @@ private:
                 const auto p = profiles[i].toObject();
                 if (p["id"].toString() != id)
                     continue;
-                auto *item = new QListWidgetItem(icon(p["protocol"].toString()), p["name"].toString(), recent);
+                auto *item = new QListWidgetItem(sessionIcon(p, p["protocol"].toString()), p["name"].toString(), recent);
                 item->setData(Qt::UserRole, i);
             }
         }
@@ -1376,7 +1407,10 @@ private:
     // "Session settings" dialog: protocol row, basic settings, advanced tabs and bookmark.
     void edit(int index, const QString &folderHint = {})
     {
-        auto profile = index < 0 ? QJsonObject{{"folder", folderHint}} : profiles[index].toObject();
+        auto profile = index < 0 ? QJsonDocument::fromJson(QSettings().value("session/defaults").toByteArray()).object()
+                                 : profiles[index].toObject();
+        if (index < 0)
+            profile["folder"] = folderHint;
         QDialog editor(this);
         editor.setWindowTitle(L("Session settings"));
         auto *layout = new QVBoxLayout(&editor);
@@ -1552,6 +1586,39 @@ private:
         folder->setCurrentText(profile["folder"].toString());
         bm->addRow(L("Session name"), name);
         bm->addRow(L("Folder"), folder);
+        auto iconData = profile["icon"].toString();
+        auto *iconRow = new QHBoxLayout;
+        auto *iconView = new QLabel;
+        iconView->setFixedSize(32, 32);
+        auto *chooseIcon = new QPushButton(L("Choose image..."));
+        auto *defaultIcon = new QPushButton(L("Default"));
+        iconRow->addWidget(iconView);
+        iconRow->addWidget(chooseIcon);
+        iconRow->addWidget(defaultIcon);
+        iconRow->addStretch();
+        bm->addRow(L("Icon"), iconRow);
+        // Shows the chosen image, else the icon of the selected protocol (showIcon is set once group exists).
+        std::function<void()> showIcon;
+        connect(chooseIcon, &QPushButton::clicked, &editor,
+                [&]
+                {
+                    const auto file = QFileDialog::getOpenFileName(&editor, L("Icon"), {},
+                                                                   L("Images") + " (*.png *.ico *.bmp *.jpg *.jpeg *.svg *.gif)");
+                    if (file.isEmpty())
+                        return;
+                    const auto data = iconFromFile(file);
+                    if (data.isEmpty())
+                        QMessageBox::warning(&editor, L("Icon"), L("This file is not an image CrossTerm can read."));
+                    else
+                        iconData = data;
+                    showIcon();
+                });
+        connect(defaultIcon, &QPushButton::clicked, &editor,
+                [&]
+                {
+                    iconData.clear();
+                    showIcon();
+                });
         auto *autostart = new QCheckBox(L("Open this session when CrossTerm starts"));
         autostart->setChecked(profile["autostart"].toBool());
         bm->addRow(autostart);
@@ -1584,10 +1651,21 @@ private:
             if (resetPort)
                 port->setValue(defaultPort(protocol));
         };
-        connect(group, &QButtonGroup::idClicked, &editor, [&](int id) { select(id, true); });
+        showIcon = [&]
+        {
+            iconView->setPixmap(sessionIcon(QJsonObject{{"icon", iconData}}, protocols.value(group->checkedId(), "ssh")).pixmap(32, 32));
+            defaultIcon->setEnabled(!iconData.isEmpty());
+        };
+        connect(group, &QButtonGroup::idClicked, &editor,
+                [&](int id)
+                {
+                    select(id, true);
+                    showIcon();
+                });
         const int start = std::max(0, int(protocols.indexOf(profile["protocol"].toString("ssh"))));
         group->button(start)->setChecked(true);
         select(start, false);
+        showIcon();
 
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
         buttons->button(QDialogButtonBox::Ok)->setIcon(icon("ok", 16));
@@ -1635,6 +1713,8 @@ private:
                                     {"proxyPort", proxyPort->value()},
                                     {"autostart", autostart->isChecked()},
                                     {"favorite", profile["favorite"].toBool()}};
+                    if (!iconData.isEmpty())
+                        profile["icon"] = iconData;
                     // Validation: mosh like SSH; serial and WSL only have the port or distribution name.
                     auto check = profile;
                     if (protocol == "mosh")
@@ -1842,7 +1922,7 @@ public:
         panel->certificateTrusted = [this, id = profile["id"].toString()](const QString &fingerprint)
         { rememberFingerprint(id, "ftpFingerprint", fingerprint); };
         p->widget = panel;
-        addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), icon("ftp"));
+        addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), sessionIcon(profile, "ftp"));
         return panel;
     }
 
@@ -1879,7 +1959,7 @@ public:
         view->onCertificateTrusted = [this, id = profile["id"].toString()](const QString &fingerprint)
         { rememberFingerprint(id, "rdpFingerprint", fingerprint); };
         p->widget = view;
-        addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), icon("rdp"));
+        addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), sessionIcon(profile, "rdp"));
         view->connectToHost();
         return view;
     }
@@ -1907,7 +1987,7 @@ public:
         auto *view = new VncView(profile["host"].toString(), quint16(profile["port"].toInt(5900)), password, area);
         view->onDisconnected = [target](const QString &) { SessionSecrets::instance().forget(target); };
         p->widget = view;
-        addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), icon("vnc"));
+        addPage(p, QString("%1. %2").arg(++counter).arg(profile["name"].toString()), sessionIcon(profile, "vnc"));
         view->setFocus();
         return view;
     }
@@ -1982,12 +2062,27 @@ private:
     {
         if (i < 0 || i >= profiles.size())
             return;
-        const auto profile = profiles[i].toObject();
-        if (!profile["issues"].toArray().isEmpty())
+        if (!profiles[i].toObject()["issues"].toArray().isEmpty())
         {
             edit(i);
             return;
         }
+        openProfile(profiles[i].toObject());
+    }
+
+    // An SFTP tab with the settings of SSH session i (host, user, key, jump hosts, proxy).
+    void openSftp(int i)
+    {
+        if (i < 0 || i >= profiles.size())
+            return;
+        auto profile = profiles[i].toObject();
+        profile["protocol"] = "sftp";
+        profile["x11"] = false;
+        openProfile(profile);
+    }
+
+    void openProfile(const QJsonObject &profile)
+    {
         if (openDevice(profile))
             return;
         const bool x11 = profile["x11"].toBool() && profile["protocol"].toString() == "ssh";
@@ -2155,6 +2250,37 @@ private:
         return false;
     }
 
+    // What "Copy settings" takes from a session: everything but what makes it that session (name, place, host, its
+    // own certificates and sync state).
+    static QJsonObject sessionSettings(QJsonObject profile)
+    {
+        for (const auto *key : {"id", "name", "folder", "host", "favorite", "autostart", "conflictOf", "issues", "modified"})
+            profile.remove(key);
+        for (const auto &key : profile.keys())
+            if (key.endsWith("Fingerprint", Qt::CaseInsensitive))
+                profile.remove(key);
+        return profile;
+    }
+
+    void pasteSettings(const QList<int> &indices)
+    {
+        if (indices.isEmpty() ||
+            QMessageBox::question(this, L("Paste settings"),
+                                  L("Give %1 session(s) the protocol, port, user, key, jump hosts, proxy and other settings "
+                                    "of the copied session? Names, folders and hosts stay as they are.")
+                                      .arg(indices.size())) != QMessageBox::Yes)
+            return;
+        auto next = profiles;
+        for (const int i : indices)
+        {
+            auto profile = next[i].toObject();
+            for (auto it = copiedSettings.begin(); it != copiedSettings.end(); ++it)
+                profile[it.key()] = it.value();
+            next.replace(i, profile);
+        }
+        save(next);
+    }
+
     void duplicate(int i)
     {
         if (i < 0)
@@ -2293,6 +2419,10 @@ private:
         form->addRow(L("Terminal font"), font);
         form->addRow(L("Font size"), size);
         form->addRow(paste);
+        auto *confirmMultiline = new QCheckBox(L("Confirm before pasting several lines"));
+        confirmMultiline->setToolTip(L("Text that looks dangerous is always shown before it is pasted."));
+        confirmMultiline->setChecked(settings.value("terminal/confirmMultiline", true).toBool());
+        form->addRow(confirmMultiline);
 
         form = section(L("Connections"));
         auto *prediction = new QComboBox;
@@ -2345,8 +2475,11 @@ private:
                     if (!folder.isEmpty())
                         logFolder->setText(QDir::toNativeSeparators(folder));
                 });
+        auto *logTimes = new QCheckBox(L("Start each log line with the date and time (milliseconds)"));
+        logTimes->setChecked(settings.value("log/timestamps").toBool());
         form->addRow(logEnabled);
         form->addRow(L("Log folder"), logFolder);
+        form->addRow(logTimes);
 
         if (sync)
         {
@@ -2409,6 +2542,7 @@ private:
         settings.setValue("terminal/font", font->currentFont().family());
         settings.setValue("terminal/size", size->value());
         settings.setValue("terminal/rightPaste", paste->isChecked());
+        settings.setValue("terminal/confirmMultiline", confirmMultiline->isChecked());
         applyThemeKey(theme->currentData().toString());
         settings.setValue("mosh/prediction", prediction->currentData().toString());
         settings.setValue("sftp/parallel", parallel->value());
@@ -2420,6 +2554,7 @@ private:
         applyScheme(scheme->currentText());
         settings.setValue("log/enabled", logEnabled->isChecked());
         settings.setValue("log/folder", logFolder->text().trimmed());
+        settings.setValue("log/timestamps", logTimes->isChecked());
         for (int i = 0; i < bar->count(); ++i)
         {
             if (auto *t = page(i)->terminal)
@@ -2528,6 +2663,22 @@ private:
                        });
         menu.addSeparator();
         menu.addAction(L("Close tab"), [&] { closePage(p); });
+        // Pages collected first: closing one shifts the indices of the others.
+        auto closeWhere = [this](const std::function<bool(int, Page *)> &which)
+        {
+            QList<Page *> pages;
+            for (int i = 0; i < bar->count(); ++i)
+                if (auto *q = page(i); q && q != home && which(i, q))
+                    pages << q;
+            for (auto *q : pages)
+                if (isOpen(q))
+                    closePage(q);
+        };
+        menu.addAction(L("Close tabs to the left"), [&] { closeWhere([index](int i, Page *) { return i < index; }); })
+            ->setEnabled(index > 1);
+        menu.addAction(L("Close tabs to the right"), [&] { closeWhere([index](int i, Page *) { return i > index; }); })
+            ->setEnabled(index + 1 < bar->count());
+        menu.addAction(L("Close ended tabs"), [&] { closeWhere([](int, Page *q) { return q->state != Page::Running; }); });
         menu.addAction(L("Close all tabs except this one"), [&] { closeAll(p); });
         menu.addAction(L("Close all tabs"), [&] { closeAll(nullptr); });
         // The actions hold this page and its view: a tab closing while the menu is open closes the menu (closePage).
@@ -2545,6 +2696,9 @@ private:
             const auto sessions = selectedSessions(false).size(), all = selectedSessions(true).size();
             if (sessions)
                 menu.addAction(icon("session", 16), L("Open %1 selected session(s)").arg(sessions), [&] { openSelected(); });
+            if (sessions && !copiedSettings.isEmpty())
+                menu.addAction(L("Paste settings to %1 selected session(s)").arg(sessions),
+                               [&] { pasteSettings(selectedSessions(false)); });
             if (all)
                 menu.addAction(icon("delete", 16), L("Delete %1 selected session(s)").arg(all), [&] { removeSelected(); });
             if (!menu.isEmpty())
@@ -2561,8 +2715,13 @@ private:
         if (i >= 0)
         {
             menu.addAction(icon("session", 16), L("Execute"), [&] { open(i); });
+            if (profiles[i].toObject()["protocol"].toString() == "ssh")
+                menu.addAction(icon("sftp", 16), L("Open SFTP session"), [&] { openSftp(i); });
             menu.addAction(L("Edit session"), [&] { edit(i); });
             menu.addAction(L("Duplicate session"), [&] { duplicate(i); });
+            menu.addAction(L("Copy settings"), [&] { copiedSettings = sessionSettings(profiles[i].toObject()); });
+            menu.addAction(L("Use these settings for new sessions"),
+                           [&] { QSettings().setValue("session/defaults", QJsonDocument(sessionSettings(profiles[i].toObject())).toJson(QJsonDocument::Compact)); });
             menu.addAction(icon("star", 16),
                            profiles[i].toObject()["favorite"].toBool() ? L("Remove from favorites") : L("Add to favorites"),
                            [&] { toggleFavorite(i); });
@@ -2572,7 +2731,12 @@ private:
         const auto folder = item ? item->data(0, Qt::UserRole + 2).toString().mid(1).replace('/', '\\') : QString();
         // The Favorites view ("*favorites") is not a folder: a session created from it goes to the root.
         const auto newFolder = i >= 0 ? profiles[i].toObject()["folder"].toString() : folder.startsWith('*') ? QString() : folder;
+        if (i >= 0 && !copiedSettings.isEmpty())
+            menu.addAction(L("Paste settings"), [&] { pasteSettings({i}); });
         menu.addAction(icon("session", 16), L("New session"), [&] { edit(-1, newFolder); });
+        if (QSettings().contains("session/defaults"))
+            menu.addAction(L("Forget the settings for new sessions"), [] { QSettings().remove("session/defaults"); });
+        menu.addAction(L("Collapse all folders"), [&] { tree->collapseAll(); });
         if (i < 0 && !folderPath(folder).isEmpty() && !folder.startsWith('*'))
             menu.addAction(icon("delete", 16), L("Delete folder"), [&] { removeFolder(folder); });
         menu.addAction(L("Import from MobaXterm..."), [&] { importWizard(); });
@@ -2817,12 +2981,13 @@ private:
         auto *row = new QHBoxLayout;
         auto *add = new QPushButton(icon("plus", 16), L("New tunnel"));
         auto *change = new QPushButton(L("Edit"));
+        auto *copy = new QPushButton(L("Duplicate"));
         auto *erase = new QPushButton(icon("delete", 16), L("Delete"));
         auto *start = new QPushButton(icon("ok", 16), L("Start"));
         auto *stop = new QPushButton(L("Stop"));
         auto *startAll = new QPushButton(L("Start all"));
         auto *stopAll = new QPushButton(L("Stop all"));
-        for (auto *b : {add, change, erase, start, stop, startAll, stopAll})
+        for (auto *b : {add, change, copy, erase, start, stop, startAll, stopAll})
             row->addWidget(b);
         row->addStretch();
         layout->addLayout(row);
@@ -2881,6 +3046,25 @@ private:
                         persist();
                         if (wasRunning)
                             startTunnel(tunnel["id"].toString());
+                        fill();
+                    }
+                });
+        // The copy opens in the editor first: two tunnels on the same local port cannot both run.
+        connect(copy, &QPushButton::clicked, &dialog,
+                [=]
+                {
+                    const int index = tunnelIndex(selected());
+                    if (index < 0)
+                        return;
+                    auto tunnel = tunnels[index].toObject();
+                    tunnel.remove("id");
+                    tunnel.remove("modified");
+                    tunnel.remove("conflictOf");
+                    tunnel["name"] = L("%1 (copy)").arg(tunnel["name"].toString());
+                    if (editTunnel(tunnel))
+                    {
+                        tunnels.insert(index + 1, tunnel);
+                        persist();
                         fill();
                     }
                 });
@@ -2996,11 +3180,24 @@ private:
             return;
         // A macro started during another one's pause must not end "playing" (no recording) for the outer one.
         const bool wasPlaying = playing;
+        const auto id = macros[index].toObject()["id"].toString();
+        if (macroStack.contains(id)) // a macro that includes itself, directly or through another one
+            return;
+        macroStack << id;
         playing = true;
         QPointer<Terminal> guard(target);
         for (const auto &v : macros[index].toObject()["steps"].toArray())
         {
             const auto step = v.toObject();
+            if (step.contains("macro")) // another macro included at this point
+            {
+                for (int i = 0; i < macros.size(); ++i)
+                    if (macros[i].toObject()["id"].toString() == step["macro"].toString())
+                        playMacro(i, target);
+                if (!guard || target->finished())
+                    break;
+                continue;
+            }
             if (step.contains("sleep")) // pause step in macros imported from MobaXterm
             {
                 // exec() returns at once while the application is quitting: the rest of the macro must not be typed
@@ -3025,6 +3222,7 @@ private:
             QApplication::sendEvent(target, &key);
         }
         playing = wasPlaying;
+        macroStack.removeLast();
         if (guard) // the tab may have been closed during a pause
             target->setFocus();
     }
@@ -3112,7 +3310,8 @@ private:
             return;
         auto safe = name;
         safe.replace(QRegularExpression("[^\\w.-]+"), "_");
-        t->setLogFile(QDir(folder).filePath(QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss-zzz") + "_" + safe + ".log"));
+        t->setLogFile(QDir(folder).filePath(QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss-zzz") + "_" + safe + ".log"),
+                     settings.value("log/timestamps").toBool());
     }
 
     // --- Favorites.
@@ -3350,6 +3549,87 @@ private:
         const auto servers = detectXServers();
         if (servers.isEmpty() || !xdmcp.start(servers.first(), host.isEmpty() ? "broadcast" : "xdmcp", host))
             QMessageBox::warning(this, L("XDMCP session"), servers.isEmpty() ? L("No X server found.") : xdmcp.error());
+    }
+
+    // The saved password of target was rejected and another one typed in the terminal. A few seconds later, if the
+    // server took it (still cached: a rejected one is dropped by the next prompt, and no prompt is open), the user is
+    // asked whether it replaces the saved one.
+    void offerNewPassword(const QString &target)
+    {
+        QTimer::singleShot(
+            loginSettleMs, this,
+            [this, target]
+            {
+                auto typed = SessionSecrets::instance().get(target);
+                if (!typed)
+                    return;
+                QJsonObject profile;
+                for (int i = 0; i < bar->count() && profile.isEmpty(); ++i)
+                    if (const auto *p = page(i); p && p->terminal && !p->terminal->finished() && !p->terminal->prompting() &&
+                                                 credentialTarget(p->profile, QCoreApplication::applicationName()) == target)
+                        profile = p->profile;
+                if (profile.isEmpty() || readSecret(target) == typed)
+                    return;
+                if (QMessageBox::question(this, L("Saved password"),
+                                          L("The saved password of %1 was rejected and the one you typed was accepted. "
+                                            "Save it in place of the old one?")
+                                              .arg(profile["name"].toString())) == QMessageBox::Yes &&
+                    !storeSecret(target, profile["user"].toString(), *typed))
+                    QMessageBox::warning(this, L("Saved password"), L("The password could not be saved in the system vault."));
+                typed->fill(QChar(0));
+            });
+    }
+
+    // Sends a Wake On LAN packet; the addresses used before are offered again.
+    void wakeOnLanDialog()
+    {
+        QDialog dialog(this);
+        dialog.setWindowTitle(L("Wake On LAN"));
+        auto *form = new QFormLayout(&dialog);
+        QSettings settings;
+        auto *mac = new QComboBox;
+        mac->setEditable(true);
+        mac->addItems(settings.value("wol/macs").toStringList());
+        mac->setCurrentText(mac->count() ? mac->itemText(0) : QString());
+        mac->lineEdit()->setPlaceholderText("00:1A:2B:3C:4D:5E");
+        auto *to = new QLineEdit(settings.value("wol/address", "255.255.255.255").toString());
+        auto *port = new QSpinBox;
+        port->setRange(1, 65535);
+        port->setValue(settings.value("wol/port", 9).toInt());
+        form->addRow(L("MAC address"), mac);
+        form->addRow(L("Broadcast address"), to);
+        form->addRow(L("UDP port"), port);
+        auto *status = new QLabel;
+        form->addRow(status);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+        auto *send = buttons->addButton(L("Send"), QDialogButtonBox::ActionRole);
+        send->setDefault(true);
+        form->addRow(buttons);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        connect(send, &QPushButton::clicked, &dialog,
+                [&]
+                {
+                    const auto address = mac->currentText().trimmed();
+                    const QHostAddress host(to->text().trimmed());
+                    QString error;
+                    if (host.isNull())
+                        error = L("Enter an IP address.");
+                    else if (!sendWakeOnLan(address, host, quint16(port->value()), &error))
+                        error = error == "MAC" ? L("Enter a MAC address of 12 hexadecimal digits.") : error;
+                    style(status, error.isEmpty() ? "color: #3fb950;" : "color: #e5534b;");
+                    status->setText(error.isEmpty() ? L("Packet sent to %1.").arg(address) : error);
+                    if (!error.isEmpty())
+                        return;
+                    QSettings s;
+                    auto macs = s.value("wol/macs").toStringList();
+                    macs.removeAll(address);
+                    macs.prepend(address);
+                    s.setValue("wol/macs", macs.mid(0, 20));
+                    s.setValue("wol/address", host.toString());
+                    s.setValue("wol/port", port->value());
+                });
+        dialog.resize(380, dialog.sizeHint().height());
+        dialog.exec();
     }
 
     void retryLogins()
@@ -3892,6 +4172,110 @@ protected:
             recordingSteps.append(QJsonObject{{"key", 0}, {"modifiers", 0}, {"text", text}});
     }
 
+    // A paste the user made in t (shortcut, mouse or menu): risky or multi-line text is shown first; then pasted,
+    // replicated and recorded.
+    void userPaste(Terminal *t, const QString &clipboard)
+    {
+        QPointer<Terminal> guard(t);
+        const auto text = confirmPaste(clipboard, t);
+        if (!text || text->isEmpty() || !guard || t->finished())
+            return;
+        t->paste(*text);
+        pasted(t, *text);
+    }
+
+    // The text to paste, as the user accepted or edited it; nullopt when cancelled. Text with nothing risky and a
+    // single line (or several, with the setting off) is returned as it is, without asking.
+    std::optional<QString> confirmPaste(const QString &text, QWidget *from)
+    {
+        const auto risks = pasteRisks(text);
+        const int lines = pasteLineCount(text);
+        if (risks.isEmpty() && (lines == 1 || !QSettings().value("terminal/confirmMultiline", true).toBool()))
+            return text;
+        QDialog dialog(from ? from->window() : this);
+        dialog.setWindowTitle(L("Confirm paste"));
+        auto *layout = new QVBoxLayout(&dialog);
+        QStringList reasons;
+        bool invisible = false;
+        for (const auto &r : risks)
+        {
+            const auto where = L("Line %1").arg(r.line) + ": ";
+            switch (r.kind)
+            {
+            case PasteRisk::PipeToShell:
+                reasons << where + L("a downloaded script is run directly (%1)").arg(r.detail);
+                break;
+            case PasteRisk::Profile:
+                reasons << where + L("writes to a startup or access file (%1)").arg(r.detail);
+                break;
+            case PasteRisk::UnpackRoot:
+                reasons << where + L("extracts an archive into the root folder (%1)").arg(r.detail);
+                break;
+            case PasteRisk::Homograph:
+                reasons << where + L("\"%1\" mixes Latin letters with look-alike letters of another alphabet").arg(r.detail);
+                break;
+            case PasteRisk::Invisible:
+                invisible = true;
+                reasons << where + L("%1 invisible or unusual space character(s)").arg(r.detail);
+                break;
+            }
+        }
+        if (!risks.isEmpty())
+        {
+            auto *warning = new QLabel(L("This text may be dangerous:"));
+            style(warning, "color: #e8b04a;");
+            layout->addWidget(warning);
+            auto *list = new QLabel("• " + reasons.join("\n• "));
+            list->setTextFormat(Qt::PlainText);
+            list->setWordWrap(true);
+            layout->addWidget(list);
+        }
+        auto *edit = new QPlainTextEdit(text);
+        edit->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        edit->setLineWrapMode(QPlainTextEdit::NoWrap);
+        // Characters a reader cannot see, and look-alike letters, marked in red.
+        auto mark = [edit]
+        {
+            QList<QTextEdit::ExtraSelection> marks;
+            const auto content = edit->toPlainText();
+            for (int i = 0; i < content.size(); ++i)
+            {
+                if (!pasteInvisible(content[i]) && !pasteLookalike(content[i]))
+                    continue;
+                QTextEdit::ExtraSelection m;
+                m.cursor = QTextCursor(edit->document());
+                m.cursor.setPosition(i);
+                m.cursor.setPosition(i + 1, QTextCursor::KeepAnchor);
+                m.format.setBackground(QColor("#b03030"));
+                m.format.setForeground(Qt::white);
+                marks << m;
+            }
+            edit->setExtraSelections(marks);
+        };
+        mark();
+        connect(edit, &QPlainTextEdit::textChanged, &dialog, mark);
+        layout->addWidget(edit, 1);
+        auto *count = new QLabel(L("%1 lines. You can edit the text before pasting.").arg(lines));
+        count->setObjectName("empty");
+        layout->addWidget(count);
+        auto *buttons = new QDialogButtonBox;
+        auto *paste = buttons->addButton(L("Paste"), QDialogButtonBox::AcceptRole);
+        buttons->addButton(QDialogButtonBox::Cancel);
+        if (invisible)
+            connect(buttons->addButton(L("Remove invisible characters"), QDialogButtonBox::ActionRole), &QPushButton::clicked,
+                    &dialog, [edit] { edit->setPlainText(pasteCleaned(edit->toPlainText())); });
+        layout->addWidget(buttons);
+        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        // Return accepts: the focus starts on Paste, not in the text.
+        paste->setDefault(true);
+        paste->setFocus();
+        dialog.resize(640, 360);
+        if (dialog.exec() != QDialog::Accepted)
+            return std::nullopt;
+        return edit->toPlainText();
+    }
+
     // A paste made with the mouse or the menu in source: like typed keys, it goes to the other terminals with
     // MultiExec (a paste on one server followed by Return on all would run different commands) and into the macro
     // being recorded.
@@ -3927,16 +4311,16 @@ protected:
         if (recording && !playing && sessionKey)
         {
             const auto *key = static_cast<QKeyEvent *>(event);
-            // A paste is recorded as its text: replaying the shortcut would paste whatever the clipboard holds then.
-            if (Terminal::isPasteKey(key))
-                recordPaste(QApplication::clipboard()->text());
-            else if (key->key() < Qt::Key_Shift || key->key() > Qt::Key_Alt)
+            // A paste is recorded as its text by userPaste: replaying the shortcut would paste whatever the clipboard
+            // holds then.
+            if (!Terminal::isPasteKey(key) && (key->key() < Qt::Key_Shift || key->key() > Qt::Key_Alt))
                 recordingSteps.append(QJsonObject{{"key", key->key()},
                                                   {"modifiers", logicalModifiers(int(key->modifiers()))},
                                                   {"text", key->text()},
                                                   {"logical", true}});
         }
-        if (multiExec && sessionKey)
+        // A paste shortcut is not replicated as a key: userPaste confirms the text once and pastes it everywhere.
+        if (multiExec && sessionKey && !Terminal::isPasteKey(static_cast<QKeyEvent *>(event)))
         {
             const auto *key = static_cast<QKeyEvent *>(event);
             forwarding = true;
@@ -4057,6 +4441,295 @@ public:
             shot("15-monitor-bar.png", &sample);
             check(sample.findChildren<QFrame *>("monitorCell").size() == 11, "monitoring bar has its eleven cells");
         }
+        // --- Features that need no server: paste guard, tab and session menus, settings copy, macros, icons, Wake On
+        // LAN, log times. Local terminals only.
+        {
+            // Runs act on the first modal dialog that opens while start() runs (start opens it with exec()).
+            auto onModal = [&](const std::function<void()> &start, const std::function<void(QWidget *)> &act)
+            {
+                bool seen = false;
+                QTimer poll;
+                connect(&poll, &QTimer::timeout, this,
+                        [&]
+                        {
+                            if (auto *w = QApplication::activeModalWidget(); w && !seen)
+                            {
+                                seen = true;
+                                poll.stop();
+                                act(w);
+                            }
+                        });
+                poll.start(100);
+                start();
+                poll.stop();
+                return seen;
+            };
+            auto clickButton = [](QWidget *w, const QString &text)
+            {
+                for (auto *b : w->findChildren<QAbstractButton *>())
+                    if (b->text() == text)
+                        return b->click(), true;
+                return false;
+            };
+            QSettings().setValue("log/enabled", true);
+            QSettings().setValue("log/timestamps", true);
+            QTemporaryDir logs;
+            QSettings().setValue("log/folder", logs.path());
+            terminal(localShell(), "Guard");
+            auto *g = current();
+            QSettings().setValue("log/enabled", false);
+            check(wait(15000, [&] { return g->terminal->contents().contains(">") || g->terminal->contents().contains("$"); }),
+                  "local terminal for the paste checks");
+            // Risky text: the dialog lists the reasons; Cancel pastes nothing.
+            const auto risky = QString::fromUtf8("curl -s http://127.0.0.1:9/GUARD1 | sh\necho p\u0430ypal");
+            QString reasons;
+            bool cancelled = onModal([&] { userPaste(g->terminal, risky); },
+                                     [&](QWidget *w)
+                                     {
+                                         for (auto *l : w->findChildren<QLabel *>())
+                                             reasons += l->text() + "\n";
+                                         w->resize(640, 360);
+                                         shot("40-paste-confirm.png", w);
+                                         static_cast<QDialog *>(w)->reject();
+                                     });
+            check(cancelled && reasons.contains(L("Line %1").arg(1)) && reasons.contains(L("Line %1").arg(2)),
+                  "risky paste: confirmation lists the pipe to a shell and the look-alike letters");
+            wait(500, [] { return false; });
+            check(!g->terminal->contents().contains("GUARD1"), "cancelled paste sends nothing");
+            // Return accepts it as edited.
+            onModal([&] { userPaste(g->terminal, "curl -s http://127.0.0.1:9/GUARD1 | sh"); },
+                    [&](QWidget *w)
+                    {
+                        if (auto *edit = w->findChild<QPlainTextEdit *>())
+                            edit->setPlainText("echo GUARD2");
+                        QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+                        QApplication::sendEvent(QApplication::focusWidget() ? QApplication::focusWidget() : w, &enter);
+                    });
+            check(wait(5000, [&] { return g->terminal->contents().contains("GUARD2"); }),
+                  "Return pastes the text as edited in the confirmation");
+            // A single safe line goes straight in.
+            const bool asked = onModal([&] { userPaste(g->terminal, "echo GUARD3"); }, [](QWidget *w) { w->close(); });
+            g->terminal->paste("\r");
+            check(!asked && wait(5000, [&] { return g->terminal->contents().contains("GUARD3"); }), "safe single line pasted without asking");
+            // Log lines start with their time.
+            closePage(g);
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete); // the log is completed on deletion
+            wait(5000,
+                 [&]
+                 {
+                     for (const auto &f : QDir(logs.path()).entryList({"*.log"}))
+                         if (QFile file(logs.filePath(f)); file.open(QIODevice::ReadOnly) && file.readAll().contains("GUARD3"))
+                             return true;
+                     return false;
+                 });
+            QString logText;
+            for (const auto &f : QDir(logs.path()).entryList({"*.log"}))
+            {
+                QFile file(logs.filePath(f));
+                if (file.open(QIODevice::ReadOnly))
+                    logText += QString::fromUtf8(file.readAll());
+            }
+            static const QRegularExpression stamped("^\\[\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\.\\d{3}\\] .*GUARD3",
+                                                    QRegularExpression::MultilineOption);
+            check(stamped.match(logText).hasMatch(), "log lines start with date and time in milliseconds");
+            if (!stamped.match(logText).hasMatch())
+                log << "log was: " + logText.left(600);
+            QSettings().setValue("log/timestamps", false);
+
+            // Tabs: close to the left / right / ended.
+            QList<Page *> made;
+            for (const auto *name : {"T1", "T2", "T3", "T4"})
+            {
+                terminal(localShell(), name);
+                made << current();
+            }
+            const auto indexOf = [&](Page *q)
+            {
+                for (int i = 0; i < bar->count(); ++i)
+                    if (page(i) == q)
+                        return i;
+                return -1;
+            };
+            auto menuAction = [&](const QString &text, const QString &screenshot)
+            {
+                QTimer::singleShot(300, this,
+                                   [&, text, screenshot]
+                                   {
+                                       auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+                                       if (!menu)
+                                           return;
+                                       if (!screenshot.isEmpty())
+                                           shot(screenshot, menu);
+                                       for (auto *a : menu->actions())
+                                           if (a->text() == text && a->isEnabled())
+                                               return a->trigger(), void(menu->close());
+                                       menu->close();
+                                   });
+            };
+            menuAction(L("Close tabs to the left"), "41-tab-menu.png");
+            tabMenu(bar->tabRect(indexOf(made[2])).center());
+            wait(1000, [] { return false; });
+            check(!isOpen(made[0]) && !isOpen(made[1]) && isOpen(made[2]) && isOpen(made[3]), "Close tabs to the left");
+            menuAction(L("Close tabs to the right"), {});
+            tabMenu(bar->tabRect(indexOf(made[2])).center());
+            wait(1000, [] { return false; });
+            check(isOpen(made[2]) && !isOpen(made[3]), "Close tabs to the right");
+            made[2]->terminal->paste("exit\r");
+            wait(10000, [&] { return made[2]->state != Page::Running; });
+            terminal(localShell(), "T5");
+            auto *alive = current();
+            menuAction(L("Close ended tabs"), {});
+            tabMenu(bar->tabRect(indexOf(alive)).center());
+            wait(1000, [] { return false; });
+            check(!isOpen(made[2]) && isOpen(alive), "Close ended tabs keeps the running one");
+            closePage(alive);
+
+            // Sessions: copy and paste settings, defaults for new sessions, tree menu.
+            const auto saved = profiles;
+            auto next = profiles;
+            next.append(QJsonObject{{"id", "e2e-a"}, {"name", "e2e-a"}, {"protocol", "ssh"}, {"host", "a.example"}, {"port", 2200},
+                                    {"user", "alice"}, {"compression", true}, {"folder", "E2E"}});
+            next.append(QJsonObject{{"id", "e2e-b"}, {"name", "e2e-b"}, {"protocol", "telnet"}, {"host", "b.example"}, {"port", 23},
+                                    {"folder", "E2E"}});
+            save(next);
+            copiedSettings = sessionSettings(profileById("e2e-a"));
+            int b = -1;
+            for (int i = 0; i < profiles.size(); ++i)
+                if (profiles[i].toObject()["id"] == "e2e-b")
+                    b = i;
+            QTimer yes;
+            connect(&yes, &QTimer::timeout, this,
+                    []
+                    {
+                        if (auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget()))
+                            box->button(QMessageBox::Yes) ? box->button(QMessageBox::Yes)->click() : void();
+                    });
+            yes.start(100);
+            pasteSettings({b});
+            yes.stop();
+            const auto pastedTo = profileById("e2e-b");
+            check(pastedTo["protocol"] == "ssh" && pastedTo["port"] == 2200 && pastedTo["user"] == "alice" &&
+                      pastedTo["compression"] == true && pastedTo["host"] == "b.example" && pastedTo["name"] == "e2e-b",
+                  "Paste settings copies the settings and keeps name and host");
+            for (QTreeWidgetItemIterator it(tree); *it; ++it)
+                if ((*it)->text(0) == "e2e-a")
+                {
+                    tree->scrollToItem(*it);
+                    tree->setCurrentItem(*it);
+                    menuAction({}, "42-tree-menu.png"); // screenshot only
+                    treeMenu(tree->visualItemRect(*it).center());
+                    break;
+                }
+            tree->expandAll();
+            menuAction(L("Collapse all folders"), {});
+            treeMenu(QPoint(5, tree->viewport()->height() - 5));
+            bool anyExpanded = false;
+            for (QTreeWidgetItemIterator it(tree); *it; ++it)
+                anyExpanded |= (*it)->childCount() > 0 && (*it)->isExpanded();
+            check(!anyExpanded, "Collapse all folders");
+            QSettings().setValue("session/defaults", QJsonDocument(sessionSettings(profileById("e2e-a"))).toJson());
+            // A new session starts from the defaults; its editor shows the icon row.
+            QString port;
+            onModal([&] { edit(-1); },
+                    [&](QWidget *w)
+                    {
+                        if (auto *tabs = w->findChild<QTabWidget *>())
+                            tabs->setCurrentIndex(tabs->count() - 1);
+                        for (auto *spin : w->findChildren<QSpinBox *>())
+                            if (spin->maximum() == 65535 && port.isEmpty())
+                                port = QString::number(spin->value());
+                        w->resize(640, w->sizeHint().height());
+                        shot("43-session-icon.png", w);
+                        static_cast<QDialog *>(w)->reject();
+                    });
+            check(port == "2200", "new session starts from the saved defaults");
+            QSettings().remove("session/defaults");
+            // Own icon: stored as PNG and shown in the tree.
+            QImage red(48, 48, QImage::Format_ARGB32);
+            red.fill(Qt::red);
+            red.save(logs.filePath("icon.png"));
+            auto withIcon = profileById("e2e-a");
+            withIcon["icon"] = iconFromFile(logs.filePath("icon.png"));
+            next = profiles;
+            for (int i = 0; i < next.size(); ++i)
+                if (next[i].toObject()["id"] == "e2e-a")
+                    next.replace(i, withIcon);
+            save(next);
+            bool redIcon = false;
+            for (QTreeWidgetItemIterator it(tree); *it; ++it)
+                if ((*it)->text(0) == "e2e-a")
+                    redIcon = (*it)->icon(0).pixmap(16, 16).toImage().pixelColor(8, 8) == QColor(Qt::red);
+            check(!withIcon["icon"].toString().isEmpty() && redIcon, "session icon from an image file, shown in the tree");
+            save(saved);
+
+            // Macros: one appended into another is played inside it, once even if it includes itself.
+            const auto savedMacros = macros;
+            macros = {};
+            macros.append(QJsonObject{{"id", "m-inner"}, {"name", "inner"},
+                                      {"steps", QJsonArray{QJsonObject{{"key", 0}, {"modifiers", 0}, {"text", "INNER"}}}}});
+            macros.append(QJsonObject{{"id", "m-outer"}, {"name", "outer"},
+                                      {"steps", QJsonArray{QJsonObject{{"key", 0}, {"modifiers", 0}, {"text", "echo OUTER"}},
+                                                           QJsonObject{{"macro", "m-inner"}}, QJsonObject{{"macro", "m-outer"}},
+                                                           QJsonObject{{"key", int(Qt::Key_Return)}, {"modifiers", 0}, {"text", ""}}}}});
+            terminal(localShell(), "Macro");
+            auto *m = current();
+            wait(15000, [&] { return m->terminal->contents().contains(">") || m->terminal->contents().contains("$"); });
+            playMacro(1, m->terminal);
+            check(wait(5000, [&] { return m->terminal->contents().contains("OUTERINNER"); }) &&
+                      m->terminal->contents().count("INNER") <= 2,
+                  "a macro plays the macro appended to it, and does not loop into itself");
+            closePage(m);
+            macros = savedMacros;
+
+            // Tunnels dialog with Duplicate; Wake On LAN to a local socket.
+            const auto savedTunnels = tunnels;
+            onModal([&] { tunnelDialog(); },
+                    [&](QWidget *w)
+                    {
+                        if (auto *list = w->findChild<QTreeWidget *>(); list && list->topLevelItemCount())
+                            list->setCurrentItem(list->topLevelItem(0));
+                        shot("44-tunnels.png", w);
+                        // The copy opens in the tunnel editor: OK there.
+                        QTimer ok;
+                        connect(&ok, &QTimer::timeout, this,
+                                [&]
+                                {
+                                    auto *editor = QApplication::activeModalWidget();
+                                    if (editor && editor != w)
+                                        if (auto *box = editor->findChild<QDialogButtonBox *>(); box && box->button(QDialogButtonBox::Ok))
+                                            box->button(QDialogButtonBox::Ok)->click();
+                                });
+                        ok.start(200);
+                        clickButton(w, L("Duplicate"));
+                        ok.stop();
+                        static_cast<QDialog *>(w)->reject();
+                    });
+            check(tunnels.size() == savedTunnels.size() + 1 &&
+                      tunnels.last().toObject()["name"] == L("%1 (copy)").arg(savedTunnels.first().toObject()["name"].toString()) &&
+                      tunnels.last().toObject()["id"] != savedTunnels.first().toObject()["id"],
+                  "Duplicate tunnel: a copy with its own id, edited before it is added");
+            tunnels = savedTunnels;
+            save(profiles);
+            QUdpSocket wol;
+            wol.bind(QHostAddress::LocalHost, 0);
+            QSettings().setValue("wol/address", "127.0.0.1");
+            QSettings().setValue("wol/port", wol.localPort());
+            onModal([&] { wakeOnLanDialog(); },
+                    [&](QWidget *w)
+                    {
+                        if (auto *combo = w->findChild<QComboBox *>())
+                            combo->setCurrentText("00:1A:2B:3C:4D:5E");
+                        clickButton(w, L("Send"));
+                        wait(1000, [&] { return wol.hasPendingDatagrams(); });
+                        shot("45-wake-on-lan.png", w);
+                        static_cast<QDialog *>(w)->reject();
+                    });
+            check(wol.hasPendingDatagrams() && wol.receiveDatagram().data().size() == 102, "Wake On LAN packet sent");
+            QSettings().remove("wol/address");
+            QSettings().remove("wol/port");
+            QSettings().remove("wol/macs");
+        }
+
         open(0);
         auto *p = current();
         check(p != home && p->terminal && p->sftp, "SSH tab opens with terminal and SFTP panel");
@@ -5368,6 +6041,11 @@ public:
             if (window)
                 window->retryLogins();
         };
+        SessionSecrets::instance().offered = [window = QPointer<Window>(this)](const QString &target)
+        {
+            if (window)
+                window->offerNewPassword(target);
+        };
         SessionSecrets::instance().ask = [window = QPointer<Window>(this)](const QString &id, const QString &prompt, bool echo,
                                                                            std::function<void(std::optional<QString>)> answer)
         {
@@ -5514,9 +6192,7 @@ public:
                          t->paste(QApplication::clipboard()->text()); // password prompt: this terminal only
                      return;
                  }
-                 const auto text = QApplication::clipboard()->text();
-                 t->paste(text);
-                 pasted(t, text);
+                 userPaste(t, QApplication::clipboard()->text());
              });
         terminalMenu->addSeparator();
         item(terminalMenu, N("Exit"), [this] { close(); }, "exit");
@@ -5592,6 +6268,7 @@ public:
                  scanner->setAttribute(Qt::WA_DeleteOnClose);
                  scanner->show();
              });
+        item(toolsMenu, N("Wake On LAN..."), [this] { wakeOnLanDialog(); });
         item(settingsMenu, N("Configuration"), [this] { settingsDialog(); }, "settings");
         auto *languageMenu = new QMenu(this);
         texts.bind(languageMenu, &QMenu::setTitle, N("Language"));
@@ -5791,6 +6468,21 @@ public:
                                        save(profiles);
                                        refreshMacros();
                                    });
+                    // Steps that play another macro: a login macro can be reused at the start of others.
+                    auto *include = menu.addMenu(L("Append another macro"));
+                    for (int other = 0; other < macros.size(); ++other)
+                        if (other != row)
+                            include->addAction(conflictName(macros[other].toObject()),
+                                               [this, row, other]
+                                               {
+                                                   auto macro = macros[row].toObject();
+                                                   auto steps = macro["steps"].toArray();
+                                                   steps.append(QJsonObject{{"macro", macros[other].toObject()["id"].toString()}});
+                                                   macro["steps"] = steps;
+                                                   macros.replace(row, macro);
+                                                   save(profiles);
+                                               });
+                    include->setEnabled(macros.size() > 1);
                     menu.addAction(icon("delete", 16), L("Delete"),
                                    [&]
                                    {

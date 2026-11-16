@@ -1,4 +1,5 @@
 #include "servers.h"
+#include <QRegularExpression>
 #include <algorithm>
 #include <QCheckBox>
 #include <QCoreApplication>
@@ -35,6 +36,37 @@ QString ui(const char *text)
     return QCoreApplication::translate("CrossTerm", text);
 }
 } // namespace
+
+QByteArray wakeOnLanPacket(const QString &mac)
+{
+    auto hex = mac.trimmed();
+    static const QRegularExpression format("^[0-9A-Fa-f]{2}([:.-]?[0-9A-Fa-f]{2}){5}$|^([0-9A-Fa-f]{4}\\.){2}[0-9A-Fa-f]{4}$");
+    if (!format.match(hex).hasMatch())
+        return {};
+    hex.remove(QRegularExpression("[:.-]"));
+    const auto address = QByteArray::fromHex(hex.toLatin1());
+    QByteArray packet(6, char(0xFF));
+    for (int i = 0; i < 16; ++i)
+        packet += address;
+    return packet;
+}
+
+bool sendWakeOnLan(const QString &mac, const QHostAddress &to, quint16 port, QString *error)
+{
+    const auto packet = wakeOnLanPacket(mac);
+    if (packet.isEmpty())
+    {
+        if (error)
+            *error = "MAC";
+        return false;
+    }
+    QUdpSocket socket;
+    if (socket.writeDatagram(packet, to, port) == packet.size())
+        return true;
+    if (error)
+        *error = socket.errorString();
+    return false;
+}
 
 QString jailedPath(const QString &root, const QString &relative)
 {
