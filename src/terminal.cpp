@@ -1765,6 +1765,15 @@ void Terminal::wheelEvent(QWheelEvent *event)
     pending += event->angleDelta().y();
     const int lines = pending / 40;
     pending %= 40;
+    // Full-screen programs (nano, vim, less, htop: the alternate screen, which has no scrollback): the wheel sends
+    // arrow keys instead, as xterm's alternate scroll does. vterm_keyboard_key follows the cursor key mode.
+    if (state->alternate)
+    {
+        for (int i = 0; i < std::abs(lines); ++i)
+            vterm_keyboard_key(state->vt, lines > 0 ? VTERM_KEY_UP : VTERM_KEY_DOWN, VTERM_MOD_NONE);
+        event->accept();
+        return;
+    }
     state->offset = std::clamp(state->offset + lines, 0, int(state->scrollback.size()));
     hoverLink({-1, -1}, false); // another row is under the mouse now
     update();

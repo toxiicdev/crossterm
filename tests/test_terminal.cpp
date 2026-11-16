@@ -6,6 +6,7 @@
 #include <QFontMetrics>
 #include <QImage>
 #include <QPixmap>
+#include <QWheelEvent>
 
 #define CHECK(expression)                                                                                                        \
     if (!(expression))                                                                                                           \
@@ -174,6 +175,35 @@ int main(int argc, char **argv)
         tabDevice->feed("Linux motd\r\n");
         QApplication::processEvents();
         CHECK(tab.contents().startsWith("banner 1") && tab.contents().contains("Linux motd") && tabDevice->rows == 30)
+    }
+
+    // Mouse wheel: scrollback on the normal screen, arrow keys in full-screen programs (alternate screen).
+    {
+        auto *wheelDevice = new FakeDevice;
+        Terminal wheel(wheelDevice);
+        wheel.setAttribute(Qt::WA_ShowWithoutActivating);
+        wheel.show();
+        setGrid(wheel, 40, 10);
+        auto spin = [&](int delta)
+        {
+            QWheelEvent event(QPointF(10, 10), wheel.mapToGlobal(QPointF(10, 10)), {}, {0, delta}, Qt::NoButton,
+                              Qt::NoModifier, Qt::NoScrollPhase, false);
+            QApplication::sendEvent(&wheel, &event);
+        };
+        wheelDevice->written.clear();
+        spin(120);
+        CHECK(wheelDevice->written.isEmpty())
+        wheelDevice->feed("\x1b[?1049h"); // nano, vim, less: alternate screen
+        spin(120);
+        CHECK(wheelDevice->written == "\x1b[A\x1b[A\x1b[A")
+        wheelDevice->written.clear();
+        wheelDevice->feed("\x1b[?1h"); // application cursor keys
+        spin(-120);
+        CHECK(wheelDevice->written == "\x1bOB\x1bOB\x1bOB")
+        wheelDevice->feed("\x1b[?1049l");
+        wheelDevice->written.clear();
+        spin(-120);
+        CHECK(wheelDevice->written.isEmpty())
     }
 
     // Process on a pseudo terminal: TERM describes this emulator (Windows sets none, so ssh sent none to the server).
