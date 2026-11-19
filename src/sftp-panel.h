@@ -654,6 +654,18 @@ class SftpPanel : public QWidget
         }
         return names;
     }
+    // Selected files (not folders) with their sizes; only the clicked one when it is not part of the selection.
+    QList<QPair<QString, qint64>> selectedFiles(QTreeWidgetItem *clicked) const
+    {
+        const auto file = [](QTreeWidgetItem *i) { return qMakePair(i->text(0), i->data(0, Qt::UserRole + 1).toLongLong()); };
+        if (!clicked->isSelected())
+            return {file(clicked)};
+        QList<QPair<QString, qint64>> chosen;
+        for (auto *item : files->selectedItems())
+            if (item->text(0) != ".." && !item->data(0, Qt::UserRole).toBool())
+                chosen << file(item);
+        return chosen;
+    }
     bool isDir(const QString &name) const
     {
         for (int i = 0; i < files->topLevelItemCount(); ++i)
@@ -2747,10 +2759,16 @@ public:
                     QMenu menu(this);
                     if (!dir)
                     {
-                        menu.addAction(icon("open", 16), L("Open"), [=] { openRemote(name, size, 0, directory); });
-                        menu.addAction(icon("edit", 16), L("Open with default text editor"),
-                                       [=] { openRemote(name, size, 2, directory); });
-                        menu.addAction(icon("openwith", 16), L("Open with..."), [=] { openRemote(name, size, 1, directory); });
+                        // Every selected file, not only the one clicked.
+                        const auto chosenFiles = selectedFiles(item);
+                        const auto open = [this, chosenFiles, directory](int mode)
+                        {
+                            for (const auto &f : chosenFiles)
+                                openRemote(f.first, f.second, mode, directory);
+                        };
+                        menu.addAction(icon("open", 16), L("Open"), [=] { open(0); });
+                        menu.addAction(icon("edit", 16), L("Open with default text editor"), [=] { open(2); });
+                        menu.addAction(icon("openwith", 16), L("Open with..."), [=] { open(1); });
                     }
                     else
                         menu.addAction(icon("folder", 16), L("Open"), [=] { run(remotePath); });
@@ -2835,8 +2853,10 @@ public:
                         run(join(name));
                         return;
                     }
-                    // Open with the default editor; saves are uploaded back to the server.
-                    openRemote(name, item->data(0, Qt::UserRole + 1).toLongLong());
+                    // Open with the default editor (every selected file, Enter on a selection); saves are uploaded
+                    // back to the server.
+                    for (const auto &f : selectedFiles(item))
+                        openRemote(f.first, f.second);
                 });
 
         texts.text(monitoring, N("Remote monitoring"));

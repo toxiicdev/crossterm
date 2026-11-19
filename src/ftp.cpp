@@ -1570,6 +1570,17 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
                     return browse(join(name));
                 if (!entry)
                     return;
+                // Every selected file (Enter on a selection), only the activated one when it is not selected.
+                QStringList names{name};
+                if (item->isSelected())
+                {
+                    names.clear();
+                    for (auto *selected : files->selectedItems())
+                        if (const auto *e = find(selected->text(0)); e && !e->dir && !e->link)
+                            names << e->name;
+                }
+                for (const auto &name : names)
+                {
                 if (!safeName(name)) // from the server: it would escape the temporary folder
                     return status->setText(ui("Unsafe file name from the server: %1").arg(name));
                 // Open with the default application from a temporary copy (no reload): a private folder of this panel
@@ -1588,6 +1599,7 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
                                   else
                                       QDesktopServices::openUrl(QUrl::fromLocalFile(local));
                               });
+                }
             });
 
     // Transfer queue.
