@@ -106,6 +106,16 @@ int main(int argc, char **argv)
             };
             if (r.path == "/raw/x")
                 return {200, content, {}};
+            // The account's gists: an unrelated newer one, and the sync gist once created.
+            if (r.method == "GET" && (r.path == "/gists" || r.path.startsWith("/gists?")))
+            {
+                QJsonArray list{QJsonObject{{"id", "other"}, {"created_at", "2030-01-01T00:00:00Z"},
+                                            {"files", QJsonObject{{"notes.txt", QJsonObject{}}}}}};
+                if (exists)
+                    list.append(QJsonObject{{"id", "g1"}, {"created_at", "2026-01-01T00:00:00Z"},
+                                            {"files", QJsonObject{{FileName, QJsonObject{}}}}});
+                return {200, QJsonDocument(list).toJson(), {}};
+            }
             if (r.method == "POST" && r.path == "/gists")
             {
                 const auto body = QJsonDocument::fromJson(r.body).object();
@@ -129,6 +139,10 @@ int main(int argc, char **argv)
         CHECK(await([&](Done d) { gist->read(d); }).status == Result::NotFound)
         const auto created = await([&](Done d) { gist->write("version 1", {}, d); });
         CHECK(created.status == Result::Ok && created.updated["gist"] == "g1")
+        // A second device with the same token and no id finds that gist (and saves its id) instead of making its own.
+        auto joining = create(QJsonObject{{"type", "gist"}, {"token", "tok"}, {"api", server.base()}});
+        const auto found = await([&](Done d) { joining->read(d); });
+        CHECK(found.status == Result::Ok && found.data == "version 1" && found.updated["gist"] == "g1")
         // From here as a device that saved the id.
         gist = create(QJsonObject{{"type", "gist"}, {"token", "tok"}, {"api", server.base()}, {"gist", "g1"}});
         const auto read = await([&](Done d) { gist->read(d); });

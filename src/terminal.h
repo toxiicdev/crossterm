@@ -111,6 +111,7 @@ protected:
 
 private:
     void userPaste(const QString &text);
+    bool mouseReport(const QPointF &position, Qt::KeyboardModifiers modifiers, int button, bool pressed);
     struct State;
     std::unique_ptr<State> state;
     void setup();

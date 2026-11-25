@@ -3055,14 +3055,29 @@ public:
                                        // The current mode as the starting value: a confirmed default must not drop
                                        // setuid, setgid or sticky.
                                        const bool shellTools = has("chown") && has("find");
-                                       const auto initial = sftpOctalMode(access);
-                                       const auto chosen = sftpPermissionsDialog(this, remotePath, initial, owner, group,
-                                                                                 shellTools, dir);
-                                       // OK without changes does nothing: Windows' sftp lists group and other rights
-                                       // as '*', read as 0, and chmod with them would take those rights away.
-                                       if (chosen && (chosen->mode != initial || chosen->owner != owner ||
-                                                      chosen->group != group || chosen->recurse))
-                                           applyPermissions(remotePath, *chosen, owner, group);
+                                       auto ask = [this, remotePath, dir, owner, group, shellTools](const QString &initial)
+                                       {
+                                           const auto chosen = sftpPermissionsDialog(this, remotePath, initial, owner, group,
+                                                                                     shellTools, dir);
+                                           // OK without changes does nothing (a mode read wrong is not written back).
+                                           if (chosen && (chosen->mode != initial || chosen->owner != owner ||
+                                                          chosen->group != group || chosen->recurse))
+                                               applyPermissions(remotePath, *chosen, owner, group);
+                                       };
+                                       // Windows' sftp lists group and other rights as '*': the real mode from the
+                                       // server (GNU, then BSD stat), or a change would take those rights away.
+                                       const auto quoted = posixQuote(remotePath);
+                                       if (!access.contains('*') || quoted.isEmpty() ||
+                                           !runShell("stat -c %a -- " + quoted + " 2>/dev/null || stat -f %Lp -- " + quoted,
+                                                     true,
+                                                     [ask, access](int code, const QString &out, const QString &)
+                                                     {
+                                                         static const QRegularExpression mode("^[0-7]{3,4}$");
+                                                         const auto real = out.trimmed();
+                                                         ask(code == 0 && mode.match(real).hasMatch() ? real
+                                                                                                      : sftpOctalMode(access));
+                                                     }))
+                                           ask(sftpOctalMode(access));
                                    });
                     menu.exec(files->viewport()->mapToGlobal(at));
                 });

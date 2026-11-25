@@ -297,6 +297,8 @@ struct Terminal::State
     std::deque<Line> scrollback;
     int offset = 0;
     bool alternate = false, popping = true, joinTop = false;
+    int mouse = VTERM_PROP_MOUSE_NONE; // mouse tracking asked by the program
+    int mouseWheel = 0;                // wheel delta for the program, sent per notch
     int pushed = 0;           // lines pushed to the scrollback during the last vterm_set_size
     std::vector<bool> popped; // continuation flags of lines popped back onto the screen during the last vterm_set_size
     int logged = 0;           // lines at the top of the screen already written to the log (popped from the scrollback)
@@ -502,8 +504,11 @@ struct Terminal::State
     void resize(int newRows, int newCols)
     {
         auto *state = vterm_obtain_state(vt);
+        // mosh-server redraws the whole screen (clear first) at every new size: lines pulled back from the scrollback
+        // would be erased with it and lost from both. With mosh the scrollback stays where it is.
+        const bool pull = !mosh;
         // 0) if row 0 continues a scrollback line, the whole logical line moves back onto the screen
-        if (!alternate && !scrollback.empty() && vterm_state_get_lineinfo(state, 0)->continuation)
+        if (pull && !alternate && !scrollback.empty() && vterm_state_get_lineinfo(state, 0)->continuation)
         {
             int head = int(scrollback.size()) - 1;
             while (head > 0 && scrollback[size_t(head)].continuation)
@@ -531,7 +536,7 @@ struct Terminal::State
             setSize(rows - freed, cols, false);
         // 3) ...then grow to the final height, pulling lines back from the scrollback (already at the new width).
         if (rows != newRows)
-            setSize(newRows, cols, true);
+            setSize(newRows, cols, pull);
     }
     // Rewraps the scrollback to the current width by joining continued lines.
     void rewrap()
@@ -744,6 +749,10 @@ void Terminal::setup()
         {
             if (prop == VTERM_PROP_ALTSCREEN)
                 static_cast<State *>(context)->alternate = value->boolean;
+            // A program that asks for the mouse (tmux "mouse on", htop, mc, vim mouse=a): clicks and the wheel go
+            // to it (see mouseReport).
+            if (prop == VTERM_PROP_MOUSE)
+                static_cast<State *>(context)->mouse = value->number;
             // Shown again without moving (nano and vim hide it, redraw, place it, then show it): movecursor alone
             // would leave it hidden until the next move.
             if (prop == VTERM_PROP_CURSORVISIBLE)
@@ -1599,9 +1608,39 @@ QString Terminal::selectedText() const
     return result;
 }
 
+// The mouse for a program that asked for it (tmux, htop, mc, vim): libvterm encodes it as the program asked (X10,
+// SGR...). Shift held keeps it local (selection, paste), as in xterm. button: 1 left, 2 middle, 3 right, 4/5 wheel,
+// 0 a move. False when the mouse is not the program's.
+bool Terminal::mouseReport(const QPointF &position, Qt::KeyboardModifiers modifiers, int button, bool pressed)
+{
+    auto &s = *state;
+    if (s.mouse == VTERM_PROP_MOUSE_NONE || (modifiers & Qt::ShiftModifier) || s.ended || s.promptDone)
+        return false;
+    s.offset = 0; // the program's screen, not the scrollback
+    const QFontMetrics fm(font());
+    const int col = std::clamp(int(position.x() - 4) / std::max(1, fm.horizontalAdvance('M')), 0, s.cols - 1);
+    const int row = std::clamp(int(position.y() - 4) / std::max(1, fm.height()), 0, s.rows - 1);
+    int mods = 0;
+    if (modifiers & ControlKey)
+        mods |= VTERM_MOD_CTRL;
+    if (modifiers & Qt::AltModifier)
+        mods |= VTERM_MOD_ALT;
+    vterm_mouse_move(s.vt, row, col, VTermModifier(mods));
+    if (button)
+        vterm_mouse_button(s.vt, button, pressed, VTermModifier(mods));
+    return true;
+}
+
+static int vtermButton(Qt::MouseButton button)
+{
+    return button == Qt::LeftButton ? 1 : button == Qt::MiddleButton ? 2 : button == Qt::RightButton ? 3 : 0;
+}
+
 void Terminal::mousePressEvent(QMouseEvent *event)
 {
     setFocus();
+    if (const int button = vtermButton(event->button()); button && mouseReport(event->position(), event->modifiers(), button, true))
+        return;
     if (event->button() == Qt::LeftButton)
     {
         // Cmd/Ctrl + click on a link opens it; anywhere else the click starts a selection as usual.
@@ -1627,6 +1666,9 @@ void Terminal::mousePressEvent(QMouseEvent *event)
 
 void Terminal::mouseMoveEvent(QMouseEvent *event)
 {
+    // libvterm reports the move only in the modes that want it (drag, any motion).
+    if (!state->selecting && mouseReport(event->position(), event->modifiers(), 0, false))
+        return;
     if (!state->selecting)
     {
         hoverLink(event->position().toPoint(), event->modifiers() & Qt::ControlModifier);
@@ -1715,6 +1757,9 @@ void Terminal::hoverLink(const QPoint &pixel, bool active)
 
 void Terminal::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (!state->selecting)
+        if (const int button = vtermButton(event->button()); button && mouseReport(event->position(), event->modifiers(), button, false))
+            return;
     if (event->button() != Qt::LeftButton || !state->selecting)
         return;
     state->selecting = false;
@@ -1725,6 +1770,9 @@ void Terminal::mouseReleaseEvent(QMouseEvent *event)
 
 void Terminal::mouseDoubleClickEvent(QMouseEvent *event)
 {
+    // The second press of a double click, for the program (it tells double clicks apart itself).
+    if (const int button = vtermButton(event->button()); button && mouseReport(event->position(), event->modifiers(), button, true))
+        return;
     const auto at = cellAt(event->position().toPoint());
     auto word = [&](int col)
     {
@@ -1772,6 +1820,17 @@ void Terminal::wheelEvent(QWheelEvent *event)
         pending %= 120;
         if (steps)
             zoom(steps);
+        event->accept();
+        return;
+    }
+    // A program that has the mouse gets the wheel as buttons 4 (up) and 5 (down), one per notch: tmux scrolls its
+    // own history, instead of the arrow keys below that went to the shell inside and cycled its history.
+    if (state->mouse != VTERM_PROP_MOUSE_NONE && !(event->modifiers() & Qt::ShiftModifier))
+    {
+        state->mouseWheel += event->angleDelta().y();
+        for (; std::abs(state->mouseWheel) >= 120; state->mouseWheel -= state->mouseWheel > 0 ? 120 : -120)
+            if (mouseReport(event->position(), event->modifiers(), state->mouseWheel > 0 ? 4 : 5, true))
+                mouseReport(event->position(), event->modifiers(), state->mouseWheel > 0 ? 4 : 5, false);
         event->accept();
         return;
     }

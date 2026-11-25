@@ -277,7 +277,7 @@ class Gist : public Http
     void fetchGist(std::function<void(const Result &, const QJsonObject &gist)> done)
     {
         if (id.isEmpty())
-            return done(withStatus(Result::NotFound), {});
+            return discover(done);
         send(request("/gists/" + id), "GET", {},
              [this, done](QNetworkReply *reply)
              {
@@ -307,6 +307,35 @@ class Gist : public Http
                           r.data = rawReply->readAll();
                           done(r, gist);
                       });
+             });
+    }
+    // No gist id here yet (a device joining with the same token): the account's oldest gist that holds the sync file,
+    // so every device uses the one the first device created instead of each making its own. Its id is saved
+    // (Result::updated). None: NotFound, and the first write creates it.
+    void discover(std::function<void(const Result &, const QJsonObject &gist)> done)
+    {
+        send(request("/gists?per_page=100"), "GET", {},
+             [this, done](QNetworkReply *reply)
+             {
+                 if (reply->error() != QNetworkReply::NoError)
+                     return done(failed(httpError(reply)), {});
+                 QString found, oldest;
+                 for (const auto &v : QJsonDocument::fromJson(reply->readAll()).array())
+                 {
+                     const auto gist = v.toObject();
+                     const auto created = gist["created_at"].toString(); // ISO 8601: ordered as text
+                     if (gist["files"].toObject().contains(FileName) && (found.isEmpty() || created < oldest))
+                         found = gist["id"].toString(), oldest = created;
+                 }
+                 if (found.isEmpty())
+                     return done(withStatus(Result::NotFound), {});
+                 id = found;
+                 fetchGist(
+                     [this, done](Result r, const QJsonObject &gist)
+                     {
+                         r.updated["gist"] = id;
+                         done(r, gist);
+                     });
              });
     }
 

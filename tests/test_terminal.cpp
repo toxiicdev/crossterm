@@ -136,6 +136,35 @@ int main(int argc, char **argv)
     QApplication::sendEvent(&terminal, &composed);
     CHECK(device->written == QString::fromUtf8("é").toUtf8())
 
+    // A program that asks for the mouse (tmux "mouse on": clicks, SGR encoding) gets clicks and the wheel; Shift keeps
+    // the mouse local. Off again, the wheel scrolls as before.
+    {
+        const QFontMetrics fm(terminal.font());
+        const QPointF cell(4 + 2 * fm.horizontalAdvance('M') + 1, 4 + 1 * fm.height() + 1); // column 3, row 2 (1-based)
+        auto click = [&](Qt::KeyboardModifiers mods)
+        {
+            QMouseEvent press(QEvent::MouseButtonPress, cell, terminal.mapToGlobal(cell), Qt::LeftButton, Qt::LeftButton, mods);
+            QApplication::sendEvent(&terminal, &press);
+            QMouseEvent release(QEvent::MouseButtonRelease, cell, terminal.mapToGlobal(cell), Qt::LeftButton, Qt::NoButton, mods);
+            QApplication::sendEvent(&terminal, &release);
+        };
+        device->feed("\x1b[?1000h\x1b[?1006h");
+        device->written.clear();
+        click(Qt::NoModifier);
+        CHECK(device->written == "\x1b[<0;3;2M\x1b[<0;3;2m")
+        device->written.clear();
+        QWheelEvent up(cell, terminal.mapToGlobal(cell), {}, {0, 120}, Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(&terminal, &up);
+        CHECK(device->written.startsWith("\x1b[<64;3;2M"))
+        device->written.clear();
+        click(Qt::ShiftModifier);
+        CHECK(device->written.isEmpty())
+        device->feed("\x1b[?1000l\x1b[?1006l");
+        device->written.clear();
+        click(Qt::NoModifier);
+        CHECK(device->written.isEmpty())
+    }
+
     // Predictions: drawn over the cell, the real cursor does not move, clearPredictions returns to the real screen.
     device->feed("\x1b[2J\x1b[Hxy");
     CHECK(terminal.cellChar(0, 1) == U'y' && terminal.cellChar(0, 5) == U' ' && terminal.cellChar(-1, 0) == 0 &&
