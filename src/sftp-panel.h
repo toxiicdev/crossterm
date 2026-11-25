@@ -722,6 +722,11 @@ class SftpPanel : public QWidget
         QString stamp;
         QString note; // warnings of a completed transfer (entries that sftp skipped)
         bool temporary = false; // "Download as zip": the remote file is removed once downloaded (or the row cleared)
+        // Folder: its files (-1 while not known), shown as "X / N"; an upload counts the files read from the sizes
+        // (ends: running totals), a download counts the files arrived beyond those already there (baseline).
+        int files = -1, baseline = 0;
+        QList<qint64> ends;
+        QElapsedTimer counted; // last count of the arrived files (at most once a second)
         QTreeWidgetItem *item = nullptr;
         QProgressBar *bar = nullptr;
         QProcess *process = nullptr; // while running
@@ -1212,7 +1217,14 @@ class SftpPanel : public QWidget
         // shown fits ("100%" measures the widest percentage); other states are elided on the right.
         const auto metrics = t.bar->fontMetrics();
         const int room = t.bar->width() - 8;
-        if (t.state == "running")
+        if (t.state == "running" && t.folder && t.files > 0)
+        {
+            // "X / N · %": files of the folder, the percentage dropped when it does not fit.
+            const auto widest = QString::number(t.files);
+            const QString full = "%v / %m · %p%";
+            t.bar->setFormat(metrics.horizontalAdvance(widest + " / " + widest + " · 100%") <= room ? full : "%v / %m");
+        }
+        else if (t.state == "running")
         {
             const auto rate = t.rate.text();
             QString format = "%p%";
@@ -1331,16 +1343,104 @@ class SftpPanel : public QWidget
                 t->bar->setRange(0, 0);
             else
                 t->bar->setRange(0, 100);
+            if (t->folder)
+                countFolder(t);
             showState(t);
             mover->start(program, sftpArguments(true));
             ticker->start(150);
         }
     }
 
+    // Regular files under a local folder (as "put -r" sends them, links skipped): running totals of their sizes.
+    static QList<qint64> localFileEnds(const QString &folder)
+    {
+        QList<qint64> ends;
+        qint64 total = 0;
+        QDirIterator it(folder, QDir::Files | QDir::Hidden | QDir::System | QDir::NoSymLinks, QDirIterator::Subdirectories);
+        while (it.hasNext())
+            ends << (total += it.nextFileInfo().size());
+        return ends;
+    }
+    // The files of a folder transfer, for "X / N": local for an upload (when the bytes sftp reads can be followed:
+    // not on macOS), counted on the server with find for a download (ssh sessions; an SFTP-only account has no
+    // shell). Unknown: the bar keeps moving without a count.
+    void countFolder(const std::shared_ptr<Transfer> &t)
+    {
+        t->files = -1;
+        t->ends.clear();
+        if (t->upload)
+        {
+            if (bytesRead(QCoreApplication::applicationPid(), {}) < 0)
+                return;
+            t->ends = localFileEnds(t->local);
+            showFolderCount(*t, int(t->ends.size()));
+            return;
+        }
+        t->baseline = int(localFileEnds(t->local).size());
+        const auto remote = posixQuote(t->directory + "/" + t->name);
+        const auto program = QStandardPaths::findExecutable(shell.program);
+        if (shell.program != "ssh" || !shell.error.isEmpty() || !shell.arguments.contains("--") || remote.isEmpty() ||
+            program.isEmpty())
+            return;
+        auto *counter = hideConsoleWindow(new QProcess(this));
+        counter->setProcessEnvironment(sftpEnvironment(false));
+        auto done = [this, t, counter]
+        {
+            bool ok = false;
+            const int count = QString::fromUtf8(counter->readAllStandardOutput()).trimmed().toInt(&ok);
+            forgetAskpassAttempts(counter);
+            counter->deleteLater();
+            if (ok && t->state == "running" && t->files < 0)
+                showFolderCount(*t, count);
+        };
+        connect(counter, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, done);
+        connect(counter, &QProcess::errorOccurred, this,
+                [done](QProcess::ProcessError error)
+                {
+                    if (error == QProcess::FailedToStart)
+                        done(); // no "finished" follows
+                });
+        counter->start(program, QStringList{"-T", "-o", "BatchMode=no", "-o", "StrictHostKeyChecking=yes", "-o",
+                                            "ConnectTimeout=10", "-o", "NumberOfPasswordPrompts=1"} +
+                                    shell.arguments + QStringList{"find " + remote + " -type f | wc -l"});
+    }
+    void showFolderCount(Transfer &t, int files)
+    {
+        if (files <= 0)
+            return; // an empty folder: nothing to count
+        t.files = files;
+        t.bar->setRange(0, files);
+        t.bar->setValue(0);
+        setStatus(t, {});
+    }
+    void tickFolder(Transfer &t)
+    {
+        int done = 0;
+        if (t.upload)
+        {
+            // sftp reads the files one after the other: those whose running total it has read are sent. ponytail:
+            // the order is assumed to be ours, so with files of very different sizes the count is an estimate.
+            const qint64 read = bytesRead(t.process->processId(), t.local);
+            if (read < 0)
+                return;
+            done = int(std::upper_bound(t.ends.begin(), t.ends.end(), read) - t.ends.begin());
+        }
+        else
+        {
+            if (t.counted.isValid() && t.counted.elapsed() < 1000)
+                return;
+            t.counted.start();
+            done = int(localFileEnds(t.local).size()) - t.baseline;
+        }
+        t.bar->setValue(std::clamp(done, 0, t.files));
+    }
+
     void tick()
     {
         for (const auto &t : transfers)
         {
+            if (t->state == "running" && t->process && t->folder && t->files > 0)
+                tickFolder(*t);
             if (t->state != "running" || !t->process || t->folder || (t->upload && t->size <= 0))
                 continue;
             qint64 done = -1;
@@ -1438,6 +1538,7 @@ public:
     QString transferState(int i) const { return i < transfers.size() ? transfers[i]->state : QString(); }
     int transferProgress(int i) const { return i < transfers.size() ? transfers[i]->bar->value() : -1; }
     int transferCount() const { return int(transfers.size()); }
+    QString transferText(int i) const { return i < transfers.size() ? transfers[i]->bar->text() : QString(); }
     void cancelTransfer(int i) { cancelTransfer(transfers.value(i)); }
     void resumeTransfer(int i) { resumeTransfer(transfers.value(i)); }
     // Nothing queued or running (an upload waiting for another one of the same file counts as queued).

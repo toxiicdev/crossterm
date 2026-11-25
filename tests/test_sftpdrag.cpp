@@ -71,6 +71,23 @@ int main(int argc, char **argv)
         fake->fetch = [&calls] { return ++calls > 0; };
         check(fake->urls() == fake->planned && fake->urls() == fake->planned && calls == 1, "success cached");
         delete fake;
+        // A folder upload shows its files as "X / N" instead of a moving bar (where the bytes read can be followed).
+        QTemporaryDir tree;
+        for (const auto *name : {"a.txt", "sub/b.txt", "sub/deep/c.txt"})
+        {
+            QDir(tree.path()).mkpath(QFileInfo(name).path());
+            QFile f(tree.filePath(name));
+            f.open(QIODevice::WriteOnly);
+            f.write("data");
+        }
+        panel.enqueue("/", "tree", tree.path(), true, true, -1);
+        const auto shown = panel.transferText(0);
+#ifdef Q_OS_MACOS
+        check(!shown.contains(" / "), "folder upload on macOS keeps the moving bar");
+#else
+        check(shown.startsWith("0 / 3"), "folder upload shows X / N files: " + shown.toUtf8());
+#endif
+        wait(20000, [&] { return panel.transfersIdle(); });
     }
 
     // --- With network: test server managed by others, reads only.
