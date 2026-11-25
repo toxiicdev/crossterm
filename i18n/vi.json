@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 tệp đã tồn tại. Thay thế?",
  "%1 files open": "%1 tệp đang mở",
  "%1 h %2 min": "%1 giờ %2 phút",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 có các thay đổi trên máy tính này nhưng không có trên máy chủ. Thay thế bằng tệp của máy chủ?",
  "%1 invisible or unusual space character(s)": "%1 ký tự khoảng trắng ẩn hoặc bất thường",
  "%1 is assigned to two actions.": "%1 được gán cho hai thao tác.",
  "%1 item(s) copied": "Đã sao chép %1 mục",

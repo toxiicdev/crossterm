@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1টি ফাইল ইতিমধ্যে বিদ্যমান। প্রতিস্থাপন করবেন?",
  "%1 files open": "%1টি ফাইল খোলা",
  "%1 h %2 min": "%1 ঘ %2 মি",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1-এ এই কম্পিউটারে এমন পরিবর্তন আছে যা সার্ভারে নেই। সার্ভারের ফাইল দিয়ে সেগুলো প্রতিস্থাপন করবেন?",
  "%1 invisible or unusual space character(s)": "%1টি অদৃশ্য বা অস্বাভাবিক স্পেস অক্ষর",
  "%1 is assigned to two actions.": "%1 দুটি অ্যাকশনে বরাদ্দ করা হয়েছে।",
  "%1 item(s) copied": "%1টি আইটেম কপি হয়েছে",

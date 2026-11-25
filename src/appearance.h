@@ -284,6 +284,7 @@ QSlider::handle:horizontal { width: 16px; height: 16px; margin: -6px 0; border-r
 QToolTip { background: @menu@; color: @text@; border: 1px solid @menuBorder@; border-radius: 6px; padding: 4px 8px; }
 QProgressBar { background: @segment@; border: none; border-radius: 4px; color: @text@; text-align: center; font-size: 10px; max-height: 14px; }
 QProgressBar::chunk { background: @accent@; border-radius: 4px; }
+QTreeView QProgressBar { max-height: 9999px; }
 )";
     // Light/dark pairs; the values follow the macOS system colors.
     static const QList<std::array<const char *, 3>> colors{{"window", "#ececec", "#1e1e1e"},

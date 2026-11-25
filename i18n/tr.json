@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 dosya zaten var. Üzerlerine yazılsın mı?",
  "%1 files open": "%1 açık dosya",
  "%1 h %2 min": "%1 sa %2 dk",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 bu bilgisayarda sunucuda olmayan değişiklikler içeriyor. Bunlar sunucudaki dosyayla değiştirilsin mi?",
  "%1 invisible or unusual space character(s)": "%1 görünmez veya alışılmadık boşluk karakteri",
  "%1 is assigned to two actions.": "%1 iki eyleme atanmış.",
  "%1 item(s) copied": "%1 öğe kopyalandı",

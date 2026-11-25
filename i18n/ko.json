@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "파일 %1개가 이미 있습니다. 바꾸시겠습니까?",
  "%1 files open": "열린 파일 %1개",
  "%1 h %2 min": "%1시간 %2분",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1에 서버에 없는 변경 내용이 이 컴퓨터에 있습니다. 서버의 파일로 바꾸시겠습니까?",
  "%1 invisible or unusual space character(s)": "보이지 않거나 특이한 공백 문자 %1개",
  "%1 is assigned to two actions.": "%1이(가) 두 동작에 할당되어 있습니다.",
  "%1 item(s) copied": "항목 %1개 복사됨",

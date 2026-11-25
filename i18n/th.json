@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "มี %1 ไฟล์อยู่แล้ว ต้องการแทนที่หรือไม่",
  "%1 files open": "เปิดไฟล์อยู่ %1 ไฟล์",
  "%1 h %2 min": "%1 ชม. %2 นาที",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 มีการเปลี่ยนแปลงในคอมพิวเตอร์นี้ที่ไม่มีบนเซิร์ฟเวอร์ แทนที่ด้วยไฟล์จากเซิร์ฟเวอร์หรือไม่",
  "%1 invisible or unusual space character(s)": "อักขระช่องว่างที่มองไม่เห็นหรือผิดปกติ %1 ตัว",
  "%1 is assigned to two actions.": "%1 ถูกกำหนดให้กับการทำงานสองรายการ",
  "%1 item(s) copied": "คัดลอก %1 รายการแล้ว",

@@ -9,6 +9,7 @@
   "%1 files already exist. Replace them?": "Fayiloli %1 sun riga sun wanzu. A maye gurbinsu?",
   "%1 files open": "Fayiloli %1 a buɗe",
   "%1 h %2 min": "Awa %1 minti %2",
+  "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 yana da canje-canje a wannan kwamfuta waɗanda ba sa kan sabar. A maye gurbinsu da fayil ɗin sabar?",
   "%1 invisible or unusual space character(s)": "Haruffan sarari %1 da ba a gani ko na ban mamaki",
   "%1 is assigned to two actions.": "An sanya %1 ga ayyuka biyu.",
   "%1 item(s) copied": "An kwafi abu %1",

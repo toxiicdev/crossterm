@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 個のファイルが既に存在します。置き換えますか?",
  "%1 files open": "開いているファイル %1",
  "%1 h %2 min": "%1 時間 %2 分",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 には、サーバーにない変更がこのコンピューター上にあります。サーバーのファイルで置き換えますか?",
  "%1 invisible or unusual space character(s)": "%1 個の不可視または特殊な空白文字",
  "%1 is assigned to two actions.": "%1 が 2 つのアクションに割り当てられています。",
  "%1 item(s) copied": "%1 個の項目をコピーしました",

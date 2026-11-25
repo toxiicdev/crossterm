@@ -1511,8 +1511,7 @@ public:
         t->bar->setRange(0, 100);
         t->bar->setValue(0);
         t->bar->setTextVisible(true);
-        t->bar->setMaximumHeight(14);
-        queueView->setItemWidget(t->item, 2, t->bar);
+        queueView->setItemWidget(t->item, 2, t->bar); // as tall as its row
         transfers << t;
         showState(t);
         queueBox->show();
@@ -1976,13 +1975,23 @@ public:
                 return;
             }
         }
-        // A copy with changes that are not on the server (their upload failed): opened as it is, not downloaded over.
+        // A copy with changes that are not on the server (their upload failed or was cancelled): the server's file may
+        // be newer (uploaded since), so the user chooses; without asking, every later open showed the old copy.
         if (const auto edit = edited.constFind(local);
             edit != edited.constEnd() && QFileInfo::exists(local) && !(stampOf(local) == edit->stamp))
         {
-            if (launchEditor && !openLocal(local, openMode))
-                status->setText(L("Unsafe file name from the server: %1").arg(name));
-            return;
+            const auto text = L("%1 has changes on this computer that are not on the server. Replace them with the "
+                                "server's file?")
+                                  .arg(name);
+            const bool replace = askReplace ? askReplace(text)
+                                            : QMessageBox::question(this, L("Open"), text, QMessageBox::Yes | QMessageBox::No,
+                                                                    QMessageBox::No) == QMessageBox::Yes;
+            if (!replace)
+            {
+                if (launchEditor && !openLocal(local, openMode))
+                    status->setText(L("Unsafe file name from the server: %1").arg(name));
+                return;
+            }
         }
         enqueue(directory, name, local, false, false, size, true,
                 [&](Transfer &t)

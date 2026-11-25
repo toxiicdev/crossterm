@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 fichiers existent déjà. Les remplacer ?",
  "%1 files open": "%1 fichiers ouverts",
  "%1 h %2 min": "%1 h %2 min",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 a des modifications sur cet ordinateur qui ne sont pas sur le serveur. Les remplacer par le fichier du serveur ?",
  "%1 invisible or unusual space character(s)": "%1 caractère(s) d'espace invisible(s) ou inhabituel(s)",
  "%1 is assigned to two actions.": "%1 est attribué à deux actions.",
  "%1 item(s) copied": "%1 élément(s) copié(s)",

@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 من الملفات موجودة بالفعل. هل تريد استبدالها؟",
  "%1 files open": "%1 ملف مفتوح",
  "%1 h %2 min": "%1 س %2 د",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "يحتوي %1 على تغييرات على هذا الكمبيوتر غير موجودة على الخادم. هل تريد استبدالها بملف الخادم؟",
  "%1 invisible or unusual space character(s)": "%1 من أحرف المسافة غير المرئية أو غير المعتادة",
  "%1 is assigned to two actions.": "%1 معيّن لإجراءين.",
  "%1 item(s) copied": "تم نسخ %1 عنصر",

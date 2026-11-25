@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 个文件已存在。是否替换？",
  "%1 files open": "%1 个打开的文件",
  "%1 h %2 min": "%1 小时 %2 分钟",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 在此计算机上有服务器上没有的更改。要用服务器上的文件替换它们吗?",
  "%1 invisible or unusual space character(s)": "%1 个不可见或不常见的空格字符",
  "%1 is assigned to two actions.": "%1 已分配给两个操作。",
  "%1 item(s) copied": "已复制 %1 项",

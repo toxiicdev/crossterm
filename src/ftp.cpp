@@ -2007,8 +2007,7 @@ void FtpPanel::enqueue(const QString &name, const QString &local, const QString 
     t->bar = new QProgressBar;
     t->bar->setRange(0, 100);
     t->bar->setValue(0);
-    t->bar->setMaximumHeight(14);
-    queueView->setItemWidget(t->item, 2, t->bar);
+    queueView->setItemWidget(t->item, 2, t->bar); // as tall as its row
     transfers << t;
     queueBox->show();
     start(t, false);

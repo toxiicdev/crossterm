@@ -9,6 +9,7 @@
   "%1 files already exist. Replace them?": "Umiiral na ang %1 file. Palitan ang mga ito?",
   "%1 files open": "%1 file na bukas",
   "%1 h %2 min": "%1 oras %2 min",
+  "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "May mga pagbabago ang %1 sa computer na ito na wala sa server. Palitan ang mga ito ng file ng server?",
   "%1 invisible or unusual space character(s)": "%1 hindi nakikita o kakaibang space character",
   "%1 is assigned to two actions.": "Naka-assign ang %1 sa dalawang aksyon.",
   "%1 item(s) copied": "%1 item ang nakopya",

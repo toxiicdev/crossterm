@@ -9,6 +9,7 @@
   "%1 files already exist. Replace them?": "Faili %1 tayari zipo. Zibadilishwe?",
   "%1 files open": "Faili %1 zimefunguliwa",
   "%1 h %2 min": "Saa %1 dakika %2",
+  "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 ina mabadiliko kwenye kompyuta hii ambayo hayapo kwenye seva. Yabadilishe kwa faili ya seva?",
   "%1 invisible or unusual space character(s)": "Herufi %1 za nafasi zisizoonekana au zisizo za kawaida",
   "%1 is assigned to two actions.": "%1 imepewa vitendo viwili.",
   "%1 item(s) copied": "Vipengee %1 vimenakiliwa",

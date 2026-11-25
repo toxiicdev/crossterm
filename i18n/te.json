@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 ఫైల్‌లు ఇప్పటికే ఉన్నాయి. భర్తీ చేయాలా?",
  "%1 files open": "%1 ఫైల్‌లు తెరిచి ఉన్నాయి",
  "%1 h %2 min": "%1 గం %2 ని",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1లో ఈ కంప్యూటర్‌లో సర్వర్‌లో లేని మార్పులు ఉన్నాయి. వాటిని సర్వర్ ఫైల్‌తో భర్తీ చేయాలా?",
  "%1 invisible or unusual space character(s)": "%1 కనిపించని లేదా అసాధారణ స్పేస్ అక్షరాలు",
  "%1 is assigned to two actions.": "%1 రెండు చర్యలకు కేటాయించబడింది.",
  "%1 item(s) copied": "%1 అంశాలు కాపీ అయ్యాయి",

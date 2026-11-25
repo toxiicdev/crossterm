@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "Файлы (%1) уже существуют. Заменить их?",
  "%1 files open": "Открыто файлов: %1",
  "%1 h %2 min": "%1 ч %2 мин",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "В %1 есть изменения на этом компьютере, которых нет на сервере. Заменить их файлом с сервера?",
  "%1 invisible or unusual space character(s)": "Невидимые или необычные пробельные символы: %1",
  "%1 is assigned to two actions.": "Сочетание %1 назначено двум действиям.",
  "%1 item(s) copied": "Скопировано элементов: %1",

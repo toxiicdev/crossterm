@@ -9,6 +9,7 @@
  "%1 files already exist. Replace them?": "%1 فایل از قبل وجود دارند. جایگزین شوند؟",
  "%1 files open": "%1 فایل باز",
  "%1 h %2 min": "%1 ساعت %2 دقیقه",
+ "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 تغییراتی در این رایانه دارد که روی سرور نیستند. با فایل سرور جایگزین شوند؟",
  "%1 invisible or unusual space character(s)": "%1 نویسه فاصلهٔ نامرئی یا غیرعادی",
  "%1 is assigned to two actions.": "%1 به دو کنش اختصاص داده شده است.",
  "%1 item(s) copied": "%1 مورد کپی شد",

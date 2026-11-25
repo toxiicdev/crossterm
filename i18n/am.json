@@ -9,6 +9,7 @@
   "%1 files already exist. Replace them?": "%1 ፋይሎች አስቀድመው አሉ። ይተኩ?",
   "%1 files open": "%1 ክፍት ፋይሎች",
   "%1 h %2 min": "%1 ሰዓት %2 ደቂቃ",
+  "%1 has changes on this computer that are not on the server. Replace them with the server's file?": "%1 በዚህ ኮምፒውተር ላይ በአገልጋዩ ላይ የሌሉ ለውጦች አሉት። በአገልጋዩ ፋይል ይተኩ?",
   "%1 invisible or unusual space character(s)": "%1 የማይታዩ ወይም ያልተለመዱ የክፍተት ቁምፊዎች",
   "%1 is assigned to two actions.": "%1 ለሁለት እርምጃዎች ተመድቧል።",
   "%1 item(s) copied": "%1 ንጥሎች ተቀድተዋል",
