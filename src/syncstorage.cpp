@@ -118,6 +118,11 @@ protected:
     void fetch(Done done) override
     {
         QFile f(file);
+        // iCloud Drive with "Optimize Mac Storage" (macOS 13 and earlier) leaves ".<name>.icloud" in place of a file
+        // not downloaded: the file is there, so it must not look absent (a new sync would replace the real one).
+        const QFileInfo info(file);
+        if (!f.exists() && QFileInfo::exists(info.dir().filePath("." + info.fileName() + ".icloud")))
+            return done(failed(ui("Cannot read %1: %2").arg(QDir::toNativeSeparators(file), "not downloaded from iCloud yet")));
         if (!f.exists())
             return done(withStatus(Result::NotFound));
         if (!f.open(QIODevice::ReadOnly))
@@ -604,6 +609,9 @@ protected:
                            {
                                if (!t.error.isEmpty())
                                {
+                                   // Sign in again only when the provider refused the token; offline it is not.
+                                   if (!t.rejected)
+                                       return ready(failed(t.error));
                                    Result r = failed(ui("Sign in again: %1").arg(t.error));
                                    r.signIn = true;
                                    return ready(r);

@@ -584,6 +584,7 @@ void VncView::reconnect()
     buttons = rects = 0;
     skip = 0;
     inRect = fullNext = connected = false;
+    serverText.clear(); // a new connection (a restarted server) does not have the text sent to the old one
     closed = false;
     card->present(ui("Connecting…"), address(), false);
     update(); // the last frame stays, dimmed, until the new framebuffer arrives
@@ -768,6 +769,7 @@ bool VncView::step()
         card->hide();
         updateGeometry();
         update();
+        sendClipboard(); // the view may already have the focus: no focus change would send it
         return true;
     }
     case Message:
@@ -1257,6 +1259,14 @@ static quint32 keysym(const QKeyEvent *e)
         {Qt::Key_NumLock, 0xFF7F},   {Qt::Key_ScrollLock, 0xFF14}, {Qt::Key_Print, 0xFF61},   {Qt::Key_Pause, 0xFF13},
         {Qt::Key_Menu, 0xFF67}};
     const int key = e->key();
+#ifdef Q_OS_MACOS
+    // Qt on macOS reports Command as Key_Control and Control as Key_Meta: the physical Control key is Control_L for
+    // the server (Ctrl+C in a remote terminal), Command its Super.
+    if (key == Qt::Key_Meta)
+        return 0xFFE3;
+    if (key == Qt::Key_Control)
+        return 0xFFEB;
+#endif
     if (special.contains(key))
         return special.value(key);
     if (key >= Qt::Key_F1 && key <= Qt::Key_F35)

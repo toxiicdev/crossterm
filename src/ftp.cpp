@@ -1566,8 +1566,32 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
                 const auto *entry = find(name);
                 if (name == "..")
                     return up();
-                if (entry && (entry->dir || entry->link))
+                // Open with the default application from a temporary copy (no reload): a private folder of this panel
+                // (owner only, removed with it) and a new subfolder for each open, never a fixed shared path.
+                auto openFile = [this](const QString &name)
+                {
+                    if (!safeName(name)) // from the server: it would escape the temporary folder
+                        return status->setText(ui("Unsafe file name from the server: %1").arg(name));
+                    if (!scratch)
+                        scratch = std::make_unique<QTemporaryDir>();
+                    const auto folder = scratch->filePath(QString::number(++opened));
+                    if (!scratch->isValid() || !QDir().mkpath(folder))
+                        return status->setText(ui("Cannot create the local folder %1.").arg(QDir::toNativeSeparators(folder)));
+                    const auto local = QDir(folder).filePath(name);
+                    ftp->download(join(name), local, {},
+                                  [this, local](bool ok, const QString &error)
+                                  {
+                                      if (!ok)
+                                          status->setText(error);
+                                      else
+                                          openForUser(QUrl::fromLocalFile(local));
+                                  });
+                };
+                if (entry && entry->dir)
                     return browse(join(name));
+                // A link may lead to a folder or to a file: entered when it is a folder, opened otherwise.
+                if (entry && entry->link)
+                    return browse(join(name), [openFile, name] { openFile(name); });
                 if (!entry)
                     return;
                 // Every selected file (Enter on a selection), only the activated one when it is not selected.
@@ -1580,26 +1604,7 @@ FtpPanel::FtpPanel(const QJsonObject &profile, std::function<QString()> password
                             names << e->name;
                 }
                 for (const auto &name : names)
-                {
-                if (!safeName(name)) // from the server: it would escape the temporary folder
-                    return status->setText(ui("Unsafe file name from the server: %1").arg(name));
-                // Open with the default application from a temporary copy (no reload): a private folder of this panel
-                // (owner only, removed with it) and a new subfolder for each open, never a fixed shared path.
-                if (!scratch)
-                    scratch = std::make_unique<QTemporaryDir>();
-                const auto folder = scratch->filePath(QString::number(++opened));
-                if (!scratch->isValid() || !QDir().mkpath(folder))
-                    return status->setText(ui("Cannot create the local folder %1.").arg(QDir::toNativeSeparators(folder)));
-                const auto local = QDir(folder).filePath(name);
-                ftp->download(join(name), local, {},
-                              [this, local](bool ok, const QString &error)
-                              {
-                                  if (!ok)
-                                      status->setText(error);
-                                  else
-                                      QDesktopServices::openUrl(QUrl::fromLocalFile(local));
-                              });
-                }
+                    openFile(name);
             });
 
     // Transfer queue.
@@ -1721,7 +1726,7 @@ void FtpPanel::ensure(std::function<void()> then, std::function<void(const QStri
                        });
 }
 
-void FtpPanel::browse(const QString &dir)
+void FtpPanel::browse(const QString &dir, std::function<void()> notFolder)
 {
     ++operations;
     status->setText(ui("Listing %1…").arg(dir));
@@ -1747,7 +1752,9 @@ void FtpPanel::browse(const QString &dir)
                            }
                            else
                                path->setText(listed); // the folder still shown
-                           finish(ok ? QString() : error);
+                           finish(ok || notFolder ? QString() : error);
+                           if (!ok && notFolder)
+                               notFolder(); // a link to a file: no folder to enter
                        });
         },
         finish);
@@ -2170,7 +2177,7 @@ static QString finalPath(HANDLE h)
 
 // Real path with all links resolved. On Windows QFileInfo::canonicalFilePath does not follow
 // junctions: ask the system for the final path of the open handle.
-static QString realPath(const QString &path)
+QString resolvedPath(const QString &path)
 {
 #ifdef Q_OS_WIN
     const auto native = QDir::toNativeSeparators(path).toStdWString();
@@ -2197,10 +2204,10 @@ static bool openedWithin(QFile &file, const QString &root)
 {
 #ifdef Q_OS_WIN
     const int fd = file.handle();
-    return within(fd >= 0 ? finalPath(HANDLE(_get_osfhandle(fd))) : realPath(file.fileName()), root);
+    return within(fd >= 0 ? finalPath(HANDLE(_get_osfhandle(fd))) : resolvedPath(file.fileName()), root);
 #else
     // Same file (device and inode) as the real path resolved now, and that path inside the root.
-    const auto real = realPath(file.fileName());
+    const auto real = resolvedPath(file.fileName());
     struct stat opened, named;
     return within(real, root) && fstat(file.handle(), &opened) == 0 && stat(QFile::encodeName(real).constData(), &named) == 0 &&
            opened.st_dev == named.st_dev && opened.st_ino == named.st_ino;
@@ -2361,7 +2368,7 @@ QString FtpSession::localPath(const QString &virt) const
             return {};
         probe = up;
     }
-    const auto real = realPath(probe.absoluteFilePath());
+    const auto real = resolvedPath(probe.absoluteFilePath());
     if (!within(real, server->canonicalRoot))
         return {};
     // A link inside the root must not lead an anonymous client to a hidden name of the root either.
@@ -2926,7 +2933,7 @@ bool FtpServer::start(const QString &rootDirectory, quint16 port, bool allowAnon
                       const QString &password)
 {
     stop();
-    canonicalRoot = rootDirectory.isEmpty() ? QString() : realPath(QFileInfo(rootDirectory).absoluteFilePath());
+    canonicalRoot = rootDirectory.isEmpty() ? QString() : resolvedPath(QFileInfo(rootDirectory).absoluteFilePath());
     if (canonicalRoot.isEmpty() || !QFileInfo(canonicalRoot).isDir())
     {
         error = ui("The root folder does not exist.");

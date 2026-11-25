@@ -383,7 +383,8 @@ RdpView::RdpView(const Settings &settings, std::function<QString()> passwordProv
             // Resize the session without reconnecting (IMsRdpClient9); otherwise SmartSizing.
             const qreal ratio = devicePixelRatioF();
             const int w = std::max(200, int(width() * ratio)) & ~1, h = std::max(200, int(height() * ratio));
-            if (connected)
+            // Only with the widget's size ("0" in the profile): a fixed resolution stays as chosen.
+            if (connected && this->settings.width <= 0 && this->settings.height <= 0)
                 invoke(d->dispatch.Get(), "UpdateSessionDisplaySettings", DISPATCH_METHOD,
                        {toVariant(w), toVariant(h), toVariant(w), toVariant(h), toVariant(0), toVariant(100), toVariant(100)});
         });
@@ -689,12 +690,16 @@ void RdpView::connectToHost()
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
 void RdpView::launch(const QString &program, bool trusted)
 {
-    QStringList args{"/parent-window:" + QString::number(winId()),
-                     "/v:" + destination(settings),
-                     "/from-stdin:force",
-                     trusted ? "/cert:tofu" : "/cert:deny",
-                     "/dynamic-resolution",
+    QStringList args{"/v:" + destination(settings), "/from-stdin:force", trusted ? "/cert:tofu" : "/cert:deny",
                      "/bpp:" + QString::number(settings.colorDepth)};
+    // Embedded only under X11: on Wayland winId() is no X window and xfreerdp (XWayland) could not use it.
+    if (QGuiApplication::platformName() == "xcb")
+        args << "/parent-window:" + QString::number(winId());
+    // The widget's size follows the tab; a fixed resolution stays as chosen (scaled with smart sizing).
+    if (settings.width <= 0 || settings.height <= 0)
+        args << "/dynamic-resolution";
+    else if (settings.smartSizing)
+        args << "/smart-sizing";
     if (!settings.user.isEmpty())
         args << "/u:" + settings.user;
     if (!settings.domain.isEmpty())

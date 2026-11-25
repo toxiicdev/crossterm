@@ -8,6 +8,7 @@
 #include <optional>
 class QIODevice;
 class QKeyEvent;
+class QInputMethodEvent;
 // Predicted character (local echo) in a screen cell, drawn over the real content.
 struct PredictedCell
 {
@@ -99,6 +100,9 @@ protected:
     void showEvent(QShowEvent *) override;
     void setGrid(int rows, int cols);
     void keyPressEvent(QKeyEvent *) override;
+    // Dead keys and compose (Linux, macOS) and input methods (Chinese, Japanese...): the committed text is typed.
+    void inputMethodEvent(QInputMethodEvent *) override;
+    QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
     void mousePressEvent(QMouseEvent *) override;
     void mouseMoveEvent(QMouseEvent *) override;
     void mouseReleaseEvent(QMouseEvent *) override;

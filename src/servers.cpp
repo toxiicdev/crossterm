@@ -1,4 +1,5 @@
 #include "servers.h"
+#include "ftp.h" // resolvedPath
 #include <QRegularExpression>
 #include <algorithm>
 #include <QCheckBox>
@@ -70,7 +71,9 @@ bool sendWakeOnLan(const QString &mac, const QHostAddress &to, quint16 port, QSt
 
 QString jailedPath(const QString &root, const QString &relative)
 {
-    const QString base = QFileInfo(root).canonicalFilePath();
+    // resolvedPath, not canonicalFilePath: on Windows the latter keeps junctions (mklink /J, "All Users"), which
+    // led the HTTP and TFTP servers out of the shared folder.
+    const QString base = resolvedPath(QFileInfo(root).absoluteFilePath());
     if (base.isEmpty() || relative.contains(QChar(0)))
         return {};
     QStringList parts;
@@ -86,10 +89,10 @@ QString jailedPath(const QString &root, const QString &relative)
     }
     const QString path = parts.isEmpty() ? base : base + '/' + parts.join('/');
     const QFileInfo info(path);
-    if (info.isSymLink() && !info.exists())
+    if ((info.isSymLink() || info.isJunction()) && !info.exists())
         return {};
-    // The real path (symlinks resolved) must stay under the root; for a new file the parent folder is checked.
-    const QString real = info.exists() ? info.canonicalFilePath() : QFileInfo(info.absolutePath()).canonicalFilePath();
+    // The real path (links and junctions resolved) must stay under the root; for a new file the parent is checked.
+    const QString real = info.exists() ? resolvedPath(path) : resolvedPath(info.absolutePath());
     if (real.isEmpty() || (real != base && !real.startsWith(base.endsWith('/') ? base : base + '/')))
         return {};
     // A link inside the root must not lead to a hidden name of the root either.

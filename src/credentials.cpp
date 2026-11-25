@@ -36,9 +36,18 @@ bool vaultAvailable()
     return true;
 }
 
+// A blob holds at most CRED_MAX_CREDENTIAL_BLOB_SIZE (2560) bytes: about 1280 characters as UTF-16, not enough for
+// long OAuth refresh tokens (work accounts), which CredWrite then refused. Those go as UTF-8 after this mark.
+static const QByteArray Utf8Mark("CTU8");
+
 bool storeSecret(const QString &target, const QString &user, const QString &secret)
 {
     QByteArray blob(reinterpret_cast<const char *>(secret.utf16()), secret.size() * 2);
+    if (blob.size() > CRED_MAX_CREDENTIAL_BLOB_SIZE)
+    {
+        SecureZeroMemory(blob.data(), size_t(blob.size()));
+        blob = Utf8Mark + secret.toUtf8();
+    }
     CREDENTIALW credential{};
     credential.Type = CRED_TYPE_GENERIC;
     auto targetName = target.toStdWString(), userName = user.toStdWString();
@@ -57,8 +66,11 @@ std::optional<QString> readSecret(const QString &target)
     PCREDENTIALW credential = nullptr;
     if (!CredReadW(reinterpret_cast<LPCWSTR>(target.utf16()), CRED_TYPE_GENERIC, 0, &credential))
         return std::nullopt;
-    const QString secret = QString::fromUtf16(reinterpret_cast<const char16_t *>(credential->CredentialBlob),
-                                              qsizetype(credential->CredentialBlobSize / 2));
+    const auto *bytes = reinterpret_cast<const char *>(credential->CredentialBlob);
+    const auto size = qsizetype(credential->CredentialBlobSize);
+    const QString secret = size >= Utf8Mark.size() && QByteArray::fromRawData(bytes, Utf8Mark.size()) == Utf8Mark
+                               ? QString::fromUtf8(bytes + Utf8Mark.size(), size - Utf8Mark.size())
+                               : QString::fromUtf16(reinterpret_cast<const char16_t *>(bytes), size / 2);
     SecureZeroMemory(credential->CredentialBlob, credential->CredentialBlobSize);
     CredFree(credential);
     return secret;

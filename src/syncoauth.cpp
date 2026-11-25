@@ -57,6 +57,7 @@ Tokens parseTokens(QNetworkReply *reply)
         t.expiresAt = QDateTime::currentMSecsSinceEpoch() + qint64(o["expires_in"].toDouble()) * 1000;
     if (t.access.isEmpty())
     {
+        t.rejected = o.contains("error");
         t.error = o["error_description"].toString(o["error"].toString());
         if (t.error.isEmpty())
             t.error = reply->errorString();

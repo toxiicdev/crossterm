@@ -1,5 +1,6 @@
 #include "syncui.h"
 #include "credentials.h"
+#include "profiles.h" // openForUser
 #include "syncoauth.h"
 #include <QApplication>
 #include <QCheckBox>
@@ -129,6 +130,7 @@ SyncStorage::Result wait(const std::function<void(SyncStorage::Done)> &call)
 QString askNewPassword(QWidget *parent, const QString &title, const QString &intro)
 {
     QDialog dialog(parent);
+    dialog.setProperty("syncDialog", true); // a sync run may apply its data while it is open (see syncNow)
     dialog.setWindowTitle(title);
     auto *layout = new QVBoxLayout(&dialog);
     auto *text = new QLabel(intro);
@@ -163,6 +165,7 @@ QString askNewPassword(QWidget *parent, const QString &title, const QString &int
 bool showRecoveryKey(QWidget *parent, const QString &key)
 {
     QDialog dialog(parent);
+    dialog.setProperty("syncDialog", true); // a sync run may apply its data while it is open (see syncNow)
     dialog.setWindowTitle(ui("Recovery key"));
     auto *layout = new QVBoxLayout(&dialog);
     auto *text = new QLabel(ui("The recovery key is the only way to open the synchronized data if you forget the sync "
@@ -324,7 +327,11 @@ QJsonObject SyncController::collect(const SyncVault::Keys &k)
             const auto mac = QString::fromLatin1(
                 QMessageAuthenticationCode::hash((target + '\n' + *value).toUtf8(), k.dataKey, QCryptographicHash::Sha256).toBase64());
             auto stamp = stamps[target].toObject();
-            if (stamp["mac"].toString() != mac)
+            // Seen here for the first time (sync just turned on): the oldest time, not now. A device joining with an
+            // old saved password must not replace the current one the others have; one they lack still travels.
+            if (!stamp.contains("mac"))
+                stamp = QJsonObject{{"mac", mac}, {"modified", 1.0}};
+            else if (stamp["mac"].toString() != mac)
                 stamp = QJsonObject{{"mac", mac}, {"modified", double(SyncMerge::nowMs())}};
             stamps[target] = stamp;
             passwords[target] = QJsonObject{{"user", profile["user"].toString()}, {"secret", *value}, {"modified", stamp["modified"]}};
@@ -437,9 +444,17 @@ void SyncController::apply(const QJsonObject &merged, const SyncVault::Keys &k)
             auto profile = sessions[i].toObject();
             const auto key = files[profile["id"].toString()].toObject();
             const auto current = profile["identity"].toString();
-            if (key.isEmpty() || !(current.isEmpty() || !QFile::exists(current) || current.startsWith(folder)))
+            // Compared with '/' on every system: the identity is stored with native separators ('\' on Windows),
+            // and a key of this folder was then never updated there.
+            const bool ours = QDir::fromNativeSeparators(current).startsWith(folder + '/');
+            if (key.isEmpty() || !(current.isEmpty() || !QFile::exists(current) || ours))
                 continue;
-            const auto name = QFileInfo(key["name"].toString()).fileName().remove(QRegularExpression("[^A-Za-z0-9._-]"));
+            // A name written by this code ("<id>-id_ed25519") comes back from the other devices: the id is not added
+            // again, or the name grew at every run with a new file each time.
+            const auto prefix = profile["id"].toString() + "-";
+            auto name = QFileInfo(key["name"].toString()).fileName().remove(QRegularExpression("[^A-Za-z0-9._-]"));
+            while (name.startsWith(prefix))
+                name = name.mid(prefix.size());
             const auto path = QDir(folder).filePath(profile["id"].toString() + "-" + (name.isEmpty() ? "key" : name));
             const auto bytes = QByteArray::fromBase64(key["data"].toString().toLatin1());
             QFile existing(path);
@@ -483,7 +498,19 @@ void SyncController::syncNow()
     const auto base = file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
     setStatus(ui("Synchronizing..."));
     running = std::make_unique<SyncEngine::Engine>(std::move(storage), *k, base, kinds());
-    running->run(SyncEngine::Device{[this, k] { return collect(*k); }, [this, k](const QJsonObject &m) { apply(m, *k); }},
+    // Busy: an open menu, or a dialog that is not synchronization's own, holds positions in the sessions, tunnels or
+    // macros (Edit, Delete, Rename...): data changed under it would make it act on another item.
+    const auto busy = []
+    {
+        if (QApplication::activePopupWidget())
+            return true;
+        for (QWidget *w = QApplication::activeModalWidget(); w; w = w->parentWidget())
+            if (w->property("syncDialog").toBool())
+                return false;
+        return QApplication::activeModalWidget() != nullptr;
+    };
+    running->run(SyncEngine::Device{[this, k] { return collect(*k); }, [this, k](const QJsonObject &m) { apply(m, *k); },
+                                    busy},
                  [this](const SyncEngine::Outcome &o) { finished(o); });
 }
 
@@ -493,6 +520,12 @@ void SyncController::finished(const SyncEngine::Outcome &o)
     auto *engine = running.release();
     QTimer::singleShot(0, this, [engine] { delete engine; });
     saveStorageUpdates(o.updated);
+    if (o.status == SyncEngine::Outcome::Busy)
+    {
+        debounce.start(); // again in a few seconds, once the dialog or menu has closed
+        pending = false;
+        return;
+    }
     if (o.status == SyncEngine::Outcome::Ok)
     {
         storeKeys(o.keys);
@@ -523,6 +556,7 @@ void SyncController::finished(const SyncEngine::Outcome &o)
 void SyncController::dialog(QWidget *parent)
 {
     QDialog dialog(parent);
+    dialog.setProperty("syncDialog", true); // a sync run may apply its data while it is open (see syncNow)
     dialog.setWindowTitle(ui("Synchronization"));
     QSettings settings;
     auto *layout = new QVBoxLayout(&dialog);
@@ -615,7 +649,7 @@ void SyncController::dialog(QWidget *parent)
                     }
                     account->setText(ui("Waiting for the browser..."));
                     auto *login = new SyncOAuth::Login(&dialog);
-                    login->start(SyncOAuth::provider(type), [](const QUrl &url) { QDesktopServices::openUrl(url); },
+                    login->start(SyncOAuth::provider(type), [](const QUrl &url) { openForUser(url); },
                                  [&dialog, login, refresh](const SyncOAuth::Tokens &t)
                                  {
                                      login->deleteLater();

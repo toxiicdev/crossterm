@@ -744,10 +744,14 @@ inline int runAskpass(int &argc, char **argv)
             states << tag;
     }
     const auto state = states[line].mid(tag.size()).trimmed();
-    const int attempt = QByteArray(state).replace('c', "").replace('p', "").toInt() + 1;
+    const int attempt = QByteArray(state).replace('c', "").replace('p', "").replace('v', "").toInt() + 1;
     QByteArray answered = state.contains('c') ? "c" : "";
     if (state.contains('p'))
         answered += 'p';
+    // 'v': the vault's password was sent to this process. Not "attempt 1": a key passphrase asked first used that
+    // turn, and the saved password was then never sent.
+    if (state.contains('v'))
+        answered += 'v';
     auto record = [&]
     {
         states[line] = tag + QByteArray::number(attempt) + answered;
@@ -757,8 +761,11 @@ inline int runAskpass(int &argc, char **argv)
     };
     record();
     const auto saved = target.isEmpty() || passphrase || foreign ? std::nullopt : vaultRead(target);
-    if (attempt == 1 && saved)
+    const bool savedSent = answered.contains('v');
+    if (saved && !savedSent)
     {
+        answered += 'v';
+        record();
         writeAnswer(*saved);
         return 0;
     }
@@ -800,7 +807,7 @@ inline int runAskpass(int &argc, char **argv)
     QDialog dialog;
     dialog.setWindowTitle(L("Authentication"));
     auto *layout = new QVBoxLayout(&dialog);
-    if (attempt > 1)
+    if (savedSent) // only then is it the saved password that was rejected
     {
         auto *rejected = new QLabel(L("The saved password was rejected by the server."));
         rejected->setStyleSheet("color: #c0392b;");
@@ -825,7 +832,8 @@ inline int runAskpass(int &argc, char **argv)
     if (dialog.exec() != QDialog::Accepted)
         return 1;
     auto value = secret->text();
-    if (remember->isVisible())
+    // !isHidden(): offered (setVisible above). isVisible() is false here, the dialog is already closed.
+    if (!remember->isHidden())
     {
         if (remember->isChecked())
             vaultStore(target, value);

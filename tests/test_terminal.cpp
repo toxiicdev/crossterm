@@ -128,6 +128,13 @@ int main(int argc, char **argv)
     // Keyboard and paste go to the device.
     terminal.paste("ls -l");
     CHECK(device->written == "ls -l")
+    // Text composed by a dead key or an input method reaches the session as typed text.
+    CHECK(terminal.testAttribute(Qt::WA_InputMethodEnabled))
+    device->written.clear();
+    QInputMethodEvent composed;
+    composed.setCommitString(QString::fromUtf8("é"));
+    QApplication::sendEvent(&terminal, &composed);
+    CHECK(device->written == QString::fromUtf8("é").toUtf8())
 
     // Predictions: drawn over the cell, the real cursor does not move, clearPredictions returns to the real screen.
     device->feed("\x1b[2J\x1b[Hxy");
@@ -152,6 +159,30 @@ int main(int argc, char **argv)
     CHECK(terminal.finished())
     CHECK(terminal.allText().contains("Session stopped"))
     CHECK(terminal.allText().contains("bye"))
+
+    // A selection across a row that wrapped at the window width copies one line: no break where it wrapped, and the
+    // space at the wrap column is kept.
+    {
+        auto *wrapDevice = new FakeDevice;
+        Terminal wrap(wrapDevice);
+        wrap.show();
+        setGrid(wrap, 40, 10);
+        const QByteArray command = "echo " + QByteArray(34, 'a') + " " + QByteArray(19, 'b'); // space at column 39
+        wrapDevice->feed("\x1b[2J\x1b[H" + command + "\r\nnext\r\n");
+        const QFontMetrics fm(wrap.font());
+        auto at = [&](int col, int row)
+        { return QPointF(4 + col * fm.horizontalAdvance('M') + 1, 4 + row * fm.height() + 1); };
+        auto mouse = [&](QEvent::Type type, QPointF p)
+        {
+            QMouseEvent e(type, p, wrap.mapToGlobal(p), Qt::LeftButton,
+                          type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(&wrap, &e);
+        };
+        mouse(QEvent::MouseButtonPress, at(0, 0));
+        mouse(QEvent::MouseMove, at(4, 2));
+        mouse(QEvent::MouseButtonRelease, at(4, 2));
+        CHECK(wrap.selection() == QString(command) + "\nnext")
+    }
 
     // Connection lost inside a full-screen program (alternate screen, scroll region, hidden cursor, colours): the notice
     // goes back to the normal screen below the shell output, not over what the program had drawn.

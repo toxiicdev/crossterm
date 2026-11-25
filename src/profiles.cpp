@@ -15,8 +15,10 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFileInfo>
+#include <QUrl>
 #include <QHash>
 #include <QJsonDocument>
 #include <QRegularExpression>
@@ -209,6 +211,39 @@ QProcess *hideConsoleWindow(QProcess *process)
         });
 #endif
     return process;
+}
+
+bool startForUser(const QString &program, const QStringList &arguments, const QString &native)
+{
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(arguments);
+#ifdef Q_OS_WIN
+    if (!native.isEmpty())
+        process.setNativeArguments(native);
+    // Out of the job (it allows breakaway); a job of whoever started CrossTerm may refuse it: then as before.
+    process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *a) { a->flags |= CREATE_BREAKAWAY_FROM_JOB; });
+    if (process.startDetached())
+        return true;
+    process.setCreateProcessArgumentsModifier({});
+#else
+    Q_UNUSED(native);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
+    process.setUnixProcessParameters(QProcess::UnixProcessFlag::CreateNewSession);
+#endif
+#endif
+    return process.startDetached();
+}
+
+bool openForUser(const QUrl &url)
+{
+#ifdef Q_OS_WIN
+    // Explorer hands the target to the running shell, whose child the program becomes: not one of ours.
+    return startForUser("explorer.exe", {url.isLocalFile() ? QDir::toNativeSeparators(url.toLocalFile())
+                                                           : url.toString(QUrl::FullyEncoded)});
+#else
+    return QDesktopServices::openUrl(url);
+#endif
 }
 
 bool isHiddenShellInvocation(int argc)
@@ -456,7 +491,12 @@ Import parseMoba(const QByteArray &bytes, const QString &drive)
                     tail.remove(0, 1);
                 identity = drive + ":" + tail;
             }
-            if (identity.startsWith("_CurrentDrive_"))
+            // MobaXterm's home folder; its other placeholders (_MyDocuments_, _AppDataDir_...) cannot be resolved
+            // here: the key is to be chosen, not silently missing at every login.
+            if (identity.startsWith("_ProfileDir_"))
+                identity = QDir::toNativeSeparators(QDir::homePath()) + identity.mid(12);
+            static const QRegularExpression placeholder("^_[A-Za-z]+_");
+            if (placeholder.match(identity).hasMatch())
                 issues.append("Seleziona la chiave privata locale.");
         }
         if (ssh && !fields.value(8).isEmpty())

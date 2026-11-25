@@ -691,6 +691,7 @@ void Terminal::setup()
     setFont(face);
     s.predictionUnderline = settings.value("terminal/predictionUnderline", true).toBool();
     setAttribute(Qt::WA_OpaquePaintEvent);
+    setAttribute(Qt::WA_InputMethodEnabled); // without it Qt composes no dead keys and passes no IME text
     setAccessibleName("Terminal");
     vterm_set_utf8(s.vt, 1);
     vterm_screen_enable_altscreen(s.screen, 1);
@@ -911,8 +912,10 @@ Terminal::Terminal(const Command &command, QWidget *parent) : QWidget(parent), s
 {
     setup();
     auto &s = *state;
-    const QString program =
-        QDir::isAbsolutePath(command.program) ? command.program : QStandardPaths::findExecutable(command.program);
+    // A command with an error is never run, only shown as "Cannot start" (a session whose connection failed).
+    const QString program = !command.error.isEmpty()                ? QString()
+                            : QDir::isAbsolutePath(command.program) ? command.program
+                                                                    : QStandardPaths::findExecutable(command.program);
     bool started = false;
     if (!program.isEmpty())
     {
@@ -1568,7 +1571,9 @@ QString Terminal::selectedText() const
         return {};
     if (std::make_pair(a.y(), a.x()) > std::make_pair(b.y(), b.x()))
         std::swap(a, b);
-    QStringList lines;
+    // A row that the next one continues (wrapped at the window width) is one line: no break between them, and its
+    // last columns are kept even when they are spaces, or a long command pasted elsewhere would be cut in two.
+    QString result;
     for (int line = a.y(); line <= b.y(); ++line)
     {
         QString text;
@@ -1583,11 +1588,15 @@ QString Terminal::selectedText() const
             else
                 text += ' ';
         }
-        while (text.endsWith(' '))
-            text.chop(1);
-        lines << text;
+        const bool wraps = line < b.y() && state->continued(line + 1);
+        if (!wraps)
+            while (text.endsWith(' '))
+                text.chop(1);
+        result += text;
+        if (line < b.y() && !wraps)
+            result += '\n';
     }
-    return lines.join('\n');
+    return result;
 }
 
 void Terminal::mousePressEvent(QMouseEvent *event)
@@ -1601,7 +1610,7 @@ void Terminal::mousePressEvent(QMouseEvent *event)
             hoverLink(event->position().toPoint(), true);
             if (state->linkFrom != state->linkTo)
             {
-                QDesktopServices::openUrl(state->link);
+                openForUser(state->link); // the browser must not close with CrossTerm
                 return;
             }
         }
@@ -1909,6 +1918,31 @@ bool Terminal::isPasteKey(const QKeyEvent *event)
     return (held == (Qt::ControlModifier | Qt::ShiftModifier) && event->key() == Qt::Key_V) ||
            (held == Qt::ShiftModifier && event->key() == Qt::Key_Insert);
 #endif
+}
+
+void Terminal::inputMethodEvent(QInputMethodEvent *event)
+{
+    // Typed like the keys that produce it (prompt, keys held during login, session), as one text key.
+    if (const auto text = event->commitString(); !text.isEmpty())
+    {
+        QKeyEvent key(QEvent::KeyPress, 0, Qt::NoModifier, text);
+        keyPressEvent(&key);
+    }
+    event->accept();
+}
+
+QVariant Terminal::inputMethodQuery(Qt::InputMethodQuery query) const
+{
+    if (query == Qt::ImEnabled)
+        return true;
+    if (query == Qt::ImCursorRectangle) // where the input method's candidate window goes: at the cursor
+    {
+        const QFontMetrics fm(font());
+        const auto cursor = cursorPosition();
+        return QRect(4 + cursor.x() * fm.horizontalAdvance('M'), 4 + (cursor.y() + state->offset) * fm.height(),
+                     fm.horizontalAdvance('M'), fm.height());
+    }
+    return QWidget::inputMethodQuery(query);
 }
 
 void Terminal::keyPressEvent(QKeyEvent *event)

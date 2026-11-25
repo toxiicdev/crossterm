@@ -658,7 +658,8 @@ private:
         else
         {
             p->state = Page::Failed;
-            return new Terminal(Command{p->profile["protocol"].toString(), {}, {}}, area); // shows "Cannot start"
+            // Shows "Cannot start" without running anything: a local program of that name (mosh) must not start.
+            return new Terminal(Command{p->profile["protocol"].toString(), {}, "not connected", {}}, area);
         }
         // The banner is written now, at the top of a full-size grid: not into the 2 rows of a tab not laid out yet.
         t->sizeWhenShown();
@@ -1559,6 +1560,7 @@ private:
         proxyRow->addWidget(proxyPort);
         adv->addRow(L("Proxy"), proxyRow);
         const auto application = QCoreApplication::applicationName();
+        const QJsonObject before = profile; // what the dialog does not show is carried over from it
         const auto oldTarget = credentialTarget(profile, application);
         const bool hasSaved = index >= 0 && readSecret(oldTarget).has_value();
         auto *password = new QLineEdit;
@@ -1716,12 +1718,25 @@ private:
                                     {"favorite", profile["favorite"].toBool()}};
                     if (!iconData.isEmpty())
                         profile["icon"] = iconData;
+                    // Not in the dialog: the certificate accepted for the same server, and the mark of a conflict copy.
+                    if (before["host"] == profile["host"] && before["port"] == profile["port"])
+                        for (const auto *key : {"ftpFingerprint", "rdpFingerprint"})
+                            if (before.contains(key))
+                                profile[key] = before[key];
+                    if (before.contains("conflictOf"))
+                        profile["conflictOf"] = before["conflictOf"];
                     // Validation: mosh like SSH; serial and WSL only have the port or distribution name.
                     auto check = profile;
                     if (protocol == "mosh")
                         check["protocol"] = "ssh";
                     auto command = protocol == "serial" ? Command{} : sessionCommand(check, platform(), false);
                     if (protocol == "serial" && host->text().trimmed().isEmpty())
+                        command.error = "Indirizzo o porta da verificare.";
+                    // Mosh ports as moshConnect takes them ("60001" or "60001:60999"): otherwise every connect fails
+                    // with a message about mosh not being installed.
+                    static const QRegularExpression moshRange("^\\d{1,5}(:\\d{1,5})?$");
+                    if (protocol == "mosh" && !moshPorts->text().trimmed().isEmpty() &&
+                        !moshRange.match(moshPorts->text().trimmed()).hasMatch())
                         command.error = "Indirizzo o porta da verificare.";
                     if (title.isEmpty() || !command.error.isEmpty())
                     {
@@ -1737,7 +1752,8 @@ private:
                         return;
                     // Passwords: only in the system vault, never in the sessions file.
                     const auto newTarget = credentialTarget(profile, application);
-                    if (ssh && vaultAvailable() && savePassword->isChecked())
+                    // Every protocol: a saved password (imported or synchronized) follows a new host, user or port.
+                    if (vaultAvailable() && savePassword->isChecked())
                     {
                         auto secret = password->text();
                         if (secret.isEmpty() && hasSaved && newTarget != oldTarget)
@@ -1747,7 +1763,9 @@ private:
                                                  L("The password could not be saved in the system vault."));
                         secret.fill(QChar(0));
                     }
-                    if (hasSaved && (!savePassword->isChecked() || newTarget != oldTarget) && !targetInUse(oldTarget))
+                    // The edited session itself is in profiles now: it must not count as another user of the old target.
+                    if (hasSaved && (!savePassword->isChecked() || newTarget != oldTarget) &&
+                        !targetInUse(oldTarget, profile["id"].toString()))
                         removeSecret(oldTarget);
                     password->clear();
                     editor.accept();
@@ -1789,6 +1807,12 @@ private:
         const auto program = QStandardPaths::findExecutable(command.program);
         if (!command.error.isEmpty() || program.isEmpty())
             return nullptr;
+        // The port range becomes part of the command run by the remote shell: digits only ("60001" or "60001:60010").
+        // Checked before askpass is set up for this connection, which an early return would leave registered.
+        static const QRegularExpression portRange("^\\d{1,5}(:\\d{1,5})?$");
+        const auto ports = profile["moshPorts"].toString().trimmed();
+        if (!ports.isEmpty() && !portRange.match(ports).hasMatch())
+            return nullptr;
         QProcess bootstrap;
         hideConsoleWindow(&bootstrap);
         auto environment = QProcessEnvironment::systemEnvironment();
@@ -1796,11 +1820,6 @@ private:
             environment.insert(entry.section('=', 0, 0), entry.section('=', 1));
         bootstrap.setProcessEnvironment(environment);
         bootstrap.setProcessChannelMode(QProcess::MergedChannels);
-        // The port range becomes part of the command run by the remote shell: digits only ("60001" or "60001:60010").
-        static const QRegularExpression portRange("^\\d{1,5}(:\\d{1,5})?$");
-        const auto ports = profile["moshPorts"].toString().trimmed();
-        if (!ports.isEmpty() && !portRange.match(ports).hasMatch())
-            return nullptr;
         const auto remote = moshServerArguments(ports).join(' ');
         bootstrap.start(program, QStringList{"-tt"} + command.arguments + QStringList{remote});
         QEventLoop loop;
@@ -2099,7 +2118,7 @@ private:
         // Prompts (password, host key) appear inside the terminal tab, identified by this id.
         if (protocol == "ssh" || protocol == "sftp")
             command.environment << askpassFor(profile, true, QUuid::createUuid().toString(QUuid::WithoutBraces));
-        if (command.error.isEmpty())
+        if (command.error.isEmpty() && !profile["id"].toString().isEmpty()) // quick connects have no id
         {
             auto ids = QSettings().value("recent").toStringList();
             ids.removeAll(profile["id"].toString());
@@ -2241,11 +2260,13 @@ private:
                    : QString();
     }
 
-    bool targetInUse(const QString &target) const
+    // except: the id of a session not to count (the one being edited).
+    bool targetInUse(const QString &target, const QString &except = {}) const
     {
         for (const auto &v : profiles)
         {
-            if (credentialTarget(v.toObject(), QCoreApplication::applicationName()) == target)
+            if (credentialTarget(v.toObject(), QCoreApplication::applicationName()) == target &&
+                (except.isEmpty() || v.toObject()["id"].toString() != except))
                 return true;
         }
         return false;
@@ -2350,13 +2371,17 @@ private:
                             {"host", m.captured(3).remove('[').remove(']')},
                             {"user", m.captured(2)},
                             {"port", m.captured(4).isEmpty() ? defaultPort(protocol) : m.captured(4).toInt()}};
-        const auto command = sessionCommand(profile, platform(), qEnvironmentVariableIsSet("DISPLAY"));
+        profile["name"] = profile["host"];
+        profile["x11"] = protocol == "ssh" && qEnvironmentVariableIsSet("DISPLAY"); // as before: X11 where X runs
+        const auto command = sessionCommand(profile, platform(), false);
         if (!command.error.isEmpty())
         {
             QMessageBox::warning(this, L("Quick connect"), describe(command.error));
             return;
         }
-        terminal(command, profile["host"].toString(), profile);
+        // As a saved session opens: the built-in telnet (no telnet program on Windows or recent macOS), and askpass
+        // so a password typed once also serves the SFTP browser, monitoring and tunnels of the tab.
+        openProfile(profile);
         quick->clear();
     }
 
@@ -3266,8 +3291,9 @@ private:
             const auto *p = page(i);
             if (p == home || !p->terminal)
                 continue;
+            // "Open SFTP session" keeps the SSH session's id: "|sftp" reopens it as SFTP, not as a shell.
             if (p->profile.contains("id"))
-                ids << p->profile["id"].toString();
+                ids << p->profile["id"].toString() + (p->profile["protocol"].toString() == "sftp" ? "|sftp" : "");
             else if (p->profile.isEmpty())
                 ids << "local";
         }
@@ -3283,10 +3309,12 @@ private:
                 terminal(localShell(), L("Local terminal"));
                 continue;
             }
+            const bool sftp = id.endsWith("|sftp");
+            const auto plain = sftp ? id.chopped(5) : id;
             for (int i = 0; i < profiles.size(); ++i)
             {
-                if (profiles[i].toObject()["id"].toString() == id)
-                    open(i);
+                if (profiles[i].toObject()["id"].toString() == plain)
+                    sftp ? openSftp(i) : open(i);
             }
         }
         QSettings().remove("lastSessions");
@@ -4088,10 +4116,19 @@ private:
                     return;
                 }
                 const auto before = profiles.size();
-                if (!save(applyExtras(next, extras, importSettings->isVisible() && importSettings->isChecked(),
-                                      importMacros->isVisible() && importMacros->isChecked(),
+                // A save that fails (file locked, disk full) must leave nothing of the import behind: the macros and
+                // tunnels go back as they were, and the settings are applied only once the save has worked.
+                const auto oldTunnels = tunnels, oldMacros = macros;
+                if (!save(applyExtras(next, extras, false, importMacros->isVisible() && importMacros->isChecked(),
                                       importTunnels->isVisible() && importTunnels->isChecked())))
+                {
+                    tunnels = oldTunnels;
+                    macros = oldMacros;
+                    refreshMacros();
                     return;
+                }
+                if (importSettings->isVisible() && importSettings->isChecked())
+                    applyExtras(profiles, extras, true, false, false);
                 undoImport->setEnabled(true);
                 importPasswords(&dialog, imported, chosen);
                 // profiles is what was saved: it also counts the tunnel servers added by applyExtras.
@@ -6149,7 +6186,11 @@ public:
             auto *a = m->addAction(iconName.isEmpty() ? QIcon() : icon(iconName, 16), QString());
             texts.text(a, text);
             a->setObjectName(text);
-            shortcutActions << a;
+            // One row per command in Keyboard shortcuts: a second copy (the toolbar's Tools popup) shares the id, and
+            // with two rows one shortcut was saved over by the other's empty default, or blocked OK as a duplicate.
+            if (std::none_of(shortcutActions.begin(), shortcutActions.end(),
+                             [text](const QAction *o) { return o->objectName() == QLatin1String(text); }))
+                shortcutActions << a;
             connect(a, &QAction::triggered, this, slot);
             return a;
         };
@@ -6296,6 +6337,34 @@ public:
                  scanner->show();
              });
         item(toolsMenu, N("Wake On LAN..."), [this] { wakeOnLanDialog(); });
+        {
+            // Upload folders as ZIP (SFTP: zipped here, unzip -o on the server). Each click: off -> this session ->
+            // remembered -> off; only "remembered" is saved.
+            toolsMenu->addSeparator();
+            auto *zip = toolsMenu->addAction(QString());
+            zip->setCheckable(true);
+            auto show = [zip]
+            {
+                const int mode = sftpZipUploads();
+                zip->setChecked(mode > 0);
+                zip->setText(L("Upload folders as ZIP") +
+                             (mode == 1 ? " (" + L("this session") + ")" : mode == 2 ? " (" + L("remembered") + ")" : QString()));
+            };
+            connect(zip, &QAction::triggered, this,
+                    [show]
+                    {
+                        auto &mode = sftpZipUploads();
+                        mode = (mode + 1) % 3;
+                        QSettings settings;
+                        if (mode == 2)
+                            settings.setValue("sftp/zipUploads", true);
+                        else
+                            settings.remove("sftp/zipUploads");
+                        show();
+                    });
+            show();
+            retranslators << show;
+        }
         item(settingsMenu, N("Configuration"), [this] { settingsDialog(); }, "settings");
         auto *languageMenu = new QMenu(this);
         texts.bind(languageMenu, &QMenu::setTitle, N("Language"));
@@ -6806,7 +6875,9 @@ static void bindChildrenToLifetime()
     if (!job)
         return;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // BREAKAWAY_OK: what is opened for the user (browser, editor) leaves the job explicitly (startForUser), so
+    // closing CrossTerm does not kill it with its unsaved work. Everything else stays in the job.
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
         !AssignProcessToJobObject(job, GetCurrentProcess()))
         CloseHandle(job);
@@ -6892,9 +6963,8 @@ int main(int argc, char **argv)
         window.restoreWindow();
         window.startAutostartTunnels();
         window.startAutostartSessions();
-        // askpass counters left over from previous sessions (they contain only a number).
-        for (const auto &old : QDir::temp().entryList({"crossterm-askpass-*"}, QDir::Files))
-            QFile::remove(QDir::temp().filePath(old));
+        // Leftover askpass counters are removed by SessionSecrets::start() once a day old: removing them all here
+        // also reset those of the sessions just autostarted and of another CrossTerm running with another config.
     }
     if (smoke || e2e > 0)
     {

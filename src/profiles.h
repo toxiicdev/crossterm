@@ -31,6 +31,12 @@ QByteArray aes256EncryptBlock(const QByteArray &key32, const QByteArray &block16
 // all), the programs they start in turn (sftp -> ssh) inherit it instead of opening a visible one.
 // Call before start(); no effect on other platforms.
 QProcess *hideConsoleWindow(QProcess *process);
+// Programs and documents opened for the user (browser, editor, "Open with"): they stay open when CrossTerm closes or
+// crashes, unlike its own children, which die with it (Windows: outside the kill-on-close job; Unix: own session,
+// out of the process group that the crash handler kills).
+// native: Windows only, appended to the command line as it is (no quoting).
+bool startForUser(const QString &program, const QStringList &arguments, const QString &native = {});
+bool openForUser(const class QUrl &url); // a URL or a local file, with the system's default program
 // Path quoted for an sftp batch line ("./" before a leading dash); empty when it holds control characters.
 QString sftpQuote(QString text);
 

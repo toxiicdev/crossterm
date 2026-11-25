@@ -100,6 +100,12 @@ void Engine::attempt(int left)
                 updated[it.key()] = it.value();
             if (read.status == SyncStorage::Result::Failed)
                 return finish(failure(read));
+            if (device.busy && device.busy())
+            {
+                Outcome o;
+                o.status = Outcome::Busy;
+                return finish(o);
+            }
             const QJsonObject local = part(device.collect(), kinds, true);
             QJsonObject remoteAll;
             if (read.status == SyncStorage::Result::Ok)

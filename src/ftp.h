@@ -28,6 +28,10 @@ class QTreeWidget;
 // ---- Shared by the SFTP and FTP browsers.
 // "512 B", "12 KB", "1.2 MB", "3.4 GB" (1024 based; the units are not translated).
 QString fileSizeText(qint64 bytes);
+// Real path of an existing file or folder, every link resolved: Windows junctions too, which
+// QFileInfo::canonicalFilePath leaves as they are. Empty when it does not exist. Used to keep the built-in servers
+// inside their folder.
+QString resolvedPath(const QString &path);
 // "Replace existing files?" answers remembered until CrossTerm closes, per kind of transfer (the question's title), for
 // every SFTP and FTP tab.
 inline QHash<QString, bool> &rememberedReplaces()
@@ -194,7 +198,9 @@ class FtpPanel : public QWidget
 public:
     FtpPanel(const QJsonObject &profile, std::function<QString()> passwordProvider, QWidget *parent = nullptr);
     ~FtpPanel() override;
-    void browse(const QString &path); // absolute path or relative to the current folder
+    // Absolute path or relative to the current folder. notFolder: called instead of showing the error when it cannot
+    // be entered (a link that leads to a file).
+    void browse(const QString &path, std::function<void()> notFolder = {});
     void refresh();
     // Existing remote names (upload) or local files (download): one question before anything is queued.
     void upload(const QStringList &localFiles);                     // into the current folder; folders too

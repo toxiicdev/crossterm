@@ -17,6 +17,9 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#ifdef Q_OS_MACOS
+#include <IOKit/serial/ioss.h> // IOSSIOSPEED: rates above 230400
+#endif
 #endif
 
 // Moves at most maxSize bytes from the internal buffer to the caller.
@@ -246,6 +249,13 @@ RloginDevice::RloginDevice(const QString &host, const QString &remoteUser, quint
     const QString user = localUser.isEmpty() ? qEnvironmentVariable("USERNAME", qEnvironmentVariable("USER")) : localUser;
     connect(socket, &QTcpSocket::readyRead, this, [this] { receive(); });
     connect(socket, &QTcpSocket::disconnected, this, &QIODevice::readChannelFinished);
+    // rlogind, like rshd, refuses unprivileged source ports ("illegal port"): a reserved one (512..1023) if any.
+    // Before errorOccurred is connected: a failed bind must not end the session or stay as its reason.
+    bool reserved = false;
+    for (quint16 local = 1023; local >= 512 && !reserved; --local)
+        reserved = socket->bind(QHostAddress::Any, local);
+    if (!reserved)
+        socket->bind(QHostAddress::Any, 0);
     connect(socket, &QAbstractSocket::errorOccurred, this,
             [this](QAbstractSocket::SocketError error)
             {
@@ -472,7 +482,10 @@ bool SerialDevice::open(OpenMode mode)
     // the incoming bytes from this one.
     ioctl(fd, TIOCEXCL);
 #ifdef Q_OS_MACOS
-    const speed_t speed = speed_t(s.baud); // on BSD/macOS the speed is the numeric value
+    // On BSD/macOS the speed is the numeric value. Above 230400 (460800, 921600) the drivers refuse it in
+    // tcsetattr: 230400 there, then the real rate with IOSSIOSPEED below (as pyserial and screen do).
+    const speed_t real = speed_t(s.baud);
+    const speed_t speed = real > 230400 ? speed_t(230400) : real;
 #else
     static const std::pair<int, speed_t> speeds[] = {{1200, B1200},     {2400, B2400},     {4800, B4800},    {9600, B9600},
                                                      {19200, B19200},   {38400, B38400},   {57600, B57600},  {115200, B115200},
@@ -500,7 +513,11 @@ bool SerialDevice::open(OpenMode mode)
         tio.c_iflag |= IXON | IXOFF;
     tio.c_cc[VMIN] = 0;
     tio.c_cc[VTIME] = 0;
-    if (!speed || cfsetispeed(&tio, speed) != 0 || cfsetospeed(&tio, speed) != 0 || tcsetattr(fd, TCSANOW, &tio) != 0)
+    if (!speed || cfsetispeed(&tio, speed) != 0 || cfsetospeed(&tio, speed) != 0 || tcsetattr(fd, TCSANOW, &tio) != 0
+#ifdef Q_OS_MACOS
+        || (real != speed && ioctl(fd, IOSSIOSPEED, &real) != 0)
+#endif
+    )
     {
         setErrorString(translated("Cannot configure %1: %2")
                            .arg(s.portName, speed ? qt_error_string(errno) : translated("unsupported speed")));

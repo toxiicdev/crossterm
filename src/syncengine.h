@@ -23,6 +23,7 @@ struct Outcome
         Ok,
         Failed,       // storage or network error (error, signIn, fingerprint tell more)
         NeedPassword, // the file is encrypted with another key (sync set up again elsewhere): unlock it again
+        Busy,         // the device was busy (Device::busy): nothing merged or written, run again later
     } status = Failed;
     QString error;
     bool signIn = false;     // cloud account to sign in again
@@ -39,6 +40,9 @@ struct Device
 {
     std::function<QJsonObject()> collect;               // this device's payload (syncmerge.h)
     std::function<void(const QJsonObject &merged)> apply; // called only when the merged data differs from it
+    // Optional: true while this device's data must not change under the user (a dialog or menu holds positions in
+    // it). Asked when the storage answers, right before collect and apply.
+    std::function<bool()> busy;
 };
 
 class Engine

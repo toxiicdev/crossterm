@@ -413,11 +413,40 @@ static bool sftpOpenInTextEditor(const QString &file)
     for (const char *editor : {"gnome-text-editor", "gedit", "kate", "kwrite", "mousepad", "xed", "pluma", "featherpad"})
     {
         if (const auto program = QStandardPaths::findExecutable(editor); !program.isEmpty())
-            return QProcess::startDetached(program, {file});
+            return startForUser(program, {file});
     }
     return false;
 }
 #endif
+
+// "Upload folders as ZIP" (Tools): 0 off, 1 this run of CrossTerm, 2 remembered ("sftp/zipUploads").
+inline int &sftpZipUploads()
+{
+    static int mode = QSettings().value("sftp/zipUploads").toBool() ? 2 : 0;
+    return mode;
+}
+
+// The program that zips a local folder on this computer: bsdtar (tar.exe of Windows 10 and later, /usr/bin/tar of
+// macOS) or zip, else bsdtar where installed. Run in the folder's parent so the archive holds "<name>/...", which
+// unzip -o puts back as that folder. Empty program: none here.
+static std::pair<QString, QStringList> sftpZipCommand(const QString &name, const QString &zip)
+{
+    // Names as UTF-8 in the archive (unzip on the server reads them so; Windows' default code page would garble them).
+    const QStringList tar{"-a", "-c", "--options", "hdrcharset=UTF-8", "-f", zip, "--", name};
+#ifdef Q_OS_WIN
+    if (const auto program = QDir(qEnvironmentVariable("SystemRoot", "C:\\Windows")).filePath("System32/tar.exe");
+        QFileInfo::exists(program))
+        return {program, tar};
+#elif defined(Q_OS_MACOS)
+    if (QFileInfo::exists("/usr/bin/tar"))
+        return {"/usr/bin/tar", tar};
+#endif
+    if (const auto program = QStandardPaths::findExecutable("zip"); !program.isEmpty())
+        return {program, {"-r", "-q", "-y", zip, "./" + name}}; // -y: links as links; "./": a name starting with '-'
+    if (const auto program = QStandardPaths::findExecutable("bsdtar"); !program.isEmpty())
+        return {program, tar};
+    return {};
+}
 
 // Before a file named by the server is handed to a local program: not executable, and marked as downloaded
 // (macOS quarantine, Windows zone of the Internet) so that the system asks before running it.
@@ -742,6 +771,7 @@ class SftpPanel : public QWidget
         QString stamp;
         QString note; // warnings of a completed transfer (entries that sftp skipped)
         bool temporary = false; // "Download as zip": the remote file is removed once downloaded (or the row cleared)
+        QString unzip; // a folder uploaded as ZIP: its name; the archive is extracted (unzip -o) and removed once sent
         // Folder: its files (-1 while not known), shown as "X / N"; an upload counts the files read from the sizes
         // (ends: running totals), a download counts the files arrived beyond those already there (baseline).
         int files = -1, baseline = 0;
@@ -1112,6 +1142,21 @@ class SftpPanel : public QWidget
             run(wanted, {}, false);
         }
     }
+    // A link activated: listed as a folder first; when that listing fails on a server that answered, it is a link to
+    // a file and is opened as one.
+    struct LinkOpen
+    {
+        QString name, directory;
+        qint64 size = -1;
+    } linkOpen;
+    bool openLinkedFile()
+    {
+        const auto link = std::exchange(linkOpen, {});
+        if (link.name.isEmpty())
+            return false;
+        openRemote(link.name, link.size, 0, link.directory);
+        return true;
+    }
     // A listing through the open shell; false when there is none (or it is busy, or the path is not absolute).
     bool listViaShell(const QString &directory)
     {
@@ -1147,10 +1192,11 @@ class SftpPanel : public QWidget
         files->unsetCursor();
         if (std::exchange(listerWanted, {}).isEmpty())
             return;
-        // "cd" failed: only its message; the listing shown stays.
+        // "cd" failed: only its message; the listing shown stays (or the link activated was a file: opened).
         if (lines.isEmpty() || !lines[0].startsWith('/'))
         {
-            status->setText(lines.join('\n').left(400));
+            if (!openLinkedFile())
+                status->setText(lines.join('\n').left(400));
             return;
         }
         // The shape of sftp's output (home, then the listed folder): showListing reads both the same way.
@@ -1346,7 +1392,15 @@ class SftpPanel : public QWidget
                     batch += "-ls -l " + name + "\n"; // its line tells a resume whether the remote file changed
                 if (t->edit && t->stage == 3)
                     batch += "-rm " + part + "\n"; // what a copy that did not work left
-                batch += verb + flags + " " + (t->upload ? local + " " + name : name + " " + local) + "\n";
+                // A folder goes into its parent: sftp appends the name to a destination folder that already exists,
+                // so replacing "site" with "site" as the destination would nest it as site/site.
+                const bool parent = t->folder && QFileInfo(t->local).fileName() == t->name;
+                const auto into = !parent    ? QString()
+                                  : t->upload ? QString(".")
+                                              : sftpQuote(QDir::fromNativeSeparators(QFileInfo(t->local).path()));
+                batch += verb + flags + " " +
+                         (t->upload ? local + " " + (!into.isEmpty() ? into : name) : name + " " + (!into.isEmpty() ? into : local)) +
+                         "\n";
             }
             if (auto edit = edited.find(t->local); t->edit && t->stage != 1 && edit != edited.end())
                 edit->stamp = stampOf(t->local); // what this upload sends: a later save differs from it
@@ -1470,8 +1524,12 @@ class SftpPanel : public QWidget
                 done = QFileInfo(t->local).size();
             if (done < 0)
                 continue;
+#ifdef Q_OS_MACOS
+            // The offset of this very file: sftp reads it only once the remote one is open (and emptied). Elsewhere
+            // the counters are the whole process's (batch, pipe, libraries): see the finished handler.
             if (t->upload && done > 0)
-                t->sent = true; // sftp reads the file only once the remote one is open (and emptied)
+                t->sent = true;
+#endif
             if (t->size > 0)
                 t->bar->setValue(int(std::min<qint64>(99, done * 100 / t->size)));
             if (t->rate.add(done, t->size))
@@ -1505,7 +1563,7 @@ public:
         if (prepare)
             prepare(*t);
         t->state = "queued";
-        t->item = new QTreeWidgetItem(queueView, {name, folder ? QString() : fileSizeText(size)});
+        t->item = new QTreeWidgetItem(queueView, {t->unzip.isEmpty() ? name : t->unzip + ".zip", folder ? QString() : fileSizeText(size)});
         t->item->setToolTip(0, QDir::toNativeSeparators(local));
         t->bar = new QProgressBar;
         t->bar->setRange(0, 100);
@@ -1680,6 +1738,13 @@ private:
                     auto echoed = [&lines](const QString &command)
                     { return int(lines.indexOf(QRegularExpression("^sftp> " + QRegularExpression::escape(command) + ".*"))); };
                     t->note.clear();
+#ifndef Q_OS_MACOS
+                    // Resume appends to the remote file (reput): only when this attempt's put reached it and emptied it.
+                    // Without sftp's echo (output held until exit, a killed process) it starts over instead: slower, but
+                    // never the old file's start joined to the new file's end.
+                    if (t->upload && !t->folder && !t->sent)
+                        t->sent = lines.indexOf(QRegularExpression("^sftp> (re)?put ")) >= 0 && !error.contains("open");
+#endif
                     if (t->cancelled)
                         t->state = "cancelled";
                     else if (code == 0 && exit == QProcess::NormalExit)
@@ -1753,7 +1818,14 @@ private:
                     // A failed or cancelled zip download stays on the server for Resume until its row is cleared.
                     if (t->state == "done")
                         removeTemporary(*t);
-                    if (t->state == "done" && t->upload && t->directory == listed)
+                    if (t->state == "done" && t->upload && !t->unzip.isEmpty())
+                    {
+                        // A folder sent as ZIP: extracted over what is there (unzip -o) and the archive removed; the
+                        // folder is listed again afterwards. The local archive is no longer needed.
+                        QFile::remove(t->local);
+                        extractHere(t->name, true, t->directory);
+                    }
+                    else if (t->state == "done" && t->upload && t->directory == listed)
                     {
                         if (process->state() == QProcess::NotRunning)
                             refresh();
@@ -1812,8 +1884,12 @@ public:
             status->setText(L("Operation in progress…"));
             return;
         }
+        linkOpen = {}; // a link waiting for its listing: superseded by this one
         if (operations.isEmpty() && listViaShell(directory))
             return;
+        // A shell listing still pending (stalled) is superseded by this one: its timeout must not list that older
+        // folder again over sftp afterwards, nor its late answer replace this listing.
+        listerWanted.clear();
         if (!command.error.isEmpty())
         {
             status->setText(describe(command.error));
@@ -1850,6 +1926,7 @@ public:
     // what the server wrote on the side, shown as the status.
     void showListing(const QString &output, const QString &error)
     {
+        linkOpen = {}; // the link led to a folder: listed
         QList<RemoteEntry> entries;
         // Link name -> target, when the listing tells it.
         QHash<QString, QString> targets;
@@ -1894,6 +1971,7 @@ public:
             item->setData(0, Qt::UserRole, e.dir);
             item->setData(0, Qt::UserRole + 1, e.size);
             item->setData(0, Qt::UserRole + 2, links.value(e.name));
+            item->setData(0, Qt::UserRole + 3, e.link); // a link may lead to a folder (lstat lists it as a link)
             item->setData(1, Qt::UserRole, e.dir ? qint64(-1) : e.size);
             item->setIcon(0,
                           !e.link ? (e.dir ? folderIcon : fileIcon(e.name)) : linkIcon(e.dir ? folderIcon : fileIcon(e.name), e.dir));
@@ -2007,15 +2085,12 @@ public:
         const bool runnable = sftpRunnable(QFileInfo(file).fileName());
 #ifdef Q_OS_WIN
         const auto native = QDir::toNativeSeparators(file);
-        // "Open with": the chooser for every type, scripts too (.js, .bat...): the user picks the program.
-        if (openMode == 1)
-        {
-            const auto wide = native.toStdWString();
-            OPENASINFO info{wide.c_str(), nullptr, OAIF_ALLOW_REGISTRATION | OAIF_EXEC};
-            if (SUCCEEDED(SHOpenWithDialog(nullptr, &info)))
-                return true;
-        }
-        if ((openMode == 2 || runnable) && QProcess::startDetached("notepad.exe", {native}))
+        // "Open with": the system chooser for every type, scripts too (.js, .bat...): the user picks the program. It
+        // runs in its own process outside CrossTerm's job (the program chosen must not close with CrossTerm), which
+        // takes the whole rest of its command line as the path, unquoted. Cancelling opens nothing.
+        if (openMode == 1 && startForUser("rundll32.exe", {}, "shell32.dll,OpenAs_RunDLL " + native))
+            return true;
+        if ((openMode == 2 || runnable) && startForUser("notepad.exe", {native}))
             return true;
 #else
         // "Open with": no system chooser here, the user picks the program (an app bundle on macOS);
@@ -2027,7 +2102,7 @@ public:
             return app.isEmpty() || QProcess::startDetached("/usr/bin/open", {"-a", app, file});
 #else
             const auto app = QFileDialog::getOpenFileName(nullptr, L("Open with..."), "/usr/bin");
-            return app.isEmpty() || QProcess::startDetached(app, {file});
+            return app.isEmpty() || startForUser(app, {file});
 #endif
         }
 #ifdef Q_OS_MACOS
@@ -2039,7 +2114,7 @@ public:
 #endif
 #endif
         if (!runnable)
-            QDesktopServices::openUrl(QUrl::fromLocalFile(file));
+            openForUser(QUrl::fromLocalFile(file));
         return !runnable;
     }
     // Rows shown: those whose name holds the filter text, hidden files ("." names) only when they are shown.
@@ -2243,11 +2318,12 @@ public:
                                                                                    : kind == "7z" && has("7z");
         return can ? kind : QString();
     }
-    void extractHere(const QString &name, bool remove = false)
+    // dir: the remote folder of the archive (the listed one by default).
+    void extractHere(const QString &name, bool remove = false, QString dir = {})
     {
         const auto kind = archiveKind(name);
         const bool zip = kind == "zip";
-        const auto script = sftpExtractScript(listed, name, kind, remove);
+        const auto script = sftpExtractScript(dir.isEmpty() ? listed : dir, name, kind, remove);
         if (script.isEmpty())
             return;
         // zip: entries extracted out of the count on the first line; others: no count, a busy bar.
@@ -2979,9 +3055,13 @@ public:
                                        // The current mode as the starting value: a confirmed default must not drop
                                        // setuid, setgid or sticky.
                                        const bool shellTools = has("chown") && has("find");
-                                       const auto chosen = sftpPermissionsDialog(this, remotePath, sftpOctalMode(access), owner,
-                                                                                 group, shellTools, dir);
-                                       if (chosen)
+                                       const auto initial = sftpOctalMode(access);
+                                       const auto chosen = sftpPermissionsDialog(this, remotePath, initial, owner, group,
+                                                                                 shellTools, dir);
+                                       // OK without changes does nothing: Windows' sftp lists group and other rights
+                                       // as '*', read as 0, and chmod with them would take those rights away.
+                                       if (chosen && (chosen->mode != initial || chosen->owner != owner ||
+                                                      chosen->group != group || chosen->recurse))
                                            applyPermissions(remotePath, *chosen, owner, group);
                                    });
                     menu.exec(files->viewport()->mapToGlobal(at));
@@ -2995,6 +3075,17 @@ public:
                     if (name == ".." || item->data(0, Qt::UserRole).toBool())
                     {
                         run(join(name));
+                        return;
+                    }
+                    // A link alone: entered when it leads to a folder (~/www -> /var/www), else opened as a file
+                    // when its listing fails (see linkOpen).
+                    if (item->data(0, Qt::UserRole + 3).toBool() && selectedFiles(item).size() <= 1)
+                    {
+                        if (process->state() != QProcess::NotRunning)
+                            return run(join(name)); // only says an operation is in progress
+                        const LinkOpen link{name, listed, item->data(0, Qt::UserRole + 1).toLongLong()};
+                        run(join(name)); // clears linkOpen: set for this listing only
+                        linkOpen = link;
                         return;
                     }
                     // Open with the default editor (every selected file, Enter on a selection); saves are uploaded
@@ -3195,6 +3286,8 @@ public:
                             status->setText(error.isEmpty() ? L("SFTP operation failed.") : error.left(400));
                         if (!reached(output))
                             setLink(2);
+                        else if (openLinkedFile())
+                            status->clear();
                         return;
                     }
                     showListing(output, error);
@@ -3330,11 +3423,65 @@ public:
                 existing << info.fileName();
         }
         const bool replace = existing.isEmpty() || confirmReplace(existing, N("Upload files"));
+        // Folders as ZIP (Tools): only when the server can unzip and this computer can zip; otherwise as they are.
+        const bool zipped = sftpZipUploads() > 0 && has("unzip");
         for (const auto &info : std::as_const(infos))
         {
-            if (replace || !existing.contains(info.fileName()))
-                enqueue(directory, info.fileName(), info.filePath(), true, info.isDir(), info.isDir() ? -1 : info.size());
+            if (!replace && existing.contains(info.fileName()))
+                continue;
+            if (info.isDir() && zipped && uploadZipped(directory, info))
+                continue;
+            enqueue(directory, info.fileName(), info.filePath(), true, info.isDir(), info.isDir() ? -1 : info.size());
         }
+    }
+
+    // A folder zipped here (in the background), uploaded as one file under a hidden name, then extracted on the
+    // server with unzip -o (files replaced, others kept) and removed. Much faster than file by file for many small
+    // files. False when this computer has nothing to zip with.
+    std::unique_ptr<QTemporaryDir> zipScratch; // the archives, removed with the panel
+    int zips = 0;
+    bool uploadZipped(const QString &directory, const QFileInfo &folder)
+    {
+        if (!zipScratch)
+            zipScratch = std::make_unique<QTemporaryDir>();
+        const auto name = folder.fileName();
+        const auto dir = zipScratch->filePath(QString::number(++zips));
+        const auto zip = QDir(dir).filePath(name + ".zip");
+        const auto [program, arguments] = sftpZipCommand(name, zip);
+        if (program.isEmpty() || !zipScratch->isValid() || !QDir().mkpath(dir))
+            return false;
+        auto *zipper = hideConsoleWindow(new QProcess(this));
+        zipper->setWorkingDirectory(folder.absolutePath());
+        zipper->setStandardInputFile(QProcess::nullDevice());
+        status->setText(L("Compressing…"));
+        connect(zipper, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, zipper, directory, folder, name, zip](int code, QProcess::ExitStatus exit)
+                {
+                    const auto error = QString::fromLocal8Bit(zipper->readAllStandardError()).trimmed();
+                    zipper->deleteLater();
+                    status->clear();
+                    if (code != 0 || exit != QProcess::NormalExit || !QFileInfo::exists(zip))
+                    {
+                        // Not zipped (an unreadable file...): uploaded as it is, which reports what fails.
+                        QFile::remove(zip);
+                        status->setText(error.left(300));
+                        enqueue(directory, name, folder.filePath(), true, true, -1);
+                        return;
+                    }
+                    enqueue(directory, "." + name + ".crossterm-upload.zip", zip, true, false, QFileInfo(zip).size(), false,
+                            [&](Transfer &t) { t.unzip = name; });
+                });
+        connect(zipper, &QProcess::errorOccurred, this,
+                [this, zipper, directory, folder, name](QProcess::ProcessError e)
+                {
+                    if (e != QProcess::FailedToStart)
+                        return;
+                    zipper->deleteLater();
+                    status->clear();
+                    enqueue(directory, name, folder.filePath(), true, true, -1);
+                });
+        zipper->start(program, arguments);
+        return true;
     }
 
     void remove()

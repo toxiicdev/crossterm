@@ -89,6 +89,30 @@ int main(int argc, char **argv)
 #endif
         wait(20000, [&] { return panel.transfersIdle(); });
 
+        // Upload folders as ZIP: the local zipper makes a real zip archive holding "<folder>/...".
+        {
+            const auto [program, arguments] = sftpZipCommand("tree", "tree.zip");
+            QTemporaryDir parent;
+            QDir(parent.path()).mkpath("tree/sub");
+            QFile inside(parent.filePath("tree/sub/a.txt"));
+            inside.open(QIODevice::WriteOnly);
+            inside.write("data");
+            inside.close();
+            if (program.isEmpty())
+                std::printf("SKIPPED: no zip program on this computer\n");
+            else
+            {
+                QProcess zipper;
+                zipper.setWorkingDirectory(parent.path());
+                zipper.start(program, arguments);
+                zipper.waitForFinished(30000);
+                QFile zip(parent.filePath("tree.zip"));
+                const auto bytes = zip.open(QIODevice::ReadOnly) ? zip.readAll() : QByteArray();
+                check(zipper.exitCode() == 0 && bytes.startsWith("PK") && bytes.contains("tree/sub/a.txt"),
+                      "folder zipped here as tree/...: " + zipper.readAllStandardError());
+            }
+        }
+
         // Double click and Enter on a file open it (download queued), also when the double click does not follow a
         // press on the same row, which Qt's own activation drops.
         panel.launchEditor = false;

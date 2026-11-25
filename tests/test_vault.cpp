@@ -36,6 +36,10 @@ int main(int argc, char **argv)
     check(readSecret(target) == first, "read");
     check(storeSecret(target, "tester", second), "aggiornamento");
     check(readSecret(target) == second, "read after update");
+    // A long OAuth refresh token (work accounts): about 2000 characters, beyond 2560 bytes as UTF-16.
+    const QString token = QString(2000, QChar('t')) + QString(u"€");
+    check(storeSecret(target, "tester", token), "write of a long secret");
+    check(readSecret(target) == token, "read of a long secret");
     check(removeSecret(target), "rimozione");
     check(!readSecret(target).has_value(), "entry absent after removal");
     check(removeSecret(target), "removal of an absent entry");

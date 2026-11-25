@@ -13,6 +13,7 @@ using namespace SyncEngine;
 struct FakeDevice
 {
     QJsonObject data;
+    bool busy = false; // a dialog holds positions in the data: the run must leave it alone
     Device device()
     {
         return Device{[this] { return data; },
@@ -20,7 +21,8 @@ struct FakeDevice
                       {
                           for (auto it = merged.begin(); it != merged.end(); ++it)
                               data[it.key()] = it.value();
-                      }};
+                      },
+                      [this] { return busy; }};
     }
     QStringList names(const QString &kind = "sessions") const
     {
@@ -104,6 +106,12 @@ int main(int argc, char **argv)
     CHECK(o.status == Outcome::Ok && o.changedHere && o.uploaded)
     CHECK(b.names() == (QStringList{"db-01", "web-01"}) && !b.data.contains("macros"))
     CHECK(b.data["passwords"].toObject()["CrossTerm:root@web:22"].toObject()["secret"] == "s3cret")
+    // A busy device (a dialog or menu open) is not changed and nothing is written: Busy, run again later.
+    a.busy = true;
+    const auto before = a.data;
+    o = sync(storage, first.keys, baseA, a);
+    CHECK(o.status == Outcome::Busy && !o.uploaded && !o.changedHere && a.data == before)
+    a.busy = false;
     // A gets B's session and keeps its macro (B did not touch macros in the file).
     o = sync(storage, first.keys, baseA, a);
     CHECK(o.status == Outcome::Ok && a.names() == (QStringList{"db-01", "web-01"}) && a.names("macros") == QStringList{"deploy"})

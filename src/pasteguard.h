@@ -40,13 +40,15 @@ inline bool pasteLookalike(QChar c)
 inline QList<PasteRisk> pasteRisks(const QString &text)
 {
     QList<PasteRisk> risks;
-    const auto lines = QString(text).replace("\r\n", "\n").replace('\r', '\n').split('\n');
+    // A line ending in '\' goes on in the next one ("curl ... \" then "| sh"): one command, checked as one line.
+    const auto lines = QString(text).replace("\r\n", "\n").replace('\r', '\n').replace("\\\n", " ").split('\n');
     static const QRegularExpression word("\\S+");
-    // curl/wget/fetch output piped to a shell or interpreter; bash <(curl ...); sh -c "$(curl ...)"; PowerShell iwr | iex.
+    // curl/wget/fetch output piped to a shell or interpreter, through any stages between (| base64 -d | bash,
+    // | tee x | sh, | gunzip | sh); bash <(curl ...); sh -c "$(curl ...)"; PowerShell iwr | iex.
     static const QRegularExpression pipe(
-        "\\b(?:curl|wget|fetch|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\\b[^\\n|]*\\|\\s*(?:sudo\\s+(?:-\\S+\\s+)*)?"
+        "\\b(?:curl|wget|fetch|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\\b[^\\n]*\\|\\s*(?:sudo\\s+(?:-\\S+\\s+)*)?"
         "(?:env\\s+)?(?:\\S*/)?(?:ba|z|da|k|c|tc|fi|a)?sh\\b|"
-        "\\b(?:curl|wget|fetch|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\\b[^\\n|]*\\|\\s*(?:sudo\\s+)?(?:\\S*/)?(?:python[0-9.]*|perl|ruby|node|php|iex|Invoke-Expression)\\b|"
+        "\\b(?:curl|wget|fetch|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\\b[^\\n]*\\|\\s*(?:sudo\\s+)?(?:\\S*/)?(?:python[0-9.]*|perl|ruby|node|php|iex|Invoke-Expression)\\b|"
         "\\b(?:ba|z|k)?sh\\s+(?:-c\\s+)?[\"']?(?:<\\(|\\$\\()\\s*(?:curl|wget|fetch)\\b|"
         "\\b(?:iex|Invoke-Expression)\\b[^\\n]*\\b(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod|DownloadString)\\b",
         QRegularExpression::CaseInsensitiveOption);

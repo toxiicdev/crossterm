@@ -9,6 +9,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QNetworkDatagram>
+#include <QProcess>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTcpServer>
@@ -163,6 +164,23 @@ static void testJail(const QString &root)
     CHECK(jailedPath(root, "C:/Windows/win.ini").isEmpty());
     CHECK(jailedPath(root, "hello.txt:stream").isEmpty());
     CHECK(jailedPath(root, "nodir/x.txt").isEmpty()); // nonexistent parent folder
+    // A link to a folder outside the root (a junction on Windows: needs no privileges, and canonicalFilePath does
+    // not resolve it): neither what is in it nor a new file in it.
+    QTemporaryDir outside;
+    QFile secret(outside.filePath("secret.txt"));
+    secret.open(QIODevice::WriteOnly);
+    secret.close();
+#ifdef Q_OS_WIN
+    QProcess::execute("cmd", {"/c", "mklink", "/J", QDir::toNativeSeparators(root + "/escape"),
+                              QDir::toNativeSeparators(outside.path())});
+#else
+    QFile::link(outside.path(), root + "/escape");
+#endif
+    CHECK(QFileInfo::exists(root + "/escape/secret.txt"));
+    CHECK(jailedPath(root, "escape/secret.txt").isEmpty());
+    CHECK(jailedPath(root, "escape/new.txt").isEmpty());
+    QDir().rmdir(root + "/escape"); // the junction, not its contents
+    QFile::remove(root + "/escape");
 }
 
 // ---------- TFTP: minimal client ----------

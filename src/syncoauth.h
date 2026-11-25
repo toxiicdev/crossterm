@@ -41,6 +41,8 @@ struct Tokens
     QString access, refresh;
     qint64 expiresAt = 0; // ms since 1970
     QString error;        // empty on success
+    bool rejected = false; // the provider answered with an OAuth error (invalid_grant...): sign in again. Not when
+                           // it could not be reached (offline, DNS): that is an ordinary failure.
 };
 
 // One sign-in: listen, open the browser, wait for the redirect (5 minutes at most), exchange the code.
