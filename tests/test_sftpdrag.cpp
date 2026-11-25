@@ -88,6 +88,37 @@ int main(int argc, char **argv)
         check(shown.startsWith("0 / 3"), "folder upload shows X / N files: " + shown.toUtf8());
 #endif
         wait(20000, [&] { return panel.transfersIdle(); });
+
+        // Double click and Enter on a file open it (download queued), also when the double click does not follow a
+        // press on the same row, which Qt's own activation drops.
+        panel.launchEditor = false;
+        panel.resize(500, 700);
+        panel.show();
+        panel.showListing("Remote working directory: /home/test\nRemote working directory: /home/test\n"
+                          "-rw-r--r--    1 test     test            5 Nov 20 10:00 notes.txt\n"
+                          "-rw-r--r--    1 test     test            5 Nov 20 10:00 other.txt\n",
+                          {});
+        QApplication::processEvents();
+        auto *view = panel.view();
+        auto row = [&](const QString &name)
+        {
+            for (int i = 0; i < view->topLevelItemCount(); ++i)
+                if (view->topLevelItem(i)->text(0) == name)
+                    return view->topLevelItem(i);
+            return static_cast<QTreeWidgetItem *>(nullptr);
+        };
+        const QPoint at(30, view->visualItemRect(row("notes.txt")).center().y());
+        QMouseEvent doubleClick(QEvent::MouseButtonDblClick, at, view->viewport()->mapToGlobal(at), Qt::LeftButton,
+                                Qt::LeftButton, Qt::NoModifier);
+        int before = panel.transferCount();
+        QApplication::sendEvent(view->viewport(), &doubleClick);
+        check(panel.transferCount() == before + 1, "double click on a file opens it");
+        view->setCurrentItem(row("other.txt"));
+        QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+        before = panel.transferCount();
+        QApplication::sendEvent(view, &enter);
+        check(panel.transferCount() == before + 1, "Enter on a file opens it");
+        wait(20000, [&] { return panel.transfersIdle(); });
     }
 
     // --- With network: test server managed by others, reads only.

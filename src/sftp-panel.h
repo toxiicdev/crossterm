@@ -483,6 +483,26 @@ public:
     int dragging = 0;                // drags whose exec() is on the stack
 
 protected:
+    // Double click and Enter open the row (itemActivated) themselves: Qt's own activation is dropped when the view is
+    // not idle or the double click does not land on the row of the press, and then nothing opened.
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        auto *item = event->button() == Qt::LeftButton ? itemAt(event->position().toPoint()) : nullptr;
+        if (!item)
+            return QTreeWidget::mouseDoubleClickEvent(event);
+        event->accept();
+        emit itemActivated(item, 0);
+    }
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) && currentItem())
+        {
+            event->accept();
+            emit itemActivated(currentItem(), 0);
+            return;
+        }
+        QTreeWidget::keyPressEvent(event);
+    }
     void startDrag(Qt::DropActions) override
     {
         auto *data = dragData ? dragData() : nullptr;
