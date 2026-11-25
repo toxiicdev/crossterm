@@ -153,6 +153,26 @@ int main(int argc, char **argv)
     CHECK(terminal.allText().contains("Session stopped"))
     CHECK(terminal.allText().contains("bye"))
 
+    // Connection lost inside a full-screen program (alternate screen, scroll region, hidden cursor, colours): the notice
+    // goes back to the normal screen below the shell output, not over what the program had drawn.
+    {
+        auto *lostDevice = new FakeDevice;
+        Terminal lost(lostDevice);
+        lost.show();
+        setGrid(lost, 40, 10);
+        lostDevice->feed("shell prompt$ top\r\n");
+        lostDevice->feed("\x1b[?1049h\x1b[?25l\x1b[3;8r\x1b[41m\x1b[2J\x1b[H");
+        for (int i = 0; i < 10; ++i)
+            lostDevice->feed("\x1b[" + QByteArray::number(i + 1) + ";1HFULLSCREEN " + QByteArray::number(i));
+        emit lostDevice->readChannelFinished();
+        CHECK(lost.finished())
+        CHECK(!lost.contents().contains("FULLSCREEN"))
+        CHECK(lost.allText().contains("shell prompt$ top"))
+        const auto text = lost.allText();
+        CHECK(text.indexOf("Session stopped") > text.indexOf("shell prompt$ top"))
+        CHECK(text.contains("Press R to restart session"))
+    }
+
     // A tab created hidden gets a placeholder size of a few pixels (2 rows): with sizeWhenShown() the welcome banner
     // is still written at the top of a full grid, and the session starts below it; shown, the banner stays on top.
     {

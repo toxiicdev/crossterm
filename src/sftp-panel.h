@@ -1887,12 +1887,26 @@ public:
         }
         if ((openMode == 2 || runnable) && QProcess::startDetached("notepad.exe", {native}))
             return true;
-#elif defined(Q_OS_MACOS)
+#else
+        // "Open with": no system chooser here, the user picks the program (an app bundle on macOS);
+        // cancelling opens nothing.
+        if (openMode == 1)
+        {
+#ifdef Q_OS_MACOS
+            const auto app = QFileDialog::getOpenFileName(nullptr, L("Open with..."), "/Applications", "*.app");
+            return app.isEmpty() || QProcess::startDetached("/usr/bin/open", {"-a", app, file});
+#else
+            const auto app = QFileDialog::getOpenFileName(nullptr, L("Open with..."), "/usr/bin");
+            return app.isEmpty() || QProcess::startDetached(app, {file});
+#endif
+        }
+#ifdef Q_OS_MACOS
         if ((openMode == 2 || runnable) && QProcess::startDetached("/usr/bin/open", {"-t", file})) // the default text editor
             return true;
 #else
         if ((openMode == 2 || runnable) && sftpOpenInTextEditor(file))
             return true;
+#endif
 #endif
         if (!runnable)
             QDesktopServices::openUrl(QUrl::fromLocalFile(file));

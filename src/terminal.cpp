@@ -893,8 +893,10 @@ void Terminal::stop(const QString &reason, bool error)
     const QColor grey = blend(s.background, s.foreground, 0.4);
     const QString rule = QString::fromLatin1("\x1b[38;2;%1;%2;%3m").arg(grey.red()).arg(grey.green()).arg(grey.blue()) +
                          QString(std::min(s.cols, 80), QChar(0x2500)) + QString::fromLatin1("\x1b[0m");
+    // A session lost inside a full-screen program (vim, top...): back to the normal screen and a soft reset (scroll
+    // region, cursor shown, colours), so the notice goes below the shell output instead of over the program's screen.
     const auto notice =
-        (newline + QString::fromLatin1("\x1b[0m") + detail + newline + rule + newline + QString::fromLatin1("\x1b[1m") +
+        (QString::fromLatin1("\x1b[?1049l\x1b[!p") + newline + QString::fromLatin1("\x1b[0m") + detail + newline + rule + newline + QString::fromLatin1("\x1b[1m") +
          tr("Session stopped") + QString::fromLatin1("\x1b[0m") + newline + "    - " + tr("Press <Return> to exit tab") +
          newline + "    - " + tr("Press R to restart session") + newline)
             .toUtf8();
